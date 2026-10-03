@@ -5,7 +5,7 @@
 - [x] Workspace tabs, split tree, draggable resizing, focus, maximize, picker.
 - [x] Hook-driven Overview, bounded histories, task titles and explicit review/acceptance.
 - [x] Integration preview/install/uninstall preserving existing configuration.
-- [x] Metadata/layout persistence and honest fresh-shell resume.
+- [x] Preference/history persistence and a fresh terminal on each startup.
 - [x] Portable tests, headless appearance checks, macOS bundle script and CI.
 - [x] Codex lifecycle adapter, explicit install/uninstall, mixed-agent Overview and backward-compatible history.
 - [ ] Validate on Intel and Apple Silicon Macs with real Claude and Codex sessions (native acceptance gate).

@@ -18,3 +18,7 @@ The macOS bundle script derives the standard 16/32/128/256/512 pixel icon family
 Created with the built-in ImageGen tool from the selected Mosaic proposal, then resized only for packaging. Final design prompt:
 
 > Faithfully reproduce proposal 1, Mosaic, as one standalone macOS icon. Preserve four offset tiles: upper-left larger sea-glass tile, upper-right smaller amber tile, lower-left smaller sea-glass tile, lower-right larger sea-glass tile, and clean negative-space channels. Keep the charcoal rounded-square backing, muted greens/amber, crisp edges and subtle material depth. Center on a square canvas with transparent margins; no external shadow, labels, numbers, extra symbols, or other proposals.
+
+# Terminal symbol fallback
+
+`fonts/NotoSansSymbols2-Regular.ttf` is the unmodified Noto Sans Symbols 2 font from [Google Fonts](https://github.com/google/fonts/tree/main/ofl/notosanssymbols2), distributed under the SIL Open Font License in `fonts/OFL-NotoSansSymbols2.txt`. It is embedded as the last monospace fallback to render shell prompt symbols such as `✗` (U+2717), without replacing Hack for ordinary text. No system font installation or runtime download is required.
