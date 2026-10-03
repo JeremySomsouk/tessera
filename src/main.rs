@@ -5,9 +5,17 @@ mod ui;
 fn main() -> anyhow::Result<()> {
     let args: Vec<_> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
-        Some("hook") => {
-            if let Err(e) = integration::hook() {
+        Some("hook" | "codex-hook") => {
+            let agent = if args[1] == "codex-hook" {
+                model::Agent::Codex
+            } else {
+                model::Agent::Claude
+            };
+            if let Err(e) = integration::hook(agent) {
                 eprintln!("Tessera hook: {e}");
+            }
+            if agent == model::Agent::Codex {
+                println!("{{}}");
             }
             Ok(())
         }
@@ -15,6 +23,41 @@ fn main() -> anyhow::Result<()> {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&integration::settings(&std::env::current_exe()?))?
+            );
+            Ok(())
+        }
+        Some("codex-hooks") => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&integration::settings_for(
+                    &std::env::current_exe()?,
+                    model::Agent::Codex
+                ))?
+            );
+            Ok(())
+        }
+        Some("install-codex-hooks" | "uninstall-codex-hooks") => {
+            let path = args
+                .get(2)
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| {
+                    let home = std::env::var("CODEX_HOME")
+                        .map(std::path::PathBuf::from)
+                        .unwrap_or_else(|_| {
+                            std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+                                .join(".codex")
+                        });
+                    home.join("hooks.json")
+                });
+            integration::install_for(
+                &path,
+                &std::env::current_exe()?,
+                args[1] == "uninstall-codex-hooks",
+                model::Agent::Codex,
+            )?;
+            println!(
+                "Updated {}. Review and trust Tessera's definitions with /hooks in Codex.",
+                path.display()
             );
             Ok(())
         }
@@ -36,7 +79,7 @@ fn main() -> anyhow::Result<()> {
         }
         Some("--help" | "-h") => {
             println!(
-                "Tessera 0.1.0\n\nUsage: tessera [hooks | install-hooks [settings.json] | uninstall-hooks [settings.json]]\n\nNo argument opens the terminal application. Run hooks to preview integration before installing."
+                "Tessera 0.1.0\n\nUsage: tessera [hooks | install-hooks [settings.json] | uninstall-hooks [settings.json]]\n\nNo argument opens the terminal application. Run hooks or codex-hooks to preview integration before installing.\nCodex: tessera codex-hooks | install-codex-hooks [hooks.json] | uninstall-codex-hooks [hooks.json]"
             );
             Ok(())
         }

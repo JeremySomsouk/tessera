@@ -377,18 +377,16 @@ impl App {
                 if !self.panes.contains_key(&e.pane) {
                     continue;
                 }
-                let idx = self
-                    .saved
-                    .sessions
-                    .iter()
-                    .position(|s| s.session_id == e.session_id && s.pane == e.pane);
+                let idx = self.saved.sessions.iter().position(|s| {
+                    s.session_id == e.session_id && s.pane == e.pane && s.agent == e.agent
+                });
                 let idx = idx.unwrap_or_else(|| {
                     if self.saved.sessions.len() >= 256 {
                         self.saved.sessions.remove(0);
                     }
-                    self.saved
-                        .sessions
-                        .push(Session::new(e.pane, e.session_id.clone()));
+                    let mut session = Session::new(e.pane, e.session_id.clone());
+                    session.agent = e.agent;
+                    self.saved.sessions.push(session);
                     self.saved.sessions.len() - 1
                 });
                 self.dirty |= self.saved.sessions[idx].apply(e, now());
@@ -514,7 +512,7 @@ impl App {
         );
         ui.add_space(20.0);
         if self.saved.sessions.is_empty() {
-            egui::Frame::group(ui.style()).inner_margin(24.0).show(ui,|ui| {ui.heading("Your first session starts in a terminal");ui.label("Enable Tessera hooks, then run claude in any pane. Sessions will appear here as events arrive.");ui.add_space(12.0);ui.monospace("tessera hooks                 # preview\ntessera install-hooks         # merge with backup\nclaude");if ui.button("Return to terminal").clicked() {self.overview=false;}});
+            egui::Frame::group(ui.style()).inner_margin(24.0).show(ui,|ui| {ui.heading("Your first session starts in a terminal");ui.label("Enable Tessera hooks for Claude Code or Codex, then run the agent in any pane. Sessions appear as events arrive.");ui.add_space(12.0);ui.monospace("tessera install-hooks         # Claude Code\ntessera install-codex-hooks   # Codex; trust via /hooks\nclaude  # or codex");if ui.button("Return to terminal").clicked() {self.overview=false;}});
         }
         ui.horizontal_wrapped(|ui| {
             for (category, label) in [
@@ -643,7 +641,8 @@ impl App {
                                                 .color(ui.visuals().weak_text_color()),
                                         );
                                         ui.small(format!(
-                                            "Session {}",
+                                            "{} · Session {}",
+                                            s.agent.label(),
                                             s.session_id.chars().take(12).collect::<String>()
                                         ));
                                         ui.add_space(4.0);
@@ -1297,6 +1296,9 @@ mod render_tests {
                 focus: pane,
             });
             let mut s = Session::new(pane, format!("fixture-{n}"));
+            if n % 2 != 0 {
+                s.agent = crate::model::Agent::Codex;
+            }
             for seq in 1..4 {
                 s.apply(
                     HookEvent {
@@ -1304,6 +1306,11 @@ mod render_tests {
                         pane,
                         sequence: seq,
                         session_id: format!("fixture-{n}"),
+                        agent: if n % 2 == 0 {
+                            crate::model::Agent::Claude
+                        } else {
+                            crate::model::Agent::Codex
+                        },
                         hook_event_name: if n % 3 == 0 {
                             "PermissionRequest"
                         } else if n % 3 == 1 {
