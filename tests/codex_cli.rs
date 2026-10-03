@@ -113,11 +113,24 @@ fn codex_cli_round_trip_strips_content_and_tags_provider() {
             Err(e) => panic!("Codex hook failed to connect: {e}"),
         }
     };
-    stream
-        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
-        .unwrap();
+    // Darwin can reject SO_RCVTIMEO after the short-lived sender has closed.
+    // Read already-buffered data with a bounded nonblocking loop instead.
+    stream.set_nonblocking(true).unwrap();
     let mut bytes = Vec::new();
-    stream.read_to_end(&mut bytes).unwrap();
+    let mut chunk = [0u8; 4096];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => bytes.extend_from_slice(&chunk[..n]),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10))
+            }
+            Err(e) => panic!("Codex hook payload could not be read: {e}"),
+        }
+    }
     let event: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(event["agent"], "Codex");
     assert_eq!(event["pane"], pane.to_string());
