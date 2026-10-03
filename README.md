@@ -1,3 +1,5 @@
+![Tessera — terminal panes gathered into a mosaic](assets/tessera-banner.png)
+
 # Tessera
 
 A desktop terminal workspace with a single Overview of real Claude Code sessions.

@@ -692,6 +692,9 @@ impl App {
             self.inspector(ui);
         }
         if !ui.ctx().wants_keyboard_input() {
+            if ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+                self.overview = false;
+            }
             let ids: Vec<_> = visible
                 .iter()
                 .map(|index| self.saved.sessions[*index].key())

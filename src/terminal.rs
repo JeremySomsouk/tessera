@@ -81,6 +81,10 @@ impl EventListener for Listener {
         self.ctx.request_repaint();
     }
 }
+struct ProcessLifecycle {
+    killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
+    exited: bool,
+}
 pub struct Terminal {
     pub term: Arc<Mutex<Term<Listener>>>,
     tx: SyncSender<Command>,
@@ -89,7 +93,7 @@ pub struct Terminal {
     pub size: Size,
     mode: Arc<AtomicU32>,
     stopping: Arc<AtomicBool>,
-    killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
+    lifecycle: Arc<Mutex<ProcessLifecycle>>,
     host: Option<std::thread::JoinHandle<()>>,
 }
 impl Terminal {
@@ -114,7 +118,10 @@ impl Terminal {
         command.env("TESSERA_PANE", id.to_string());
         command.env("TESSERA_SOCKET", socket);
         let mut child = pair.slave.spawn_command(command)?;
-        let killer = child.clone_killer();
+        let lifecycle = Arc::new(Mutex::new(ProcessLifecycle {
+            killer: child.clone_killer(),
+            exited: false,
+        }));
         drop(pair.slave);
         let mut reader = pair.master.try_clone_reader()?;
         let mut writer = pair.master.take_writer()?;
@@ -177,11 +184,14 @@ impl Terminal {
         let host_term = term.clone();
         let host_alive = alive.clone();
         let host_error = error.clone();
+        let host_lifecycle = lifecycle.clone();
         let host = std::thread::spawn(move || {
             loop {
                 if host_stopping.load(Ordering::Acquire) {
+                    let mut life = host_lifecycle.lock().unwrap();
                     let _ = child.kill();
                     let _ = child.wait();
+                    life.exited = true;
                     break;
                 }
                 let result = match rx.recv_timeout(Duration::from_millis(250)) {
@@ -193,8 +203,10 @@ impl Terminal {
                         pair.master.resize(s.pty()).map_err(std::io::Error::other)
                     }
                     Ok(Command::Stop) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        let mut life = host_lifecycle.lock().unwrap();
                         let _ = child.kill();
                         let _ = child.wait();
+                        life.exited = true;
                         break;
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok(()),
@@ -204,7 +216,16 @@ impl Terminal {
                 {
                     *err = Some(e.to_string());
                 }
-                if matches!(child.try_wait(), Ok(Some(_))) {
+                let exited = {
+                    let mut life = host_lifecycle.lock().unwrap();
+                    if matches!(child.try_wait(), Ok(Some(_))) {
+                        life.exited = true;
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if exited {
                     break;
                 }
             }
@@ -219,7 +240,7 @@ impl Terminal {
             size,
             mode,
             stopping,
-            killer,
+            lifecycle,
             host: Some(host),
         })
     }
@@ -262,7 +283,11 @@ impl Terminal {
 impl Drop for Terminal {
     fn drop(&mut self) {
         self.stopping.store(true, Ordering::Release);
-        let _ = self.killer.kill();
+        if let Ok(mut life) = self.lifecycle.lock()
+            && !life.exited
+        {
+            let _ = life.killer.kill();
+        }
         let _ = self.tx.try_send(Command::Stop);
         if let Some(host) = self.host.take() {
             let _ = host.join();
@@ -339,6 +364,29 @@ mod tests {
 #[cfg(test)]
 mod pty_tests {
     use super::*;
+    #[test]
+    fn reaped_shell_is_not_signalled_again_when_pane_closes() {
+        let terminal = Terminal::spawn(
+            Uuid::new_v4(),
+            &std::env::current_dir().unwrap(),
+            Path::new("/tmp/unused-test.sock"),
+            Context::default(),
+        )
+        .unwrap();
+        terminal.input(b"exit\r".to_vec()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if terminal.lifecycle.lock().unwrap().exited {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            terminal.lifecycle.lock().unwrap().exited,
+            "shell was not reaped"
+        );
+        drop(terminal);
+    }
     #[test]
     fn real_shell_input_resize_and_protocol_response() {
         let ctx = Context::default();
