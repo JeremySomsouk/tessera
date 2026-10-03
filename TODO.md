@@ -7,7 +7,8 @@
 - [x] Integration preview/install/uninstall preserving existing configuration.
 - [x] Metadata/layout persistence and honest fresh-shell resume.
 - [x] Portable tests, headless appearance checks, macOS bundle script and CI.
-- [ ] Validate on the user's Intel Mac with real Claude sessions (first acceptance gate).
+- [x] Codex lifecycle adapter, explicit install/uninstall, mixed-agent Overview and backward-compatible history.
+- [ ] Validate on Intel and Apple Silicon Macs with real Claude and Codex sessions (native acceptance gate).
 - [ ] Validate CI artifacts on Apple Silicon and finish native terminal smoke checklist.
 
 ## Next: terminal and Overview polish

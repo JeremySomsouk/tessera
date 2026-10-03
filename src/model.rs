@@ -3,6 +3,21 @@ use std::collections::VecDeque;
 use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Agent {
+    #[default]
+    Claude,
+    Codex,
+}
+impl Agent {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Claude => "Claude Code",
+            Self::Codex => "Codex",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SessionState {
     #[default]
     Unknown,
@@ -35,6 +50,8 @@ pub struct HookEvent {
     pub pane: Uuid,
     pub sequence: u128,
     pub session_id: String,
+    #[serde(default)]
+    pub agent: Agent,
     pub hook_event_name: String,
     pub detail: String,
 }
@@ -49,6 +66,8 @@ pub struct Activity {
 pub struct Session {
     pub pane: Uuid,
     pub session_id: String,
+    #[serde(default)]
+    pub agent: Agent,
     pub state: SessionState,
     pub last_sequence: u128,
     pub history: VecDeque<Activity>,
@@ -64,6 +83,7 @@ impl Session {
         Self {
             pane,
             session_id,
+            agent: Agent::Claude,
             state: SessionState::Unknown,
             last_sequence: 0,
             history: VecDeque::new(),
@@ -74,11 +94,15 @@ impl Session {
         }
     }
     pub fn key(&self) -> String {
-        format!("{}/{}", self.pane, self.session_id)
+        match self.agent {
+            Agent::Claude => format!("{}/{}", self.pane, self.session_id),
+            Agent::Codex => format!("codex/{}/{}", self.pane, self.session_id),
+        }
     }
     pub fn apply(&mut self, e: HookEvent, now: u64) -> bool {
         if e.pane != self.pane
             || e.session_id != self.session_id
+            || e.agent != self.agent
             || self.recent.contains(&e.id)
             || e.sequence <= self.last_sequence
         {
@@ -96,6 +120,7 @@ impl Session {
             "Notification" if e.detail.starts_with("permission_prompt") => SessionState::Permission,
             "Notification" if e.detail.starts_with("idle_prompt") => SessionState::Input,
             "Stop" => SessionState::Idle,
+            "Interrupt" if self.agent == Agent::Codex => SessionState::Input,
             "SessionEnd" => SessionState::Ended,
             _ => self.state,
         };
@@ -135,9 +160,42 @@ mod tests {
             pane,
             sequence: seq,
             session_id: "a".into(),
+            agent: Agent::Claude,
             hook_event_name: name.into(),
             detail: String::new(),
         }
+    }
+    #[test]
+    fn codex_identity_transitions_and_legacy_restore() {
+        let p = Uuid::new_v4();
+        let claude = Session::new(p, "a".into());
+        let mut codex = Session::new(p, "a".into());
+        codex.agent = Agent::Codex;
+        assert_ne!(claude.key(), codex.key());
+        assert!(!codex.apply(event(p, 1, "Stop"), 1));
+        for (seq, name, expected) in [
+            (1, "SessionStart", SessionState::Running),
+            (2, "PermissionRequest", SessionState::Permission),
+            (3, "PostToolUse", SessionState::Running),
+            (4, "Stop", SessionState::Idle),
+            (5, "UserPromptSubmit", SessionState::Running),
+            (6, "Interrupt", SessionState::Input),
+            (7, "SessionEnd", SessionState::Ended),
+        ] {
+            let mut e = event(p, seq, name);
+            e.agent = Agent::Codex;
+            assert!(codex.apply(e, seq as u64));
+            assert_eq!(codex.state, expected);
+        }
+        let mut legacy = serde_json::to_value(&claude).unwrap();
+        legacy.as_object_mut().unwrap().remove("agent");
+        let restored: Session = serde_json::from_value(legacy).unwrap();
+        assert_eq!(restored.agent, Agent::Claude);
+        assert_eq!(restored.key(), claude.key());
+        let restored: Session =
+            serde_json::from_str(&serde_json::to_string(&codex).unwrap()).unwrap();
+        assert_eq!(restored.agent, Agent::Codex);
+        assert_eq!(restored.key(), codex.key());
     }
     #[test]
     fn stop_is_idle_and_not_acceptance() {

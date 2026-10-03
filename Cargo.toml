@@ -3,7 +3,7 @@ name = "tessera"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-description = "A terminal workspace with an overview of real Claude Code sessions"
+description = "A terminal workspace with an overview of real Claude Code and Codex sessions"
 
 [dependencies]
 anyhow = "1"
