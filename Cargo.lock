@@ -2341,11 +2341,13 @@ dependencies = [
 
 [[package]]
 name = "tessera"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
  "eframe",
+ "objc2 0.6.4",
+ "objc2-foundation 0.3.2",
  "portable-pty",
  "serde",
  "serde_json",
