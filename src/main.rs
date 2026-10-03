@@ -1,3 +1,4 @@
+mod choices;
 mod integration;
 mod model;
 mod search;

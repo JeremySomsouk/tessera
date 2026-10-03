@@ -62,6 +62,7 @@ fn terminal_config() -> Config {
 }
 enum Command {
     Input(Vec<u8>),
+    UserInput(Vec<u8>),
     Resize(Size),
     Selection(SelectionAction),
     Scroll(i32),
@@ -222,6 +223,15 @@ impl Terminal {
                 }
                 let result = match rx.recv_timeout(Duration::from_millis(250)) {
                     Ok(Command::Input(bytes)) => writer.write_all(&bytes),
+                    Ok(Command::UserInput(bytes)) => host_term
+                        .lock()
+                        .map_err(|_| std::io::Error::other("terminal state unavailable"))
+                        .and_then(|mut term| {
+                            term.scroll_display(Scroll::Bottom);
+                            ctx.request_repaint();
+                            drop(term);
+                            writer.write_all(&bytes)
+                        }),
                     Ok(Command::Selection(action)) => {
                         let text = host_term
                             .lock()
@@ -333,6 +343,12 @@ impl Terminal {
         TermMode::from_bits_retain(self.mode.load(Ordering::Acquire))
     }
     pub fn input(&self, bytes: Vec<u8>) -> Result<()> {
+        self.send_input(bytes, false)
+    }
+    pub fn input_at_cursor(&self, bytes: Vec<u8>) -> Result<()> {
+        self.send_input(bytes, true)
+    }
+    fn send_input(&self, bytes: Vec<u8>, follow_cursor: bool) -> Result<()> {
         if bytes.len() > 64 * 1024 {
             bail!("terminal input exceeds 64 KiB; split the paste into smaller parts");
         }
@@ -340,7 +356,11 @@ impl Terminal {
             bail!("shell has exited");
         }
         self.tx
-            .try_send(Command::Input(bytes))
+            .try_send(if follow_cursor {
+                Command::UserInput(bytes)
+            } else {
+                Command::Input(bytes)
+            })
             .map_err(|_| anyhow::anyhow!("terminal input queue full; retry input"))
     }
     pub fn resize(&mut self, size: Size) {
@@ -353,7 +373,7 @@ impl Terminal {
     pub fn paste(&self, s: &str) -> Result<()> {
         let bracketed = self.mode().contains(TermMode::BRACKETED_PASTE);
         let clean = s.replace('\u{1b}', "");
-        self.input(if bracketed {
+        self.input_at_cursor(if bracketed {
             format!("\x1b[200~{clean}\x1b[201~").into_bytes()
         } else {
             clean.replace('\n', "\r").into_bytes()
@@ -600,6 +620,38 @@ mod pty_tests {
                 "scroll was lost under lock contention"
             );
             std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn typing_and_paste_return_to_live_input_even_under_contention() {
+        let terminal = Terminal::spawn(
+            Uuid::new_v4(),
+            &std::env::current_dir().unwrap(),
+            Path::new(""),
+            Context::default(),
+        )
+        .unwrap();
+        for paste in [false, true] {
+            let mut term = terminal.term.lock().unwrap();
+            let mut parser: Processor = Processor::new();
+            parser.advance(&mut *term, &b"history\r\n".repeat(100));
+            term.scroll_display(Scroll::Delta(10));
+            assert!(term.grid().display_offset() > 0);
+            if paste {
+                terminal.paste(" ").unwrap();
+            } else {
+                terminal.input_at_cursor(b" ".to_vec()).unwrap();
+            }
+            drop(term);
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            while terminal.term.lock().unwrap().grid().display_offset() != 0 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "input did not return to bottom"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
         }
     }
 

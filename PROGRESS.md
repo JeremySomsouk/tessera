@@ -97,3 +97,10 @@ Added Sparkle 2.10.0 with a pinned framework archive checksum, bundled native lo
 Bumped package/lockfile to 0.2.2 and added release notes covering automatic updates, rename, close preference and trackpad scrolling. Updated release setup and terminal compatibility documentation.
 
 Validation: all 50 Rust tests pass including Unix socket and real PTY cases; the portable appcast test passes. Formatting, Clippy with warnings denied, debug/release builds, shell syntax and diff checks pass. The Intel DMG, nested application signature and signed archive/feed verify. The bundled framework loads and exports the native updater class. Both Keychain and CI-secret signing paths pass, and a tampered archive is rejected. Apple Silicon/Linux CI and end-to-end native updater acceptance remain pending. Repository-publication authorization was given so release feeds can be fetched without credentials.
+
+
+2026-10-04 — terminal input visibility and Codex question clicks.
+
+Keyboard input and paste now return to the bottom through the existing terminal control queue before writing, even under parser contention. Mouse/wheel and protocol responses preserve scrollback. Added an opt-in persisted “Clickable Codex questions” preference, recognizing the visible numbered question prompt and sending only arrow keys to select an option. Enter remains explicit confirmation. Native mouse reporting, copy/search/history, modifiers and stale/dragged clicks are excluded; parsing is cached by terminal output revision. Codex 0.160.0 prompt layout is the compatibility target. Native acceptance with a live Codex question remains pending.
+
+Validation: all 54 Rust tests pass, including a real PTY receiving an arrow from a UI click and typing/paste returning from scrollback under lock contention. Formatting, Clippy with warnings denied, release build, appcast test, shell syntax and diff checks pass.
