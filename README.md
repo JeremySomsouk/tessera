@@ -19,14 +19,14 @@ tessera
 
 This starts the native desktop application. It uses `$SHELL` as a login shell (defaults to `/bin/zsh` on macOS) and preserves shell startup files. Run ordinary commands, Vim, SSH, `claude`, or `codex` directly in a pane.
 
-To build a Finder application:
+To build a Finder application and release DMG:
 
 ```sh
 bash scripts/bundle-macos.sh
 open dist/Tessera.app
 ```
 
-CI produces separate Intel and Apple Silicon `.app` ZIP artifacts in the **Build and verify** workflow. Copy the application to its final location before installing hooks. Bundles are ad-hoc signed, not notarized; macOS may require Open from the application's context menu.
+CI produces separate Intel (`Tessera-x86_64.dmg`) and Apple Silicon (`Tessera-arm64.dmg`) artifacts in the **Build and verify** workflow. Open the DMG and drag Tessera to Applications before installing hooks. Bundles are ad-hoc signed, not notarized; macOS may require Open from the application's context menu.
 
 ## Connect Codex CLI
 
