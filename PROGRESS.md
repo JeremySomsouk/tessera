@@ -31,3 +31,7 @@ Validation: source PNG dimensions/alpha and small-size visual inspection, shell 
 2026-10-03 — Release DMG packaging.
 
 The existing macOS packaging script now stages the signed release application and an Applications shortcut in a compressed, checksum-verified DMG. CI uploads separate Intel and Apple Silicon DMGs instead of application ZIPs. The same script builds local DMGs without additional packaging dependencies.
+
+2026-10-03 — GitHub Release publishing.
+
+Version tag pushes now run the existing Linux/macOS verification matrix, then publish both architecture DMGs to GitHub Releases. Only the publishing job receives contents write permission. It verifies both artifacts exist, creates a draft with generated notes, uploads both files, and publishes; reruns can resume a partially completed release. Branch and pull-request builds remain artifact-only. README includes the tag/push commands. Actual release publication requires pushing a version tag containing this workflow change.
