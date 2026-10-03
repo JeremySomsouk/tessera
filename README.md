@@ -4,7 +4,7 @@
 
 A desktop terminal workspace with a single Overview of real Claude Code and Codex sessions.
 
-**0.2.4 adds screenshot file drops and makes update failures visible.** It combines real login-shell PTYs, resizable splits, keyboard navigation, persistent workspace metadata, signed automatic macOS updates, and a hook-driven agent Overview. Specification editing, issue connectors, and detached session hosting follow in later increments.
+**0.2.5 starts fresh terminals, improves workspace controls, and fixes shell prompt symbols.** It combines real login-shell PTYs, resizable splits, keyboard navigation, saved preferences and session history, signed automatic macOS updates, and a hook-driven agent Overview. Specification editing, issue connectors, and detached session hosting follow in later increments.
 
 ## Start on macOS
 
@@ -31,8 +31,8 @@ CI produces separate Intel (`Tessera-x86_64.dmg`) and Apple Silicon (`Tessera-ar
 To publish a version, tag the release commit containing this workflow and push the tag:
 
 ```sh
-git tag v0.2.4
-git push origin v0.2.4
+git tag v0.2.5
+git push origin v0.2.5
 ```
 
 Pushing a version tag (`v` followed by a digit) runs all checks and builds both DMGs, then publishes them on the [GitHub Releases page](https://github.com/JeremySomsouk/tessera/releases) with checked-in release notes when available, otherwise generated notes. New releases stay in draft until both DMGs and signed update feeds upload successfully. Release tags require the `SPARKLE_ED25519_PRIVATE_KEY` Actions secret; see [update signing](docs/updates.md). A failed publishing job can be rerun to finish the release. Branch pushes and pull requests upload Actions artifacts only.
@@ -106,9 +106,9 @@ On macOS, `Command` below is Cmd. On Linux, use Ctrl+Alt so ordinary terminal Ct
 | Session needing attention | Command+Shift+N |
 | Stop pane | Command+W |
 
-New terminals opened with Command+N or Command+T inherit the focused shell’s current working directory, including changes made with `cd`. Restored workspaces without a live shell use their saved directory; the workspace dialog still uses the directory you enter.
+New terminals opened with Command+N, Command+T, or either split shortcut inherit the focused shell’s current working directory, including changes made with `cd`. Workspaces whose shell has exited use their launch directory; the workspace dialog uses an existing working directory and an optional separate name. Enter in either field creates the workspace. Escape or a click outside Workspace & commands closes the panel.
 
-Closing a terminal asks for confirmation. Check “Don’t ask again for any terminal” and confirm to skip future prompts across all workspaces, including after restarting Tessera. Re-enable prompts with “Confirm before stopping terminals” in Workspace & commands. Stopping the last pane removes its workspace; task history is retained. Renaming selects the current name; Enter saves and Escape cancels. The rename dialog rejects blank names.
+Closing a terminal asks for confirmation. Check “Don’t ask again for any terminal” and confirm to skip future prompts across all workspaces, including after restarting Tessera. Re-enable prompts with “Confirm before stopping terminals” in Workspace & commands. Shell exit (including Ctrl+D at an empty shell prompt) closes the pane without confirmation. Stopping or exiting the last pane removes its workspace; task history is retained. Renaming selects the current name; Enter saves and Escape cancels. The rename dialog rejects blank names.
 
 In Overview, Up/Down select a session, Enter opens its terminal, and Escape returns. These keys remain normal terminal input in a pane. Drag split separators to resize. Drag terminal text to select; Cmd+C copies, Cmd+V pastes. Shift bypasses terminal mouse reporting for selection and native scrollback. Trackpad and wheel gestures scroll terminal history or are forwarded to applications that request mouse input; alternate-screen programs that enable alternate scrolling receive arrow input. Use the font slider and Light/Dark button in the toolbar. Hover actions and workspace tabs to see their shortcuts. Workspace number shortcuts follow tab position and support the physical number row on layouts such as AZERTY. In the workspace dialog, Enter in Working directory creates a workspace; Enter in Find workspace opens the first match. Invalid directories show an error inside the dialog and keep it open for correction.
 
@@ -122,7 +122,7 @@ Normal terminal typing uses a slim beam caret; applications can request block, u
 
 ## Recovery and current boundaries
 
-Workspace directories, task identities/titles/statuses, layouts, themes, font sizes, and bounded session histories are saved locally. On restart, previous sessions are marked disconnected. **Resume workspace starts fresh login shells**; old Claude session histories remain available. Closing a pane stops its shell; quitting the app stops hosted shells. Independently detached `nohup`/daemon processes are outside this lifecycle.
+Every startup opens one fresh login-shell terminal in the application’s starting directory. Previous tabs and split layouts are discarded. Themes, font sizes, terminal preferences, and bounded session histories are saved locally. Previous sessions are marked disconnected unless already ended; their histories remain available in Overview. Closing a pane stops its shell; quitting the app stops hosted shells. Independently detached `nohup`/daemon processes are outside this lifecycle.
 
 This increment has one application window, no external session daemon, no remote SSH tracking, no specification editor, and no Jira/GitHub connector. Hook histories contain event/tool names, not prompts, arguments, results, transcripts, or permission decisions. Ordinary terminal output remains in memory only. The terminal renderer is an initial implementation; see [compatibility](docs/terminal-compatibility.md) before treating it as a replacement for a mature terminal.
 

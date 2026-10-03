@@ -10,7 +10,7 @@ Portable tests: real shell input/output and resize (`stty size`), cursor-positio
 
 ## Native acceptance checklist (not yet performed)
 
-- macOS Intel + Apple Silicon launch, quit, reopen/resume, Unicode text and font fallback.
+- macOS Intel + Apple Silicon launch, quit, reopen into a fresh terminal, Unicode text and font fallback.
 - Interactive Vim/Neovim visual acceptance (Normal/Insert/Replace, resize, wide text), tmux navigation, less paging, shell job control/Ctrl+C/Ctrl+Z, SSH.
 - Real Claude login, a permission prompt, an input wait, Stop, SessionEnd, and jumping back to the same pane.
 - Terminal search in scrollback/alternate screen, search input isolation, narrow split search controls, keyboard copy-mode navigation/input isolation, selection/copy/paste, IME composition, Option-modified text, Retina scaling, drag split resizing.
@@ -31,3 +31,5 @@ Enable **Clickable Codex questions** in Workspace & commands. In Codex's numbere
 Typing, keyboard navigation, IME commits, and pasting return scrollback to the live input. Scrolling, copying, and terminal protocol replies preserve the current view.
 
 Cursor regressions cover fragmented shape requests, visibility toggles, alternate-screen exit, resize, wide/combining text, opaque block contrast and clipping. A native Vim PTY check verifies Insert-mode beam and Normal-mode block requests with ttimeoutlen=50; interactive visual acceptance remains pending. Cursor blink requests are intentionally rendered steadily.
+
+Terminal fonts include an embedded Noto Sans Symbols 2 fallback for Unicode prompt symbols such as `✗`, `✘` and checkmarks. Ordinary text keeps the existing Hack font and terminal cell metrics. Custom Nerd Font private-use icons still require further font support.

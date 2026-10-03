@@ -363,6 +363,11 @@ impl Terminal {
             launch_directory: directory.to_path_buf(),
         })
     }
+    pub fn has_exited(&self) -> bool {
+        // PTY EOF/read failures alone do not prove that the shell stopped.
+        !self.alive.load(Ordering::Acquire)
+            && self.lifecycle.try_lock().is_ok_and(|life| life.exited)
+    }
     pub fn current_directory(&self) -> Result<PathBuf> {
         if !self.alive.load(Ordering::Acquire) {
             return Ok(self.launch_directory.clone());

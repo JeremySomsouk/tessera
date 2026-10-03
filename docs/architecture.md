@@ -29,4 +29,6 @@ Input queue saturation is reported rather than silently accepted. Terminal outpu
 macOS: `~/Library/Application Support/Tessera/workspace.json`.
 Linux: `~/.config/tessera/workspace.json`.
 
+Every launch discards saved tabs/splits and opens one new terminal in the application’s starting directory. Preferences and session histories survive; previous non-ended sessions become disconnected.
+
 Writes are background atomic replacements with mode 0600. On parse errors, the original is preserved and new state goes to `workspace.recovered.json`. The shutdown path drains the persistence worker. A multi-process locking policy is still needed: run a single Tessera instance for this increment.
