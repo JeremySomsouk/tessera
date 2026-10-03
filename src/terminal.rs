@@ -567,6 +567,39 @@ mod tests {
         assert_eq!(term.renderable_content().cursor.shape, CursorShape::Beam);
     }
     #[test]
+    fn vim_cursor_shapes_survive_fragmented_updates_wide_text_and_resize() {
+        let mut term = Term::new(terminal_config(), &Size { cols: 20, rows: 5 }, VoidListener);
+        let mut parser: Processor = Processor::new();
+        parser.advance(
+            &mut term,
+            "\x1b[?1049h\x1b[2 q界\u{301}\x1b[1;2H".as_bytes(),
+        );
+        assert_eq!(
+            term.renderable_content().cursor.point,
+            Point::new(Line(0), Column(0))
+        );
+        assert_eq!(term.renderable_content().cursor.shape, CursorShape::Block);
+        parser.advance(&mut term, b"\x1b[6");
+        assert_eq!(term.renderable_content().cursor.shape, CursorShape::Block);
+        parser.advance(&mut term, b" q");
+        assert_eq!(term.renderable_content().cursor.shape, CursorShape::Beam);
+        for (sequence, shape) in [
+            (b"\x1b[1 q".as_slice(), CursorShape::Block),
+            (b"\x1b[3 q".as_slice(), CursorShape::Underline),
+            (b"\x1b[5 q".as_slice(), CursorShape::Beam),
+        ] {
+            parser.advance(&mut term, sequence);
+            term.resize(Size { cols: 12, rows: 3 });
+            assert_eq!(term.renderable_content().cursor.shape, shape);
+        }
+        parser.advance(&mut term, b"\x1b[?25l");
+        assert_eq!(term.renderable_content().cursor.shape, CursorShape::Hidden);
+        parser.advance(&mut term, b"\x1b[?25h\x1b[2 q");
+        assert_eq!(term.renderable_content().cursor.shape, CursorShape::Block);
+        parser.advance(&mut term, b"\x1b[?1049l\x1b[0 q");
+        assert_eq!(term.renderable_content().cursor.shape, CursorShape::Beam);
+    }
+    #[test]
     fn terminal_color_queries_report_dark_background_and_current_dynamic_colors() {
         let replies = Arc::new(Mutex::new(Vec::new()));
         let listener = Listener {

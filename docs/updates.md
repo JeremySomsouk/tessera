@@ -6,6 +6,10 @@ Automatic checking and downloading are enabled by default, with launch and daily
 
 Each architecture has its own `appcast-arm64.xml` or `appcast-x86_64.xml`, served from the latest GitHub release. Feeds point at version-specific DMG URLs, contain the exact archive size and signature, and use the app's increasing `CFBundleVersion` (`1.minor.patch` for the current 0.x releases). Both feeds and archives are signed; feed signature failures do not expire, and archives must pass signature verification before extraction. GitHub release publication checks for all four assets before ending draft status.
 
+## Missing update controls
+
+Open Workspace & commands with Cmd+Shift+P to find **Check for updates…**. Starting with 0.2.3, the dialog scrolls and retains updater startup errors beside a disabled check button. If Sparkle cannot load or start, reinstall the macOS application bundle; Cargo binaries show that bundle updates are unavailable. In 0.2.2, a startup failure hides the update controls and reports the failure through the general error display, which later errors can replace.
+
 ## Release key
 
 The public key in `updates/public-key.txt` is embedded as `SUPublicEDKey`. The corresponding private key is in the maintainer's macOS login Keychain under Sparkle account `fr.somsouk.tessera`. Never commit or print this private key. Keep a secure backup: losing it requires users to manually install an app containing a replacement public key.

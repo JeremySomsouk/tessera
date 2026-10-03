@@ -196,6 +196,7 @@ struct WorkspaceRename {
 
 pub struct App {
     updater: crate::updater::Updater,
+    updater_error: Option<String>,
     saved: Saved,
     panes: HashMap<Uuid, Pane>,
     active: usize,
@@ -274,6 +275,7 @@ impl App {
         });
         let mut app = Self {
             updater: crate::updater::Updater::default(),
+            updater_error: None,
             font_size: if saved.font_size > 0.0 {
                 saved.font_size
             } else {
@@ -308,7 +310,7 @@ impl App {
         }
         match crate::updater::Updater::start() {
             Ok(updater) => app.updater = updater,
-            Err(error) => app.error = format!("Updates unavailable: {error}"),
+            Err(error) => app.updater_error = Some(format!("Updates unavailable: {error}")),
         }
         configure_appearance(&cc.egui_ctx, app.saved.light);
         // Restore metadata only. Live processes never survive application shutdown.
@@ -1107,7 +1109,27 @@ impl App {
             let Some(w)=self.saved.workspaces.get_mut(self.active) else {ui.label("Create a workspace to start a shell.");return;};
             let mut rects=Vec::new();let rect=ui.available_rect_before_wrap();
             if self.maximized {rects.push((w.focus,rect));}else{w.layout.rects(ui,rect,&mut rects);}
-            let focused=w.focus;
+            let mut focused=w.focus;
+            if !self.palette && self.rename.is_none() && self.closing.is_none() {
+                let dropped = ctx.input_mut(|i| std::mem::take(&mut i.raw.dropped_files));
+                if !dropped.is_empty() {
+                    let pointer = ctx.input(|i| i.pointer.latest_pos());
+                    let target = pointer.map_or(Some(focused), |pos| rects.iter().find(|(_, rect)| rect.contains(pos)).map(|(id, _)| *id));
+                    let result = target.and_then(|id| self.panes.get_mut(&id).map(|pane| (id, pane)))
+                        .ok_or_else(|| anyhow::anyhow!("Drop files onto a running terminal pane"))
+                        .and_then(|(id, pane)| {
+                            if pane.search.is_open() || pane.terminal.copy_mode {
+                                anyhow::bail!("Close Find or copy mode before dropping files");
+                            }
+                            pane.terminal.input_at_cursor(dropped_file_input(&dropped, pane.terminal.mode())?)?;
+                            self.saved.workspaces[self.active].focus = id;
+                            focused = id;
+                            self.dirty = true;
+                            Ok(())
+                        });
+                    if let Err(error) = result { self.error = error.to_string(); }
+                }
+            }
             for (id,rect) in rects {
                 ui.scope_builder(egui::UiBuilder::new().max_rect(rect).id_salt(id),|ui| {
                     if let Some(pane)=self.panes.get_mut(&id) {
@@ -1127,6 +1149,7 @@ if !pane.terminal.alive.load(Ordering::Acquire){ui.label("Shell exited");}});
             egui::Window::new("Workspace & commands")
                 .collapsible(false)
                 .resizable(false)
+                .vscroll(true)
                 .show(ctx, |ui| {
                     ui.label("Working directory");
                     let directory = ui.add(
@@ -1221,9 +1244,9 @@ if !pane.terminal.alive.load(Ordering::Acquire){ui.label("Shell exited");}});
                     {
                         self.dirty = true;
                     }
+                    ui.separator();
+                    ui.label(format!("Tessera {}", env!("CARGO_PKG_VERSION")));
                     if self.updater.available() {
-                        ui.separator();
-                        ui.label(format!("Tessera {}", env!("CARGO_PKG_VERSION")));
                         if ui
                             .add_enabled(
                                 self.updater.can_check(),
@@ -1254,6 +1277,11 @@ if !pane.terminal.alive.load(Ordering::Acquire){ui.label("Shell exited");}});
                             self.updater.set_automatic_downloads(download);
                         }
                         ui.small("Downloaded updates install when Tessera quits.");
+                    } else if let Some(error) = &self.updater_error {
+                        ui.add_enabled(false, egui::Button::new("Check for updates…"));
+                        ui.colored_label(ui.visuals().error_fg_color, error);
+                    } else {
+                        ui.small("Automatic updates require the macOS application bundle.");
                     }
                     if ui.button("Close").clicked() {
                         self.palette = false;
@@ -1377,15 +1405,92 @@ fn workspace_submission(ctx: &egui::Context) -> Option<egui::Id> {
         .then_some(focused)
 }
 
+fn dropped_file_input(files: &[egui::DroppedFile], mode: TermMode) -> anyhow::Result<Vec<u8>> {
+    let mut text = String::new();
+    for file in files {
+        let path = file.path.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("Save the screenshot as a file, then drop it onto the terminal")
+        })?;
+        let path = path
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("Dropped file path is not valid UTF-8"))?;
+        if path.is_empty() || path.chars().any(char::is_control) {
+            anyhow::bail!("Dropped file path contains unsupported control characters");
+        }
+        if path.len() > 60 * 1024 {
+            anyhow::bail!("Dropped file path exceeds the terminal paste limit");
+        }
+        if !text.is_empty() {
+            text.push(' ');
+        }
+        if mode.contains(TermMode::BRACKETED_PASTE) {
+            text.push_str("\x1b[200~");
+        }
+        text.push('\'');
+        text.push_str(&path.replace('\'', "'\\''"));
+        text.push('\'');
+        if mode.contains(TermMode::BRACKETED_PASTE) {
+            text.push_str("\x1b[201~");
+        }
+        if text.len() > 60 * 1024 {
+            anyhow::bail!("Dropped file paths exceed the terminal paste limit; drop fewer files");
+        }
+    }
+    Ok(text.into_bytes())
+}
+
 fn cursor_rect(shape: CursorShape, pos: Pos2, cell: Vec2) -> Option<Rect> {
     match shape {
-        CursorShape::Beam => Some(Rect::from_min_size(pos, Vec2::new(2.0, cell.y))),
+        CursorShape::Beam => Some(Rect::from_min_size(
+            pos,
+            Vec2::new(2.0_f32.min(cell.x), cell.y),
+        )),
         CursorShape::Underline => Some(Rect::from_min_size(
-            pos + Vec2::new(0.0, cell.y - 2.0),
-            Vec2::new(cell.x, 2.0),
+            pos + Vec2::new(0.0, cell.y - 2.0_f32.min(cell.y)),
+            Vec2::new(cell.x, 2.0_f32.min(cell.y)),
         )),
         CursorShape::Block | CursorShape::HollowBlock => Some(Rect::from_min_size(pos, cell)),
         CursorShape::Hidden => None,
+    }
+}
+
+fn paint_cursor(
+    painter: &egui::Painter,
+    shape: CursorShape,
+    pos: Pos2,
+    cell: Vec2,
+    color: Color32,
+    font: &FontId,
+    glyph: &str,
+) {
+    let Some(rect) = cursor_rect(shape, pos, cell) else {
+        return;
+    };
+    match shape {
+        CursorShape::HollowBlock => {
+            painter.rect_stroke(
+                rect,
+                0.0,
+                Stroke::new(1.0_f32, color),
+                egui::StrokeKind::Inside,
+            );
+        }
+        CursorShape::Block => {
+            painter.rect_filled(rect, 0.0, color);
+            // Repaint the glyph over an opaque cursor rather than tinting/obscuring it.
+            let light = u32::from(color.r()) * 299
+                + u32::from(color.g()) * 587
+                + u32::from(color.b()) * 114;
+            let foreground = if light >= 128_000 {
+                Color32::BLACK
+            } else {
+                Color32::WHITE
+            };
+            painter.text(pos, egui::Align2::LEFT_TOP, glyph, font.clone(), foreground);
+        }
+        _ => {
+            painter.rect_filled(rect, 0.0, color);
+        }
     }
 }
 
@@ -1551,35 +1656,46 @@ fn terminal_view(
             }
         }
         if focused
+            && !searching
             && ((copying && mode.contains(TermMode::VI))
-                || (mode.contains(TermMode::SHOW_CURSOR) && content.display_offset == 0))
+                || (!copying
+                    && !mode.contains(TermMode::VI)
+                    && mode.contains(TermMode::SHOW_CURSOR)
+                    && content.display_offset == 0))
         {
             let p = content.cursor.point;
-            let pos = grid_rect.min
-                + Vec2::new(
-                    p.column.0 as f32 * cell.x,
-                    (p.line.0 + content.display_offset as i32) as f32 * cell.y,
-                );
-            let cursor_color = content.colors[NamedColor::Cursor as usize]
-                .map(|rgb| Color32::from_rgb(rgb.r, rgb.g, rgb.b))
-                .unwrap_or(ACCENT);
-            if let Some(rect) = cursor_rect(content.cursor.shape, pos, cell) {
-                match content.cursor.shape {
-                    CursorShape::HollowBlock => {
-                        painter.rect_stroke(
-                            rect,
-                            0.0,
-                            Stroke::new(1.0_f32, cursor_color),
-                            egui::StrokeKind::Inside,
-                        );
-                    }
-                    CursorShape::Block => {
-                        painter.rect_filled(rect, 0.0, cursor_color.gamma_multiply(0.55));
-                    }
-                    _ => {
-                        painter.rect_filled(rect, 0.0, cursor_color);
+            let row = p.line.0 + content.display_offset as i32;
+            if row >= 0 && row < rows as i32 && p.column.0 < cols {
+                let pos =
+                    grid_rect.min + Vec2::new(p.column.0 as f32 * cell.x, row as f32 * cell.y);
+                let cursor_cell = &term.grid()[p];
+                let width = if cursor_cell.flags.contains(Flags::WIDE_CHAR) {
+                    2.0
+                } else {
+                    1.0
+                };
+                let cursor_color = content.colors[NamedColor::Cursor as usize]
+                    .map(|rgb| Color32::from_rgb(rgb.r, rgb.g, rgb.b))
+                    .unwrap_or(ACCENT);
+                let mut glyph = String::new();
+                if !cursor_cell
+                    .flags
+                    .intersects(Flags::HIDDEN | Flags::WIDE_CHAR_SPACER)
+                {
+                    glyph.push(cursor_cell.c);
+                    if let Some(marks) = cursor_cell.zerowidth() {
+                        glyph.extend(marks);
                     }
                 }
+                paint_cursor(
+                    &painter,
+                    content.cursor.shape,
+                    pos,
+                    Vec2::new(cell.x * width, cell.y),
+                    cursor_color,
+                    &font,
+                    &glyph,
+                );
             }
         }
         selected = term.selection_to_string();
@@ -2134,6 +2250,7 @@ mod render_tests {
         let selected = saved.sessions.first().map(Session::key);
         App {
             updater: crate::updater::Updater::default(),
+            updater_error: None,
             saved,
             panes: HashMap::new(),
             active: 0,
@@ -2297,6 +2414,135 @@ mod render_tests {
         assert!(app.rename.is_none());
         assert_eq!(app.saved.workspaces[1].task.title, original);
         assert!(!app.dirty);
+    }
+
+    #[test]
+    fn dropped_paths_are_quoted_and_each_image_gets_its_own_paste() {
+        let files =
+            ["/tmp/Screen shot é.png", "/tmp/a'$(touch nope).png"].map(|path| egui::DroppedFile {
+                path: Some(PathBuf::from(path)),
+                ..Default::default()
+            });
+        let plain = "'/tmp/Screen shot é.png' '/tmp/a'\\''$(touch nope).png'";
+        assert_eq!(
+            dropped_file_input(&files, TermMode::empty()).unwrap(),
+            plain.as_bytes()
+        );
+        assert_eq!(dropped_file_input(&files, TermMode::BRACKETED_PASTE).unwrap(),
+            "\x1b[200~'/tmp/Screen shot é.png'\x1b[201~ \x1b[200~'/tmp/a'\\''$(touch nope).png'\x1b[201~".as_bytes());
+        for path in ["/tmp/bad\nname.png", "/tmp/bad\x1bname.png", ""] {
+            assert!(
+                dropped_file_input(
+                    &[egui::DroppedFile {
+                        path: Some(path.into()),
+                        ..Default::default()
+                    }],
+                    TermMode::empty()
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            dropped_file_input(&[egui::DroppedFile::default()], TermMode::empty())
+                .unwrap_err()
+                .to_string()
+                .contains("Save the screenshot")
+        );
+        assert!(
+            dropped_file_input(
+                &[egui::DroppedFile {
+                    path: Some("x".repeat(64 * 1024).into()),
+                    ..Default::default()
+                }],
+                TermMode::empty()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn file_drop_targets_the_hovered_split_and_reaches_pty_without_enter() {
+        let ctx = egui::Context::default();
+        let mut app = fixture(1);
+        app.overview = false;
+        app.resume(&ctx, 0);
+        let target = app.saved.workspaces[0].focus;
+        app.split(&ctx, true);
+        let other = app.saved.workspaces[0].focus;
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("received");
+        let ready = directory.path().join("ready");
+        let files = vec![egui::DroppedFile {
+            path: Some("/tmp/Screenshot é '1.png".into()),
+            ..Default::default()
+        }];
+        let expected = dropped_file_input(&files, TermMode::BRACKETED_PASTE).unwrap();
+        app.panes[&target].terminal.input(format!(
+            "printf '\\033[?2004h'; stty raw -echo; touch '{}'; dd bs=1 count={} of='{}' 2>/dev/null\r",
+            ready.display(), expected.len(), output.display()
+        ).into_bytes()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !ready.exists()
+            || !app.panes[&target]
+                .terminal
+                .mode()
+                .contains(TermMode::BRACKETED_PASTE)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "PTY did not become ready"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let frame = |app: &mut App, dropped_files| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(640.0, 480.0))),
+                    events: vec![egui::Event::PointerMoved(Pos2::new(150.0, 250.0))],
+                    dropped_files,
+                    ..Default::default()
+                },
+                |ctx| app.draw(ctx),
+            );
+        };
+        frame(&mut app, vec![]);
+        app.panes.get_mut(&target).unwrap().search.open();
+        frame(&mut app, files.clone());
+        assert!(app.error.contains("Close Find"));
+        assert_eq!(app.saved.workspaces[0].focus, other);
+        app.panes.get_mut(&target).unwrap().search.close();
+        frame(&mut app, files);
+        assert_eq!(app.saved.workspaces[0].focus, target);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !std::fs::read(&output).is_ok_and(|bytes| bytes.len() == expected.len()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Drop did not reach target PTY"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(std::fs::read(output).unwrap(), expected);
+        assert!(!expected.contains(&b'\r') && !expected.contains(&b'\n'));
+    }
+
+    #[test]
+    fn updater_failure_remains_visible_after_other_errors_change() {
+        let ctx = egui::Context::default();
+        let mut app = fixture(1);
+        app.palette = true;
+        app.updater_error =
+            Some("Updates unavailable: Cannot load Sparkle; reinstall Tessera".into());
+        app.error = "Unrelated terminal error".into();
+        let mut output = None;
+        for _ in 0..3 {
+            output = Some(ctx.run(egui::RawInput::default(), |ctx| app.draw(ctx)));
+        }
+        let output = output.unwrap();
+        for expected in ["Check for updates…", app.updater_error.as_ref().unwrap()] {
+            assert!(output.shapes.iter().any(|shape| {
+                matches!(&shape.shape, egui::epaint::Shape::Text(text) if text.galley.text() == expected)
+            }), "Missing updater diagnostic: {expected}");
+        }
     }
 
     #[test]
@@ -2842,6 +3088,51 @@ mod render_tests {
             cell
         );
         assert!(cursor_rect(CursorShape::Hidden, Pos2::ZERO, cell).is_none());
+    }
+
+    #[test]
+    fn block_cursor_preserves_glyph_contrast_and_terminal_clip() {
+        let ctx = egui::Context::default();
+        let clip = Rect::from_min_size(Pos2::ZERO, Vec2::new(30.0, 40.0));
+        for (color, foreground) in [(ACCENT, Color32::BLACK), (Color32::BLACK, Color32::WHITE)] {
+            let output = ctx.run(egui::RawInput::default(), |ctx| {
+                let painter = ctx
+                    .layer_painter(egui::LayerId::background())
+                    .with_clip_rect(clip);
+                paint_cursor(
+                    &painter,
+                    CursorShape::Block,
+                    Pos2::new(24.0, 2.0),
+                    Vec2::new(18.0, 20.0),
+                    color,
+                    &FontId::monospace(15.0),
+                    "界\u{301}",
+                );
+            });
+            let block = output.shapes.iter().find(|shape| matches!(&shape.shape, egui::epaint::Shape::Rect(rect) if rect.fill == color)).unwrap();
+            assert_eq!(block.clip_rect, clip);
+            if let egui::epaint::Shape::Rect(rect) = &block.shape {
+                assert_eq!(rect.rect.width(), 18.0);
+            }
+            let glyph = output.shapes.iter().find(|shape| matches!(&shape.shape, egui::epaint::Shape::Text(text) if text.galley.text() == "界\u{301}")).unwrap();
+            assert_eq!(glyph.clip_rect, clip);
+            if let egui::epaint::Shape::Text(text) = &glyph.shape {
+                assert_eq!(text.fallback_color, foreground);
+            }
+        }
+        let tiny = Vec2::new(1.0, 1.0);
+        assert_eq!(
+            cursor_rect(CursorShape::Beam, Pos2::ZERO, tiny)
+                .unwrap()
+                .size(),
+            tiny
+        );
+        assert_eq!(
+            cursor_rect(CursorShape::Underline, Pos2::ZERO, tiny)
+                .unwrap()
+                .min,
+            Pos2::ZERO
+        );
     }
 
     #[test]
