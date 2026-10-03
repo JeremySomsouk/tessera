@@ -1247,7 +1247,7 @@ fn terminal_view(
                         painter.rect_stroke(
                             rect,
                             0.0,
-                            Stroke::new(1.0, cursor_color),
+                            Stroke::new(1.0_f32, cursor_color),
                             egui::StrokeKind::Inside,
                         );
                     }
