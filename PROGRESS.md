@@ -111,3 +111,12 @@ Validation: all 54 Rust tests pass, including a real PTY receiving an arrow from
 Cmd+N and Cmd+T now open a workspace using the focused shell's live working directory rather than the workspace dialog's last configured directory. Reads use the child shell PID with macOS proc_pidinfo or Linux /proc, without injecting commands or changing shell configuration. Restored/exited shells use their saved/launch directory; live lookup errors are shown instead of silently opening elsewhere. The workspace dialog still honors its explicit directory. Regression covers a focused split pane after cd into a directory with spaces and Unicode and verifies the new real shell directory.
 
 Validation: all 55 Rust tests pass, including the real-shell Cmd+N regression; formatting, Clippy with warnings denied, release build, appcast test, shell syntax and diff checks pass locally. Linux/Apple Silicon CI remains pending.
+
+
+2026-10-04 — 0.2.2 published; 0.2.3 cursor rendering.
+
+Published v0.2.2 at a77e1f4 with Intel/Apple Silicon DMGs and signed architecture feeds after all three CI jobs passed. Repository is public, signing secret is configured, and anonymous latest-feed/archive downloads and signatures verify for both architectures. No private key remains in a temporary export.
+
+0.2.3 uses opaque block cursors with contrasting glyph repaint, wide-character width, terminal clipping and visible-row guards. Search and copy-mode transitions suppress conflicting cursor rendering. Application shape/visibility requests remain authoritative; blink remains steady. Added rendering and fragmented-protocol regressions, and bundled Sparkle's license/notices. Native Vim PTY mode requests checked; interactive visual acceptance and a real installed 0.2.2 → 0.2.3 update remain pending.
+
+Validation: 57 Rust tests including real PTY/Unix socket cases pass. Formatting, Clippy with warnings denied, release build, appcast test, shell syntax and diff checks pass. Local signed Intel packaging verifies and includes Sparkle notices. Native visual and installed update acceptance remain pending.

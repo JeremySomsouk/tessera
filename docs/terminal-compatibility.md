@@ -2,7 +2,7 @@
 
 ## Implemented
 
-Real login shell in a PTY, inherited environment/startup files, PTY resizing, parser-driven ANSI colors (16/256/truecolor), alternate screen, beam typing caret and application-requested cursor shapes, bounded scrollback, Unicode/wide/combining character state, pane-local literal search with scrollback navigation, drag and keyboard selection/copy, paste/bracketed paste, control keys, application cursor mode, arrow/home/end/edit keys, basic mouse button and wheel reporting (SGR and legacy), accumulated trackpad scrolling, return to live input on typing/paste, opt-in clickable Codex question choices, alternate-screen wheel-to-arrow input, IME commit input, splits and preserved live pane identity. OSC 52 clipboard reads/writes are denied. TERM is xterm-256color.
+Real login shell in a PTY, inherited environment/startup files, PTY resizing, parser-driven ANSI colors (16/256/truecolor), alternate screen, beam typing caret and application-requested cursor shapes, opaque block cursors with contrasting text, wide-character cursor coverage and clipping, bounded scrollback, Unicode/wide/combining character state, pane-local literal search with scrollback navigation, drag and keyboard selection/copy, paste/bracketed paste, control keys, application cursor mode, arrow/home/end/edit keys, basic mouse button and wheel reporting (SGR and legacy), accumulated trackpad scrolling, return to live input on typing/paste, opt-in clickable Codex question choices, alternate-screen wheel-to-arrow input, IME commit input, splits and preserved live pane identity. OSC 52 clipboard reads/writes are denied. TERM is xterm-256color.
 
 ## Checked during implementation
 
@@ -11,7 +11,7 @@ Portable tests: real shell input/output and resize (`stty size`), cursor-positio
 ## Native acceptance checklist (not yet performed)
 
 - macOS Intel + Apple Silicon launch, quit, reopen/resume, Unicode text and font fallback.
-- Vim/Neovim editing, tmux navigation, less paging, shell job control/Ctrl+C/Ctrl+Z, SSH.
+- Interactive Vim/Neovim visual acceptance (Normal/Insert/Replace, resize, wide text), tmux navigation, less paging, shell job control/Ctrl+C/Ctrl+Z, SSH.
 - Real Claude login, a permission prompt, an input wait, Stop, SessionEnd, and jumping back to the same pane.
 - Terminal search in scrollback/alternate screen, search input isolation, narrow split search controls, keyboard copy-mode navigation/input isolation, selection/copy/paste, IME composition, Option-modified text, Retina scaling, drag split resizing.
 - Keyboard-only Overview, system accessibility/VoiceOver, narrow window chrome, reduced motion.
@@ -25,3 +25,5 @@ Search omits combining marks under Alacritty’s base-cell semantics; output cha
 Enable **Clickable Codex questions** in Workspace & commands. In Codex's numbered question prompt, clicking an option selects it; press Enter to submit. Shift/drag retains text selection. Native mouse-reporting applications keep their own input handling. Compatibility only recognizes the visible question prompt with its selection marker and keyboard footer; ordinary numbered output, scrollback, search, copy mode, and notes entry do not receive synthetic keys. This is checked against Codex 0.160.0; future prompt layouts may require an update.
 
 Typing, keyboard navigation, IME commits, and pasting return scrollback to the live input. Scrolling, copying, and terminal protocol replies preserve the current view.
+
+Cursor regressions cover fragmented shape requests, visibility toggles, alternate-screen exit, resize, wide/combining text, opaque block contrast and clipping. A native Vim PTY check verifies Insert-mode beam and Normal-mode block requests with ttimeoutlen=50; interactive visual acceptance remains pending. Cursor blink requests are intentionally rendered steadily.
