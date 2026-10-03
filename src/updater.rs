@@ -116,11 +116,11 @@ pub use native::Updater;
 
 #[cfg(not(target_os = "macos"))]
 #[derive(Default)]
-pub struct Updater;
+pub struct Updater {}
 #[cfg(not(target_os = "macos"))]
 impl Updater {
     pub fn start() -> anyhow::Result<Self> {
-        Ok(Self)
+        Ok(Self {})
     }
     pub fn available(&self) -> bool {
         false
