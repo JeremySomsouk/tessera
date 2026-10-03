@@ -4,7 +4,7 @@
 
 A desktop terminal workspace with a single Overview of real Claude Code and Codex sessions.
 
-**0.2.3 improves terminal cursor rendering, including Vim cursor shapes and readable block cursors.** It combines real login-shell PTYs, resizable splits, keyboard navigation, persistent workspace metadata, signed automatic macOS updates, and a hook-driven agent Overview. Specification editing, issue connectors, and detached session hosting follow in later increments.
+**0.2.3 improves Vim/Neovim cursor rendering.** Signed automatic macOS updates, workspace renaming, trackpad scrolling and the saved terminal-close preference were added in 0.2.2. It combines real login-shell PTYs, resizable splits, keyboard navigation, persistent workspace metadata, and a hook-driven agent Overview. Specification editing, issue connectors, and detached session hosting follow in later increments.
 
 ## Start on macOS
 

@@ -30,4 +30,4 @@ Enable **Clickable Codex questions** in Workspace & commands. In Codex's numbere
 
 Typing, keyboard navigation, IME commits, and pasting return scrollback to the live input. Scrolling, copying, and terminal protocol replies preserve the current view.
 
-Cursor regressions cover fragmented shape requests, visibility toggles, alternate-screen exit, resize, wide/combining text, opaque block contrast and clipping. A native Vim PTY check verifies Insert-mode beam and Normal-mode block requests; interactive visual acceptance remains pending. Cursor blink requests are intentionally rendered steadily.
+Cursor regressions cover fragmented shape requests, visibility toggles, alternate-screen exit, resize, wide/combining text, opaque block contrast and clipping. A native Vim PTY check verifies Insert-mode beam and Normal-mode block requests with ttimeoutlen=50; interactive visual acceptance remains pending. Cursor blink requests are intentionally rendered steadily.
