@@ -15,3 +15,10 @@ Local environment limitation: no macOS window server; local socket bind is denie
 Current architecture hosts PTYs in worker threads in the app process. UI navigation preserves them; app exit does not. Metadata/history restore is implemented; detached live-process recovery is planned. Specs/connector/review-evidence milestones remain planned, not partially represented by fake views.
 
 Resume work: inspect CI, install the Intel app on the user's Mac, run the native checklist in docs/terminal-compatibility.md, fix functional blockers before starting the local specification board. Keep TODO.md and this file current per increment.
+
+
+2026-10-03 — Mosaic application icon.
+
+Selected Mosaic artwork exported as a 1024px transparent PNG and a 256px native viewport icon. macOS bundles generate the full 1×/2× ICNS family and declare CFBundleIconFile, verify icon decoding and bundle signatures, then archive. The same asset supports Intel and Apple Silicon. This increment is independent of the Codex integration PR. CI push follows the repository's renamed main branch.
+
+Validation: source PNG dimensions/alpha and small-size visual inspection, shell syntax, Rust formatting/build/Clippy, existing tests, and native ICNS/bundle checks in macOS CI. Interactive Dock/Finder appearance remains to be checked on a physical Mac.
