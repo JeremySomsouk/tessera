@@ -2,9 +2,9 @@
 
 # Tessera
 
-A desktop terminal workspace with a single Overview of real Claude Code sessions.
+A desktop terminal workspace with a single Overview of real Claude Code and Codex sessions.
 
-**0.1.0 is the first runnable increment.** It combines real login-shell PTYs, resizable splits, keyboard navigation, persistent workspace metadata, and a hook-driven Claude Overview. Specification editing, issue connectors, and detached session hosting follow in later increments.
+**0.1.0 is the first runnable increment.** It combines real login-shell PTYs, resizable splits, keyboard navigation, persistent workspace metadata, and a hook-driven agent Overview. Specification editing, issue connectors, and detached session hosting follow in later increments.
 
 ## Start on macOS
 
@@ -17,7 +17,7 @@ cargo install --path . --locked
 tessera
 ```
 
-This starts the native desktop application. It uses `$SHELL` as a login shell (defaults to `/bin/zsh` on macOS) and preserves shell startup files. Run ordinary commands, Vim, SSH, or `claude` directly in a pane.
+This starts the native desktop application. It uses `$SHELL` as a login shell (defaults to `/bin/zsh` on macOS) and preserves shell startup files. Run ordinary commands, Vim, SSH, `claude`, or `codex` directly in a pane.
 
 To build a Finder application:
 
@@ -27,6 +27,26 @@ open dist/Tessera.app
 ```
 
 CI produces separate Intel and Apple Silicon `.app` ZIP artifacts in the **Build and verify** workflow. Copy the application to its final location before installing hooks. Bundles are ad-hoc signed, not notarized; macOS may require Open from the application's context menu.
+
+## Connect Codex CLI
+
+Install Codex separately and use its normal login. Preview and install Tessera's observational lifecycle hooks:
+
+```sh
+tessera codex-hooks           # preview definitions
+tessera install-codex-hooks   # merge with backup into $CODEX_HOME/hooks.json
+codex                        # run inside a Tessera pane; open /hooks to review and trust
+```
+
+When `CODEX_HOME` is unset, the default is `~/.codex/hooks.json`. A custom file can be passed explicitly to the install/uninstall commands. Use a Codex release with lifecycle hooks, review and trust Tessera's exact definitions in `/hooks`, and restart the session if needed. Hooks disabled by user or administrator policy remain disabled. Existing inline hooks in `config.toml` remain untouched; Codex may warn about both representations in one config layer.
+
+Codex and Claude sessions share **Cmd+Shift+O** Overview, with an agent label and independent identities even when session IDs match. Start/prompt/tool events show running activity, permission requests need attention, Stop marks response completion, Interrupt needs input, and SessionEnd ends tracking. Approval decisions stay in Codex's terminal; task review/acceptance stays explicit.
+
+```sh
+tessera uninstall-codex-hooks # removes only commands from this executable location
+```
+
+No API key, paid session, transcript scanning, `notify` replacement, or hook-trust bypass is introduced. The existing 64 KiB per-hook input limit also applies to Codex; larger tool payloads cannot be tracked. Older `notify`-only Codex versions, remote/Cloud sessions, and separately identified subagent cards are outside this increment. See [integration details](docs/integration.md).
 
 ## Connect Claude Code
 
