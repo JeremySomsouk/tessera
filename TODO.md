@@ -31,4 +31,4 @@
 - [ ] Jira/GitHub read/import, project configuration and Keychain credential adapter.
 - [ ] Reviewed publish with conflict re-fetch and rich-content preservation.
 - [ ] Verification receipts, staleness, criterion-linked change requests and handoff.
-- [ ] Signed/notarized release, update strategy, Linux packaging.
+- [ ] Developer ID signing/notarization, native signed-updater acceptance, Linux packaging.

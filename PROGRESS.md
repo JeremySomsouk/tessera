@@ -74,3 +74,26 @@ Release validation: all 41 tests pass including both Unix socket round trips whe
 2026-10-03 — Immediate terminal stop.
 
 Removed stop confirmation following user feedback. Cmd+W immediately stops the focused terminal and removes its pane/workspace; the × button performs the same action in the current frame after pane rendering. No persistent pending-close state or confirmation window remains. Task/session history retention is unchanged. Shortcut regression now asserts immediate removal and disconnected history.
+
+
+2026-10-03 — Workspace rename and terminal close preference.
+
+Cmd+Shift+R (Ctrl+Alt+Shift+R on Linux) renames the active workspace through a compact modal, selects the existing name, saves with Enter, and cancels with Escape. Blank names are rejected, surrounding whitespace is trimmed, and the existing workspace persistence stores changes. Workspace & commands also exposes Rename workspace. Dialog identity uses task UUIDs so a rename cannot target another tab accidentally; modal input is withheld from the terminal.
+
+Cmd+W and the pane close button now share a confirmation with “Don’t ask again for any terminal.” Confirming with that checkbox stores the preference globally across workspaces and restarts; cancellation leaves both the terminal and preference unchanged. Existing state files default to confirmation. “Confirm before stopping terminals” in Workspace & commands can restore prompts. Last-pane workspace removal and retained session history use the existing close path.
+
+
+2026-10-03 — Trackpad and application wheel scrolling.
+
+Terminal scrolling now accumulates fractional trackpad deltas instead of rounding each frame to zero. Mouse-reporting applications receive SGR or legacy wheel events at the pointer's terminal coordinates; alternate-screen applications with alternate-scroll enabled receive cursor keys. Shift and copy mode keep scrolling native, and exited shells retain scrollback. Wheel input is batched and bounded per frame. Native scrollback operations use the existing control queue while a shell is live, avoiding dropped movement when the parser holds the terminal lock, and request a repaint.
+
+Regressions cover fractional movement, mode transitions, mouse protocol coordinates/modifiers, native versus alternate-screen routing, and a real PTY receiving a wheel event from four small gesture frames. Native macOS trackpad acceptance with Codex remains to be performed with the rebuilt application.
+
+
+2026-10-03 — 0.2.2 release and native automatic updates.
+
+Added Sparkle 2.10.0 with a pinned framework archive checksum, bundled native loading, automatic launch/daily checks and background downloads, install-on-quit behavior, manual checks and Sparkle-owned persisted preferences. Plain Cargo and non-macOS builds do not start an updater. Architecture-specific signed feeds and signed DMGs are published atomically within the existing draft release flow. Feeds require Ed25519 verification without expiry; archives require verification before extraction. Release signing is gated on version tags and requires SPARKLE_ED25519_PRIVATE_KEY, matched to the committed public key. The local private key stays in the macOS login Keychain. Current bundles remain ad hoc signed; initial manual installation/approval and later native update acceptance are documented.
+
+Bumped package/lockfile to 0.2.2 and added release notes covering automatic updates, rename, close preference and trackpad scrolling. Updated release setup and terminal compatibility documentation.
+
+Validation: all 50 Rust tests pass including Unix socket and real PTY cases; the portable appcast test passes. Formatting, Clippy with warnings denied, debug/release builds, shell syntax and diff checks pass. The Intel DMG, nested application signature and signed archive/feed verify. The bundled framework loads and exports the native updater class. Both Keychain and CI-secret signing paths pass, and a tampered archive is rejected. Apple Silicon/Linux CI and end-to-end native updater acceptance remain pending. Repository-publication authorization was given so release feeds can be fetched without credentials.

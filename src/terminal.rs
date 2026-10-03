@@ -64,6 +64,7 @@ enum Command {
     Input(Vec<u8>),
     Resize(Size),
     Selection(SelectionAction),
+    Scroll(i32),
     Stop,
 }
 #[derive(Clone)]
@@ -241,6 +242,13 @@ impl Terminal {
                             Err(error) => Err(error),
                         }
                     }
+                    Ok(Command::Scroll(lines)) => host_term
+                        .lock()
+                        .map_err(|_| std::io::Error::other("terminal state unavailable"))
+                        .map(|mut term| {
+                            term.scroll_display(Scroll::Delta(lines));
+                            ctx.request_repaint();
+                        }),
                     Ok(Command::Resize(s)) => {
                         if let Ok(mut t) = host_term.lock() {
                             t.resize(s);
@@ -351,10 +359,20 @@ impl Terminal {
             clean.replace('\n', "\r").into_bytes()
         })
     }
-    pub fn scroll(&self, lines: i32) {
-        if let Ok(mut t) = self.term.try_lock() {
-            t.scroll_display(Scroll::Delta(lines));
+    pub fn scroll(&self, lines: i32) -> Result<()> {
+        if self.alive.load(Ordering::Acquire) {
+            self.tx.try_send(Command::Scroll(lines)).map_err(|_| {
+                anyhow::anyhow!("terminal control queue unavailable; retry scrolling")
+            })?;
+        } else {
+            let mut term = self
+                .term
+                .try_lock()
+                .map_err(|_| anyhow::anyhow!("terminal state busy; retry scrolling"))?;
+            term.scroll_display(Scroll::Delta(lines));
+            self.ctx.request_repaint();
         }
+        Ok(())
     }
 }
 impl Drop for Terminal {
@@ -557,6 +575,34 @@ mod pty_tests {
         assert!(!terminal.copy_mode);
         drop(terminal);
     }
+    #[test]
+    fn scrollback_movement_is_queued_while_terminal_state_is_busy() {
+        let terminal = Terminal::spawn(
+            Uuid::new_v4(),
+            &std::env::current_dir().unwrap(),
+            Path::new(""),
+            Context::default(),
+        )
+        .unwrap();
+        let mut term = terminal.term.lock().unwrap();
+        let mut parser: Processor = Processor::new();
+        parser.advance(&mut *term, &b"history\r\n".repeat(100));
+        assert_eq!(term.grid().display_offset(), 0);
+        terminal.scroll(3).unwrap();
+        drop(term);
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if terminal.term.lock().unwrap().grid().display_offset() >= 3 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "scroll was lost under lock contention"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     #[test]
     fn real_shell_input_resize_and_protocol_response() {
         let ctx = Context::default();

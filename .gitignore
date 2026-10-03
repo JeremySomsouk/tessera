@@ -26,3 +26,6 @@ rustc-ice-*.txt
 # Application bundles
 dist/
 
+
+# Python release-tool caches
+__pycache__/

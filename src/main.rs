@@ -4,6 +4,7 @@ mod search;
 mod selection;
 mod terminal;
 mod ui;
+mod updater;
 fn main() -> anyhow::Result<()> {
     let args: Vec<_> = std::env::args().collect();
     match args.get(1).map(String::as_str) {

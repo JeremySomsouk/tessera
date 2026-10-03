@@ -164,6 +164,8 @@ struct Saved {
     font_size: f32,
     #[serde(default)]
     light: bool,
+    #[serde(default)]
+    skip_stop_confirmation: bool,
 }
 fn accent(ui: &egui::Ui) -> Color32 {
     if ui.visuals().dark_mode {
@@ -179,7 +181,19 @@ struct Pane {
     terminal: Terminal,
     search: TerminalSearch,
 }
+struct TerminalClose {
+    pane: Uuid,
+    skip_confirmation: bool,
+}
+
+struct WorkspaceRename {
+    workspace: Uuid,
+    title: String,
+    focus: bool,
+}
+
 pub struct App {
+    updater: crate::updater::Updater,
     saved: Saved,
     panes: HashMap<Uuid, Pane>,
     active: usize,
@@ -195,6 +209,8 @@ pub struct App {
     font_size: f32,
     new_directory: String,
     palette: bool,
+    rename: Option<WorkspaceRename>,
+    closing: Option<TerminalClose>,
     filter: String,
     maximized: bool,
     category: u8,
@@ -255,6 +271,7 @@ impl App {
             }
         });
         let mut app = Self {
+            updater: crate::updater::Updater::default(),
             font_size: if saved.font_size > 0.0 {
                 saved.font_size
             } else {
@@ -277,6 +294,8 @@ impl App {
                 .to_string_lossy()
                 .into(),
             palette: false,
+            rename: None,
+            closing: None,
             filter: String::new(),
             maximized: false,
             category: 0,
@@ -284,6 +303,10 @@ impl App {
         match endpoint {
             Ok(e) => app.endpoint = Some(e),
             Err(e) => app.error = format!("Event endpoint unavailable: {e}"),
+        }
+        match crate::updater::Updater::start() {
+            Ok(updater) => app.updater = updater,
+            Err(error) => app.error = format!("Updates unavailable: {error}"),
         }
         configure_appearance(&cc.egui_ctx, app.saved.light);
         // Restore metadata only. Live processes never survive application shutdown.
@@ -369,6 +392,49 @@ impl App {
             self.dirty = true;
             self.overview = false;
             self.maximized = false;
+        }
+    }
+    fn request_stop_terminal(&mut self, id: Uuid) {
+        if self.saved.skip_stop_confirmation {
+            self.stop_terminal(id);
+        } else {
+            self.palette = false;
+            self.closing = Some(TerminalClose {
+                pane: id,
+                skip_confirmation: false,
+            });
+        }
+    }
+    fn confirm_stop_terminal(&mut self) {
+        if let Some(closing) = self.closing.take() {
+            self.saved.skip_stop_confirmation = closing.skip_confirmation;
+            self.dirty = true;
+            self.stop_terminal(closing.pane);
+        }
+    }
+    fn close_dialog(&mut self, ctx: &egui::Context) {
+        let Some(closing) = &mut self.closing else {
+            return;
+        };
+        let mut confirm = false;
+        let mut cancel = false;
+        let response = egui::Modal::new(egui::Id::new("stop-terminal")).show(ctx, |ui| {
+            ui.set_width(320.0_f32.min((ctx.content_rect().width() - 40.0).max(120.0)));
+            ui.heading("Stop terminal?");
+            ui.label("The shell and its running processes will be stopped.");
+            ui.checkbox(
+                &mut closing.skip_confirmation,
+                "Don’t ask again for any terminal",
+            );
+            ui.horizontal(|ui| {
+                cancel = ui.button("Cancel").clicked();
+                confirm = ui.button("Stop terminal").clicked();
+            });
+        });
+        if cancel || response.should_close() {
+            self.closing = None;
+        } else if confirm {
+            self.confirm_stop_terminal();
         }
     }
     fn stop_terminal(&mut self, id: Uuid) {
@@ -472,12 +538,94 @@ impl App {
             }
         }
     }
+    fn begin_rename(&mut self) {
+        if let Some(workspace) = self.saved.workspaces.get(self.active) {
+            self.rename = Some(WorkspaceRename {
+                workspace: workspace.task.id,
+                title: workspace.task.title.clone(),
+                focus: true,
+            });
+            self.palette = false;
+        }
+    }
+    fn finish_rename(&mut self) {
+        let Some(rename) = &self.rename else {
+            return;
+        };
+        let title = rename.title.trim();
+        if title.is_empty() {
+            return;
+        }
+        if let Some(workspace) = self
+            .saved
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.task.id == rename.workspace)
+            && workspace.task.title != title
+        {
+            workspace.task.title = title.to_owned();
+            self.dirty = true;
+        }
+        self.rename = None;
+    }
+    fn rename_dialog(&mut self, ctx: &egui::Context) {
+        let Some(rename) = &mut self.rename else {
+            return;
+        };
+        let mut submit = false;
+        let mut cancel = false;
+        let response = egui::Modal::new(egui::Id::new("rename-workspace")).show(ctx, |ui| {
+            ui.set_width(280.0_f32.min((ctx.content_rect().width() - 40.0).max(120.0)));
+            ui.heading("Rename workspace");
+            let label = ui.label("Name");
+            let mut field = egui::TextEdit::singleline(&mut rename.title)
+                .id(egui::Id::new("workspace-name"))
+                .desired_width(ui.available_width())
+                .show(ui);
+            field.response = field.response.labelled_by(label.id);
+            if rename.focus {
+                field.response.request_focus();
+                field
+                    .state
+                    .cursor
+                    .set_char_range(Some(egui::text::CCursorRange::two(
+                        egui::text::CCursor::new(0),
+                        egui::text::CCursor::new(rename.title.chars().count()),
+                    )));
+                field.state.store(ctx, field.response.id);
+                rename.focus = false;
+            }
+            let valid = !rename.title.trim().is_empty();
+            if field.response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                submit = valid;
+                if !valid {
+                    field.response.request_focus();
+                }
+            }
+            ui.horizontal(|ui| {
+                submit |= ui.add_enabled(valid, egui::Button::new("Rename")).clicked();
+                cancel = ui.button("Cancel").clicked();
+            });
+        });
+        if cancel || response.should_close() {
+            self.rename = None;
+        } else if submit {
+            self.finish_rename();
+        }
+    }
     fn shortcuts(&mut self, ctx: &egui::Context) {
         let command = if cfg!(target_os = "macos") {
             Modifiers::MAC_CMD
         } else {
             Modifiers::CTRL | Modifiers::ALT
         };
+        if self.rename.is_some() || self.closing.is_some() {
+            return;
+        }
+        if ctx.input_mut(|i| i.consume_key(command | Modifiers::SHIFT, Key::R)) {
+            self.begin_rename();
+            return;
+        }
         if ctx.input_mut(|i| i.consume_key(command | Modifiers::SHIFT, Key::O)) {
             self.overview = !self.overview;
         }
@@ -528,7 +676,7 @@ impl App {
         if ctx.input_mut(|i| i.consume_key(command, Key::W))
             && let Some(id) = self.saved.workspaces.get(self.active).map(|w| w.focus)
         {
-            self.stop_terminal(id);
+            self.request_stop_terminal(id);
         }
         if ctx.input_mut(|i| i.consume_key(command | Modifiers::SHIFT, Key::N))
             && let Some(s) = self.saved.sessions.iter().find(|s| s.state.attention())
@@ -936,7 +1084,7 @@ if ui.small_button("Find").on_hover_text(shortcut("Find in terminal", "F")).clic
 if ui.small_button("×").on_hover_text(shortcut("Stop terminal", "W")).clicked(){stop=Some(id);}
 if !pane.terminal.alive.load(Ordering::Acquire){ui.label("Shell exited");}});
                         if let Some(err)=pane.terminal.error.try_lock().ok().and_then(|e|e.clone()) {ui.small(err);}
-                        let (clicked,result)=terminal_view(ui,&mut pane.terminal,&mut pane.search,focused==id&&!self.palette&&stop.is_none(),self.font_size);
+                        let (clicked,result)=terminal_view(ui,&mut pane.terminal,&mut pane.search,focused==id&&!self.palette&&self.rename.is_none()&&self.closing.is_none()&&stop.is_none(),self.font_size);
                         if clicked {self.saved.workspaces[self.active].focus=id;self.dirty=true;}
                         if let Err(e)=result {self.error=e.to_string();}
                     }else{ui.heading("Workspace restored");ui.label("The previous processes have stopped. Start fresh login shells in this layout.");if ui.button("Resume workspace").clicked(){self.resume(ctx,self.active);}}
@@ -1013,14 +1161,68 @@ if !pane.terminal.alive.load(Ordering::Acquire){ui.label("Shell exited");}});
                         self.maximized = !self.maximized;
                         self.palette = false;
                     }
+                    if ui
+                        .add_enabled(
+                            !self.saved.workspaces.is_empty(),
+                            egui::Button::new("Rename workspace"),
+                        )
+                        .on_hover_text(shortcut("Rename workspace", "Shift+R"))
+                        .clicked()
+                    {
+                        self.begin_rename();
+                    }
+                    let mut confirm_stop = !self.saved.skip_stop_confirmation;
+                    if ui
+                        .checkbox(&mut confirm_stop, "Confirm before stopping terminals")
+                        .changed()
+                    {
+                        self.saved.skip_stop_confirmation = !confirm_stop;
+                        self.dirty = true;
+                    }
+                    if self.updater.available() {
+                        ui.separator();
+                        ui.label(format!("Tessera {}", env!("CARGO_PKG_VERSION")));
+                        if ui
+                            .add_enabled(
+                                self.updater.can_check(),
+                                egui::Button::new("Check for updates…"),
+                            )
+                            .clicked()
+                        {
+                            self.updater.check();
+                        }
+                        let mut automatic = self.updater.automatic_checks();
+                        if ui
+                            .checkbox(&mut automatic, "Check for updates automatically")
+                            .changed()
+                        {
+                            self.updater.set_automatic_checks(automatic);
+                        }
+                        let mut download = self.updater.automatic_downloads();
+                        if ui
+                            .add_enabled(
+                                automatic,
+                                egui::Checkbox::new(
+                                    &mut download,
+                                    "Download updates automatically",
+                                ),
+                            )
+                            .changed()
+                        {
+                            self.updater.set_automatic_downloads(download);
+                        }
+                        ui.small("Downloaded updates install when Tessera quits.");
+                    }
                     if ui.button("Close").clicked() {
                         self.palette = false;
                     }
                 });
         }
+        self.rename_dialog(ctx);
         if let Some(id) = stop {
-            self.stop_terminal(id);
+            self.request_stop_terminal(id);
         }
+        self.close_dialog(ctx);
         if self.dirty {
             if now().saturating_sub(self.last_save) >= 2 {
                 match self.writer.try_send(self.saved.clone()) {
@@ -1316,10 +1518,43 @@ fn terminal_view(
     }
     let reporting =
         !copying && mode.intersects(TermMode::MOUSE_MODE) && !ui.input(|i| i.modifiers.shift);
-    if response.hovered() {
-        let scroll = ui.input(|i| i.raw_scroll_delta.y);
-        if scroll.abs() > 0.0 {
-            terminal.scroll((scroll / cell.y).round() as i32);
+    let mut result = Ok(());
+    if response.hovered()
+        && let Some(pos) = ui
+            .input(|i| i.pointer.hover_pos())
+            .filter(|pos| grid_rect.contains(*pos))
+    {
+        let (delta, modifiers) = ui.input(|i| (i.raw_scroll_delta.y, i.modifiers));
+        let route = scroll_route(
+            mode,
+            copying || modifiers.shift || !terminal.alive.load(Ordering::Acquire),
+        );
+        let lines = ui.ctx().data_mut(|data| {
+            data.get_temp_mut_or_default::<ScrollState>(response.id.with("scroll"))
+                .lines(delta, cell.y, route)
+        });
+        if lines != 0 {
+            match route {
+                ScrollRoute::History => result = terminal.scroll(lines),
+                ScrollRoute::Mouse => {
+                    let col = ((pos.x - grid_rect.left()) / cell.x).floor() as usize + 1;
+                    let row = ((pos.y - grid_rect.top()) / cell.y).floor() as usize + 1;
+                    let bytes = wheel_input(lines, col, row, modifiers, mode);
+                    if !bytes.is_empty() {
+                        result = terminal.input(bytes);
+                    }
+                }
+                ScrollRoute::Arrows => {
+                    let key = if lines > 0 {
+                        Key::ArrowUp
+                    } else {
+                        Key::ArrowDown
+                    };
+                    if let Some(bytes) = encode_key(key, Modifiers::NONE, mode) {
+                        result = terminal.input(bytes.repeat(lines.unsigned_abs() as usize));
+                    }
+                }
+            }
         }
     }
     let clicked = response.clicked() || response.drag_started();
@@ -1327,13 +1562,12 @@ fn terminal_view(
         || (!focused && !clicked)
         || (!response.has_focus() && ui.ctx().wants_keyboard_input())
     {
-        return (clicked, Ok(()));
-    }
-    if copying {
-        let result = copy_input(terminal, ui.input(|i| i.events.clone()));
         return (clicked, result);
     }
-    let mut result = Ok(());
+    if copying {
+        let copy_result = copy_input(terminal, ui.input(|i| i.events.clone()));
+        return (clicked, result.and(copy_result));
+    }
     for event in ui.input(|i| i.events.clone()) {
         let input = match event {
             egui::Event::Text(s) => Some(s.into_bytes()),
@@ -1407,6 +1641,73 @@ fn terminal_view(
     }
     (clicked, result)
 }
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum ScrollRoute {
+    #[default]
+    History,
+    Mouse,
+    Arrows,
+}
+fn scroll_route(mode: TermMode, bypass: bool) -> ScrollRoute {
+    if bypass {
+        ScrollRoute::History
+    } else if mode.intersects(TermMode::MOUSE_MODE) {
+        ScrollRoute::Mouse
+    } else if mode.contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL) {
+        ScrollRoute::Arrows
+    } else {
+        ScrollRoute::History
+    }
+}
+#[derive(Clone, Default)]
+struct ScrollState {
+    pending: f32,
+    route: ScrollRoute,
+}
+impl ScrollState {
+    fn lines(&mut self, delta: f32, height: f32, route: ScrollRoute) -> i32 {
+        if route != self.route {
+            self.pending = 0.0;
+            self.route = route;
+        }
+        if !delta.is_finite() || !height.is_finite() || height <= 0.0 {
+            return 0;
+        }
+        // Bound a single frame's input so extreme device deltas cannot flood the PTY.
+        self.pending = (self.pending + delta / height).clamp(-128.0, 128.0);
+        let lines = self.pending.trunc() as i32;
+        self.pending -= lines as f32;
+        lines
+    }
+}
+fn wheel_input(
+    lines: i32,
+    col: usize,
+    row: usize,
+    modifiers: Modifiers,
+    mode: TermMode,
+) -> Vec<u8> {
+    let code = if lines > 0 { 64 } else { 65 }
+        + if modifiers.shift { 4 } else { 0 }
+        + if modifiers.alt { 8 } else { 0 }
+        + if modifiers.ctrl { 16 } else { 0 };
+    let event = if mode.contains(TermMode::SGR_MOUSE) {
+        format!("\x1b[<{code};{col};{row}M").into_bytes()
+    } else if col < 224 && row < 224 {
+        vec![
+            27,
+            b'[',
+            b'M',
+            code as u8 + 32,
+            (col + 32) as u8,
+            (row + 32) as u8,
+        ]
+    } else {
+        return Vec::new();
+    };
+    event.repeat(lines.unsigned_abs() as usize)
+}
+
 fn copy_input(terminal: &mut Terminal, events: Vec<egui::Event>) -> anyhow::Result<()> {
     for event in events {
         let action = match event {
@@ -1546,6 +1847,72 @@ mod tests {
         assert_eq!(ids, vec![a, c]);
     }
     #[test]
+    fn trackpad_scroll_accumulates_small_deltas_without_inventing_lines() {
+        let mut scroll = ScrollState::default();
+        for _ in 0..3 {
+            assert_eq!(scroll.lines(4.0, 20.0, ScrollRoute::History), 0);
+        }
+        assert_eq!(scroll.lines(8.0, 20.0, ScrollRoute::History), 1);
+        assert_eq!(scroll.lines(-10.0, 20.0, ScrollRoute::History), 0);
+        assert_eq!(scroll.lines(-10.0, 20.0, ScrollRoute::History), -1);
+        assert_eq!(scroll.lines(10.0, 20.0, ScrollRoute::History), 0);
+        assert_eq!(
+            scroll.lines(10.0, 20.0, ScrollRoute::Mouse),
+            0,
+            "remainder crossed input mode boundary"
+        );
+        assert_eq!(scroll.lines(f32::NAN, 20.0, ScrollRoute::Mouse), 0);
+        assert_eq!(scroll.lines(f32::INFINITY, 20.0, ScrollRoute::Mouse), 0);
+        assert_eq!(scroll.lines(20.0, 0.0, ScrollRoute::Mouse), 0);
+        assert_eq!(scroll.lines(100_000.0, 20.0, ScrollRoute::Mouse), 128);
+    }
+
+    #[test]
+    fn scrolling_routes_mouse_alternate_screen_and_native_history() {
+        let alt = TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL;
+        assert!(matches!(
+            scroll_route(TermMode::NONE, false),
+            ScrollRoute::History
+        ));
+        assert!(matches!(scroll_route(alt, false), ScrollRoute::Arrows));
+        assert!(matches!(
+            scroll_route(TermMode::ALT_SCREEN, false),
+            ScrollRoute::History
+        ));
+        assert!(matches!(
+            scroll_route(alt | TermMode::MOUSE_REPORT_CLICK, false),
+            ScrollRoute::Mouse
+        ));
+        assert!(matches!(
+            scroll_route(alt | TermMode::MOUSE_REPORT_CLICK, true),
+            ScrollRoute::History
+        ));
+        assert_eq!(
+            wheel_input(2, 10, 5, Modifiers::NONE, TermMode::SGR_MOUSE),
+            b"\x1b[<64;10;5M\x1b[<64;10;5M"
+        );
+        assert_eq!(
+            wheel_input(
+                -1,
+                2,
+                3,
+                Modifiers::CTRL | Modifiers::ALT,
+                TermMode::SGR_MOUSE
+            ),
+            b"\x1b[<89;2;3M"
+        );
+        assert_eq!(
+            wheel_input(-1, 2, 3, Modifiers::NONE, TermMode::NONE),
+            vec![27, b'[', b'M', 97, 34, 35]
+        );
+        assert!(wheel_input(1, 224, 3, Modifiers::NONE, TermMode::NONE).is_empty());
+        assert_eq!(
+            wheel_input(1, 300, 3, Modifiers::NONE, TermMode::SGR_MOUSE),
+            b"\x1b[<64;300;3M"
+        );
+    }
+
+    #[test]
     fn terminal_keys_respect_application_cursor_and_ctrl() {
         assert_eq!(
             encode_key(Key::ArrowUp, Modifiers::NONE, TermMode::APP_CURSOR).unwrap(),
@@ -1623,6 +1990,7 @@ mod render_tests {
         }
         let selected = saved.sessions.first().map(Session::key);
         App {
+            updater: crate::updater::Updater::default(),
             saved,
             panes: HashMap::new(),
             active: 0,
@@ -1638,6 +2006,8 @@ mod render_tests {
             font_size: 15.0,
             new_directory: String::new(),
             palette: false,
+            rename: None,
+            closing: None,
             filter: String::new(),
             maximized: false,
             category: 0,
@@ -1750,7 +2120,215 @@ mod render_tests {
     }
 
     #[test]
-    fn command_w_stops_terminal_without_confirmation() {
+    fn rename_shortcut_selects_name_and_escape_cancels() {
+        let ctx = egui::Context::default();
+        let mut app = fixture(2);
+        app.active = 1;
+        app.palette = true;
+        let original = app.saved.workspaces[1].task.title.clone();
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![key_event(Key::R, None, command() | Modifiers::SHIFT)],
+                ..Default::default()
+            },
+            |ctx| {
+                app.shortcuts(ctx);
+                assert!(!ctx.input(|i| i.key_pressed(Key::R)));
+                app.rename_dialog(ctx);
+            },
+        );
+        assert!(!app.palette);
+        assert_eq!(app.rename.as_ref().unwrap().title, original);
+        let state = egui::TextEdit::load_state(&ctx, egui::Id::new("workspace-name")).unwrap();
+        let range = state.cursor.char_range().unwrap();
+        assert_eq!(range.sorted_cursors()[0].index, 0);
+        assert_eq!(range.sorted_cursors()[1].index, original.chars().count());
+        app.rename.as_mut().unwrap().title = "Cancelled".into();
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![key_event(Key::Escape, None, Modifiers::NONE)],
+                ..Default::default()
+            },
+            |ctx| app.rename_dialog(ctx),
+        );
+        assert!(app.rename.is_none());
+        assert_eq!(app.saved.workspaces[1].task.title, original);
+        assert!(!app.dirty);
+    }
+
+    #[test]
+    fn workspace_dialogs_fit_narrow_windows_in_both_themes() {
+        for light in [false, true] {
+            for rename in [false, true] {
+                let ctx = egui::Context::default();
+                configure_appearance(&ctx, light);
+                let mut app = fixture(1);
+                if rename {
+                    app.begin_rename();
+                } else {
+                    app.request_stop_terminal(app.saved.workspaces[0].focus);
+                }
+                let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(480.0, 400.0));
+                for _ in 0..3 {
+                    let _ = ctx.run(
+                        egui::RawInput {
+                            screen_rect: Some(screen),
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            app.rename_dialog(ctx);
+                            app.close_dialog(ctx);
+                        },
+                    );
+                }
+                let id = egui::Id::new(if rename {
+                    "rename-workspace"
+                } else {
+                    "stop-terminal"
+                });
+                let rect = ctx.memory(|memory| memory.area_rect(id)).unwrap();
+                assert!(screen.contains_rect(rect), "Dialog overflows: {rect:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn rename_dialog_enter_saves_typed_name() {
+        let ctx = egui::Context::default();
+        let mut app = fixture(1);
+        app.begin_rename();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| app.draw(ctx));
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::Text("New workspace name".into())],
+                ..Default::default()
+            },
+            |ctx| app.draw(ctx),
+        );
+        assert_eq!(app.rename.as_ref().unwrap().title, "New workspace name");
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![key_event(Key::Enter, None, Modifiers::NONE)],
+                ..Default::default()
+            },
+            |ctx| app.draw(ctx),
+        );
+        assert!(app.rename.is_none());
+        assert_eq!(app.saved.workspaces[0].task.title, "New workspace name");
+    }
+
+    #[test]
+    fn rename_rejects_blank_names_and_saves_original_workspace() {
+        let mut app = fixture(2);
+        app.begin_rename();
+        app.rename.as_mut().unwrap().title = "  ".into();
+        app.finish_rename();
+        assert!(app.rename.is_some());
+        assert!(!app.dirty);
+        app.active = 1;
+        app.rename.as_mut().unwrap().title = "  Custom name  ".into();
+        app.finish_rename();
+        assert_eq!(app.saved.workspaces[0].task.title, "Custom name");
+        assert!(app.rename.is_none());
+        assert!(app.dirty);
+        let saved: Saved =
+            serde_json::from_slice(&serde_json::to_vec(&app.saved).unwrap()).unwrap();
+        assert_eq!(saved.workspaces[0].task.title, "Custom name");
+        app.saved.workspaces.clear();
+        app.begin_rename();
+        assert!(app.rename.is_none());
+    }
+
+    #[test]
+    fn trackpad_gesture_reaches_mouse_application_through_pty() {
+        let ctx = egui::Context::default();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wheel-input");
+        let mut terminal = Terminal::spawn(
+            Uuid::new_v4(),
+            dir.path(),
+            std::path::Path::new(""),
+            ctx.clone(),
+        )
+        .unwrap();
+        let mut search = TerminalSearch::default();
+        let pos = Pos2::new(80.0, 80.0);
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(640.0, 480.0));
+        let mut expected = Vec::new();
+        let mut height = 0.0;
+        for _ in 0..2 {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events: vec![egui::Event::PointerMoved(pos)],
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let font = FontId::monospace(15.0);
+                        let cell = ui.fonts_mut(|fonts| {
+                            Vec2::new(fonts.glyph_width(&font, 'M'), fonts.row_height(&font))
+                        });
+                        height = cell.y;
+                        let grid = ui.available_rect_before_wrap().shrink(8.0);
+                        let col = ((pos.x - grid.left()) / cell.x).floor() as usize + 1;
+                        let row = ((pos.y - grid.top()) / cell.y).floor() as usize + 1;
+                        expected = wheel_input(1, col, row, Modifiers::NONE, TermMode::SGR_MOUSE);
+                        terminal_view(ui, &mut terminal, &mut search, true, 15.0)
+                            .1
+                            .unwrap();
+                    });
+                },
+            );
+        }
+        terminal.input(format!("stty raw -echo; printf '\\033[?1049h\\033[?1000h\\033[?1006h'; dd bs=1 count={} of='{}' 2>/dev/null; stty sane\r", expected.len(), path.display()).into_bytes()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !terminal
+            .mode()
+            .contains(TermMode::ALT_SCREEN | TermMode::MOUSE_REPORT_CLICK | TermMode::SGR_MOUSE)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "mouse application did not start"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        for _ in 0..4 {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events: vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::MouseWheel {
+                            unit: egui::MouseWheelUnit::Point,
+                            delta: Vec2::new(0.0, height / 4.0),
+                            modifiers: Modifiers::NONE,
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        terminal_view(ui, &mut terminal, &mut search, true, 15.0)
+                            .1
+                            .unwrap();
+                    });
+                },
+            );
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !std::fs::read(&path).is_ok_and(|bytes| bytes.len() == expected.len()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "trackpad wheel input did not reach PTY"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(std::fs::read(path).unwrap(), expected);
+    }
+
+    #[test]
+    fn command_w_requests_confirmation_and_saved_opt_out_closes_immediately() {
         let ctx = egui::Context::default();
         let mut app = fixture(1);
         let pane = app.saved.workspaces[0].focus;
@@ -1764,9 +2342,48 @@ mod render_tests {
                 assert!(!ctx.input(|i| i.key_pressed(Key::W)));
             },
         );
+        assert_eq!(app.closing.as_ref().unwrap().pane, pane);
+        assert_eq!(app.saved.workspaces.len(), 1);
+        app.closing.as_mut().unwrap().skip_confirmation = true;
+        app.confirm_stop_terminal();
+        assert!(app.saved.skip_stop_confirmation);
         assert!(app.saved.workspaces.is_empty());
+        let saved: Saved =
+            serde_json::from_slice(&serde_json::to_vec(&app.saved).unwrap()).unwrap();
+        assert!(saved.skip_stop_confirmation);
+        let mut next = fixture(1);
+        next.saved.skip_stop_confirmation = saved.skip_stop_confirmation;
+        next.request_stop_terminal(next.saved.workspaces[0].focus);
+        assert!(next.closing.is_none());
+        assert!(next.saved.workspaces.is_empty());
         assert_eq!(app.saved.sessions[0].pane, pane);
         assert_eq!(app.saved.sessions[0].state, SessionState::Disconnected);
+    }
+
+    #[test]
+    fn cancel_terminal_close_does_not_save_checkbox_or_stop_terminal() {
+        let ctx = egui::Context::default();
+        let mut app = fixture(1);
+        app.request_stop_terminal(app.saved.workspaces[0].focus);
+        app.closing.as_mut().unwrap().skip_confirmation = true;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| app.close_dialog(ctx));
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![key_event(Key::Escape, None, Modifiers::NONE)],
+                ..Default::default()
+            },
+            |ctx| app.close_dialog(ctx),
+        );
+        assert!(app.closing.is_none());
+        assert_eq!(app.saved.workspaces.len(), 1);
+        assert!(!app.saved.skip_stop_confirmation);
+        assert!(!app.dirty);
+        let mut old = serde_json::to_value(&app.saved).unwrap();
+        old.as_object_mut()
+            .unwrap()
+            .remove("skip_stop_confirmation");
+        let restored: Saved = serde_json::from_value(old).unwrap();
+        assert!(!restored.skip_stop_confirmation);
     }
 
     #[test]

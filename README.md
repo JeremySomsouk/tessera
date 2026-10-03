@@ -4,7 +4,7 @@
 
 A desktop terminal workspace with a single Overview of real Claude Code and Codex sessions.
 
-**0.2.1 fixes terminal closing and workspace dialog submission.** It combines real login-shell PTYs, resizable splits, keyboard navigation, persistent workspace metadata, and a hook-driven agent Overview. Specification editing, issue connectors, and detached session hosting follow in later increments.
+**0.2.2 adds signed automatic macOS updates, workspace renaming and trackpad scrolling, plus a saved terminal-close preference.** It combines real login-shell PTYs, resizable splits, keyboard navigation, persistent workspace metadata, and a hook-driven agent Overview. Specification editing, issue connectors, and detached session hosting follow in later increments.
 
 ## Start on macOS
 
@@ -31,11 +31,11 @@ CI produces separate Intel (`Tessera-x86_64.dmg`) and Apple Silicon (`Tessera-ar
 To publish a version, tag the release commit containing this workflow and push the tag:
 
 ```sh
-git tag v0.2.1
-git push origin v0.2.1
+git tag v0.2.2
+git push origin v0.2.2
 ```
 
-Pushing a version tag (`v` followed by a digit) runs all checks and builds both DMGs, then publishes them on the [GitHub Releases page](https://github.com/JeremySomsouk/tessera/releases) with checked-in release notes when available, otherwise generated notes. New releases stay in draft until both assets upload successfully. A failed publishing job can be rerun to finish the release. Branch pushes and pull requests upload Actions artifacts only.
+Pushing a version tag (`v` followed by a digit) runs all checks and builds both DMGs, then publishes them on the [GitHub Releases page](https://github.com/JeremySomsouk/tessera/releases) with checked-in release notes when available, otherwise generated notes. New releases stay in draft until both DMGs and signed update feeds upload successfully. Release tags require the `SPARKLE_ED25519_PRIVATE_KEY` Actions secret; see [update signing](docs/updates.md). A failed publishing job can be rerun to finish the release. Branch pushes and pull requests upload Actions artifacts only.
 
 ## Connect Codex CLI
 
@@ -80,6 +80,12 @@ tessera uninstall-hooks
 
 See [integration details](docs/integration.md), including custom settings paths and stale executable paths.
 
+## macOS updates
+
+Starting with 0.2.2, the Finder application checks for new releases at launch and daily, downloads signed updates in the background, and installs them when Tessera quits. Running terminals are not stopped to apply an update. In **Workspace & commands** (Cmd+Shift+P), choose **Check for updates…**, or change automatic checking/downloading. Preferences are saved by Sparkle. Plain Cargo binaries and Linux builds do not update themselves.
+
+Install 0.2.2 manually once to get the updater. Subsequent updates use the installed application rather than another browser download. Releases remain ad hoc signed: initial installation can require macOS approval, and Developer ID signing/notarization is required for Apple's normal trusted distribution. See [release and signing setup](docs/updates.md).
+
 ## Keyboard
 
 On macOS, `Command` below is Cmd. On Linux, use Ctrl+Alt so ordinary terminal Ctrl shortcuts remain available.
@@ -88,6 +94,7 @@ On macOS, `Command` below is Cmd. On Linux, use Ctrl+Alt so ordinary terminal Ct
 | --- | --- |
 | Overview / previous terminal | Command+Shift+O |
 | New workspace in the current configured directory | Command+T |
+| Rename current workspace | Command+Shift+R |
 | Side-by-side split | Command+D |
 | Stacked split | Command+Shift+D |
 | Maximize / restore pane | Command+Shift+Enter |
@@ -97,11 +104,11 @@ On macOS, `Command` below is Cmd. On Linux, use Ctrl+Alt so ordinary terminal Ct
 | Workspace 1–9 | Command+1–9 |
 | Workspace picker / commands | Command+Shift+P |
 | Session needing attention | Command+Shift+N |
-| Stop pane immediately | Command+W |
+| Stop pane | Command+W |
 
-Stopping the last pane removes its workspace; task history is retained.
+Closing a terminal asks for confirmation. Check “Don’t ask again for any terminal” and confirm to skip future prompts across all workspaces, including after restarting Tessera. Re-enable prompts with “Confirm before stopping terminals” in Workspace & commands. Stopping the last pane removes its workspace; task history is retained. Renaming selects the current name; Enter saves and Escape cancels. The rename dialog rejects blank names.
 
-In Overview, Up/Down select a session, Enter opens its terminal, and Escape returns. These keys remain normal terminal input in a pane. Drag split separators to resize. Drag terminal text to select; Cmd+C copies, Cmd+V pastes. Shift bypasses terminal mouse reporting for selection. Use the font slider and Light/Dark button in the toolbar. Hover actions and workspace tabs to see their shortcuts. Workspace number shortcuts follow tab position and support the physical number row on layouts such as AZERTY. In the workspace dialog, Enter in Working directory creates a workspace; Enter in Find workspace opens the first match. Invalid directories show an error inside the dialog and keep it open for correction.
+In Overview, Up/Down select a session, Enter opens its terminal, and Escape returns. These keys remain normal terminal input in a pane. Drag split separators to resize. Drag terminal text to select; Cmd+C copies, Cmd+V pastes. Shift bypasses terminal mouse reporting for selection and native scrollback. Trackpad and wheel gestures scroll terminal history or are forwarded to applications that request mouse input; alternate-screen programs that enable alternate scrolling receive arrow input. Use the font slider and Light/Dark button in the toolbar. Hover actions and workspace tabs to see their shortcuts. Workspace number shortcuts follow tab position and support the physical number row on layouts such as AZERTY. In the workspace dialog, Enter in Working directory creates a workspace; Enter in Find workspace opens the first match. Invalid directories show an error inside the dialog and keep it open for correction.
 
 Normal terminal typing uses a slim beam caret; applications can request block, underline, beam or hidden cursors. Terminal color queries report the actual palette and application overrides, so dark-theme detection uses the real background.
 
