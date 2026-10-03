@@ -27,3 +27,7 @@ Validation adds provider transitions/history migration, Codex metadata privacy a
 Selected Mosaic artwork exported as a 1024px transparent PNG and a 256px native viewport icon. macOS bundles generate the full 1×/2× ICNS family and declare CFBundleIconFile, verify icon decoding and bundle signatures, then archive. The same asset supports Intel and Apple Silicon. This increment is independent of the Codex integration PR. CI push follows the repository's renamed main branch.
 
 Validation: source PNG dimensions/alpha and small-size visual inspection, shell syntax, Rust formatting/build/Clippy, existing tests, and native ICNS/bundle checks in macOS CI. Interactive Dock/Finder appearance remains to be checked on a physical Mac.
+
+2026-10-03 — Release DMG packaging.
+
+The existing macOS packaging script now stages the signed release application and an Applications shortcut in a compressed, checksum-verified DMG. CI uploads separate Intel and Apple Silicon DMGs instead of application ZIPs. The same script builds local DMGs without additional packaging dependencies.
