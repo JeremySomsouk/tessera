@@ -28,6 +28,15 @@ open dist/Tessera.app
 
 CI produces separate Intel (`Tessera-x86_64.dmg`) and Apple Silicon (`Tessera-arm64.dmg`) artifacts in the **Build and verify** workflow. Open the DMG and drag Tessera to Applications before installing hooks. Bundles are ad-hoc signed, not notarized; macOS may require Open from the application's context menu.
 
+To publish a version, tag the release commit containing this workflow and push the tag:
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+Pushing a version tag (`v` followed by a digit) runs all checks and builds both DMGs, then publishes them on the [GitHub Releases page](https://github.com/JeremySomsouk/tessera/releases) with generated release notes. New releases stay in draft until both assets upload successfully. A failed publishing job can be rerun to finish the release. Branch pushes and pull requests upload Actions artifacts only.
+
 ## Connect Codex CLI
 
 Install Codex separately and use its normal login. Preview and install Tessera's observational lifecycle hooks:
