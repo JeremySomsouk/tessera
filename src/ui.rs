@@ -1379,13 +1379,56 @@ fn workspace_submission(ctx: &egui::Context) -> Option<egui::Id> {
 
 fn cursor_rect(shape: CursorShape, pos: Pos2, cell: Vec2) -> Option<Rect> {
     match shape {
-        CursorShape::Beam => Some(Rect::from_min_size(pos, Vec2::new(2.0, cell.y))),
+        CursorShape::Beam => Some(Rect::from_min_size(
+            pos,
+            Vec2::new(2.0_f32.min(cell.x), cell.y),
+        )),
         CursorShape::Underline => Some(Rect::from_min_size(
-            pos + Vec2::new(0.0, cell.y - 2.0),
-            Vec2::new(cell.x, 2.0),
+            pos + Vec2::new(0.0, cell.y - 2.0_f32.min(cell.y)),
+            Vec2::new(cell.x, 2.0_f32.min(cell.y)),
         )),
         CursorShape::Block | CursorShape::HollowBlock => Some(Rect::from_min_size(pos, cell)),
         CursorShape::Hidden => None,
+    }
+}
+
+fn paint_cursor(
+    painter: &egui::Painter,
+    shape: CursorShape,
+    pos: Pos2,
+    cell: Vec2,
+    color: Color32,
+    font: &FontId,
+    glyph: &str,
+) {
+    let Some(rect) = cursor_rect(shape, pos, cell) else {
+        return;
+    };
+    match shape {
+        CursorShape::HollowBlock => {
+            painter.rect_stroke(
+                rect,
+                0.0,
+                Stroke::new(1.0_f32, color),
+                egui::StrokeKind::Inside,
+            );
+        }
+        CursorShape::Block => {
+            painter.rect_filled(rect, 0.0, color);
+            // Repaint the glyph over an opaque cursor rather than tinting/obscuring it.
+            let light = u32::from(color.r()) * 299
+                + u32::from(color.g()) * 587
+                + u32::from(color.b()) * 114;
+            let foreground = if light >= 128_000 {
+                Color32::BLACK
+            } else {
+                Color32::WHITE
+            };
+            painter.text(pos, egui::Align2::LEFT_TOP, glyph, font.clone(), foreground);
+        }
+        _ => {
+            painter.rect_filled(rect, 0.0, color);
+        }
     }
 }
 
@@ -1551,35 +1594,46 @@ fn terminal_view(
             }
         }
         if focused
+            && !searching
             && ((copying && mode.contains(TermMode::VI))
-                || (mode.contains(TermMode::SHOW_CURSOR) && content.display_offset == 0))
+                || (!copying
+                    && !mode.contains(TermMode::VI)
+                    && mode.contains(TermMode::SHOW_CURSOR)
+                    && content.display_offset == 0))
         {
             let p = content.cursor.point;
-            let pos = grid_rect.min
-                + Vec2::new(
-                    p.column.0 as f32 * cell.x,
-                    (p.line.0 + content.display_offset as i32) as f32 * cell.y,
-                );
-            let cursor_color = content.colors[NamedColor::Cursor as usize]
-                .map(|rgb| Color32::from_rgb(rgb.r, rgb.g, rgb.b))
-                .unwrap_or(ACCENT);
-            if let Some(rect) = cursor_rect(content.cursor.shape, pos, cell) {
-                match content.cursor.shape {
-                    CursorShape::HollowBlock => {
-                        painter.rect_stroke(
-                            rect,
-                            0.0,
-                            Stroke::new(1.0_f32, cursor_color),
-                            egui::StrokeKind::Inside,
-                        );
-                    }
-                    CursorShape::Block => {
-                        painter.rect_filled(rect, 0.0, cursor_color.gamma_multiply(0.55));
-                    }
-                    _ => {
-                        painter.rect_filled(rect, 0.0, cursor_color);
+            let row = p.line.0 + content.display_offset as i32;
+            if row >= 0 && row < rows as i32 && p.column.0 < cols {
+                let pos =
+                    grid_rect.min + Vec2::new(p.column.0 as f32 * cell.x, row as f32 * cell.y);
+                let cursor_cell = &term.grid()[p];
+                let width = if cursor_cell.flags.contains(Flags::WIDE_CHAR) {
+                    2.0
+                } else {
+                    1.0
+                };
+                let cursor_color = content.colors[NamedColor::Cursor as usize]
+                    .map(|rgb| Color32::from_rgb(rgb.r, rgb.g, rgb.b))
+                    .unwrap_or(ACCENT);
+                let mut glyph = String::new();
+                if !cursor_cell
+                    .flags
+                    .intersects(Flags::HIDDEN | Flags::WIDE_CHAR_SPACER)
+                {
+                    glyph.push(cursor_cell.c);
+                    if let Some(marks) = cursor_cell.zerowidth() {
+                        glyph.extend(marks);
                     }
                 }
+                paint_cursor(
+                    &painter,
+                    content.cursor.shape,
+                    pos,
+                    Vec2::new(cell.x * width, cell.y),
+                    cursor_color,
+                    &font,
+                    &glyph,
+                );
             }
         }
         selected = term.selection_to_string();
@@ -2842,6 +2896,51 @@ mod render_tests {
             cell
         );
         assert!(cursor_rect(CursorShape::Hidden, Pos2::ZERO, cell).is_none());
+    }
+
+    #[test]
+    fn block_cursor_preserves_glyph_contrast_and_terminal_clip() {
+        let ctx = egui::Context::default();
+        let clip = Rect::from_min_size(Pos2::ZERO, Vec2::new(30.0, 40.0));
+        for (color, foreground) in [(ACCENT, Color32::BLACK), (Color32::BLACK, Color32::WHITE)] {
+            let output = ctx.run(egui::RawInput::default(), |ctx| {
+                let painter = ctx
+                    .layer_painter(egui::LayerId::background())
+                    .with_clip_rect(clip);
+                paint_cursor(
+                    &painter,
+                    CursorShape::Block,
+                    Pos2::new(24.0, 2.0),
+                    Vec2::new(18.0, 20.0),
+                    color,
+                    &FontId::monospace(15.0),
+                    "界\u{301}",
+                );
+            });
+            let block = output.shapes.iter().find(|shape| matches!(&shape.shape, egui::epaint::Shape::Rect(rect) if rect.fill == color)).unwrap();
+            assert_eq!(block.clip_rect, clip);
+            if let egui::epaint::Shape::Rect(rect) = &block.shape {
+                assert_eq!(rect.rect.width(), 18.0);
+            }
+            let glyph = output.shapes.iter().find(|shape| matches!(&shape.shape, egui::epaint::Shape::Text(text) if text.galley.text() == "界\u{301}")).unwrap();
+            assert_eq!(glyph.clip_rect, clip);
+            if let egui::epaint::Shape::Text(text) = &glyph.shape {
+                assert_eq!(text.fallback_color, foreground);
+            }
+        }
+        let tiny = Vec2::new(1.0, 1.0);
+        assert_eq!(
+            cursor_rect(CursorShape::Beam, Pos2::ZERO, tiny)
+                .unwrap()
+                .size(),
+            tiny
+        );
+        assert_eq!(
+            cursor_rect(CursorShape::Underline, Pos2::ZERO, tiny)
+                .unwrap()
+                .min,
+            Pos2::ZERO
+        );
     }
 
     #[test]

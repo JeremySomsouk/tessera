@@ -20,6 +20,7 @@ bundle_build="$((release_major + 1)).$release_minor.$release_patch"
 bundle="dist/Tessera.app"
 mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Resources" "$bundle/Contents/Frameworks"
 ditto "$sparkle_root/Sparkle.framework" "$bundle/Contents/Frameworks/Sparkle.framework"
+cp "$sparkle_root/LICENSE" "$bundle/Contents/Resources/Sparkle-LICENSE.txt"
 cp target/release/tessera "$bundle/Contents/MacOS/tessera"
 # Build the complete macOS icon family from the committed 1024px PNG.
 icon_work=$(mktemp -d "dist/.tessera-icon.XXXXXX")
