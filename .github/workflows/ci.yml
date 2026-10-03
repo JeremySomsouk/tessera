@@ -1,6 +1,7 @@
 name: Build and verify
 on:
   push:
+    branches: [master]
   pull_request:
   workflow_dispatch:
 permissions:

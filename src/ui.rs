@@ -1418,42 +1418,35 @@ mod render_tests {
                 |ctx| app.draw(ctx),
             );
         }
+        let output_dir = tempfile::tempdir().unwrap();
+        let output_path = output_dir.path().join("keyboard-once");
+        let command = format!("printf x >> '{}'\r", output_path.display());
         let grid = app.panes[&pane].terminal.term.clone();
         let held = grid.lock().unwrap();
         let _ = ctx.run(
             egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1180.0, 760.0))),
-                events: vec![egui::Event::Text("printf '\\nACK_UI_ONCE\\n'\r".into())],
+                events: vec![egui::Event::Text(command)],
                 ..Default::default()
             },
             |ctx| app.draw(ctx),
         );
         drop(held);
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
-        let mut ack = false;
         while std::time::Instant::now() < deadline {
-            let t = app.panes[&pane].terminal.term.lock().unwrap();
-            let text: String = t.grid().display_iter().map(|c| c.cell.c).collect();
-            let count = text.matches("ACK_UI_ONCE").count();
-            if count >= 2 {
-                assert_eq!(count, 2, "keyboard input was duplicated");
-                ack = true;
+            if std::fs::read(&output_path).is_ok_and(|bytes| !bytes.is_empty()) {
                 break;
             }
-            drop(t);
             std::thread::sleep(Duration::from_millis(10));
         }
-        if !ack {
-            let t = app.panes[&pane].terminal.term.lock().unwrap();
-            eprintln!(
-                "SCREEN: {:?}",
-                t.grid()
-                    .display_iter()
-                    .map(|c| c.cell.c)
-                    .collect::<String>()
-            );
-        }
-        assert!(ack, "terminal widget swallowed keyboard input");
+        // Shells may repaint their echoed command multiple times. Check the command's
+        // effect, rather than counting its appearances in terminal scrollback.
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            std::fs::read(&output_path).expect("terminal widget swallowed keyboard input"),
+            b"x",
+            "keyboard input was duplicated"
+        );
     }
     #[test]
     fn overview_hundred_session_workload() {
