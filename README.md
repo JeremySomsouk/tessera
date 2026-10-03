@@ -97,7 +97,7 @@ On macOS, `Command` below is Cmd. On Linux, use Ctrl+Alt so ordinary terminal Ct
 | Workspace 1–9 | Command+1–9 |
 | Workspace picker / commands | Command+Shift+P |
 | Session needing attention | Command+Shift+N |
-| Stop pane, with confirmation | Command+W |
+| Stop pane immediately | Command+W |
 
 Stopping the last pane removes its workspace; task history is retained.
 
