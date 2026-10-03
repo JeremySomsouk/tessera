@@ -11,6 +11,8 @@ The spike demonstrated real shell I/O and resizing, ANSI/alternate-screen parsin
 - `terminal.rs`: one Alacritty state per live PTY, reader/parser thread, separate writer/control thread. UI accesses the grid with `try_lock`; parsing and PTY writes never execute on the UI thread. Parser-generated replies are sent after releasing the terminal-state lock to prevent a resize/reply deadlock.
 - `model.rs`: serializable session/task state, stable identities, bounded event history and duplicate/reordering handling. Task acceptance is always independent of session idleness.
 - `integration.rs`: user-private Unix endpoint and the same executable's `hook` command. Inherited pane/endpoint identity associates manually launched Claude sessions with the correct pane. Only structured lifecycle metadata is retained.
+- `search.rs`: ephemeral pane-local literal search using Alacritty’s search engine. One background search at a time per pane, with coalesced input and no history copy. Query generations discard obsolete results; terminal output/resize revisions invalidate match coordinates. Queries are limited to 256 characters and never persisted or sent to the PTY.
+- `selection.rs`: keyboard copy mode built on Alacritty’s vi cursor and selection engine. Live-pane actions share the bounded terminal control queue so navigation/copy stay ordered without blocking the UI; exited shells retain selection through nonblocking grid access. Selection and clipboard text are ephemeral.
 - `ui.rs`: workspace split tree, terminal painting/input, Overview, task inspector, and background persistence.
 - `main.rs`: native app and integration CLI. No agent can invoke application actions through terminal escape sequences.
 

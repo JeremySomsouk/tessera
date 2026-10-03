@@ -1,9 +1,10 @@
+use crate::selection::{self, SelectionAction};
 use alacritty_terminal::{
     Term,
     event::{Event, EventListener},
     grid::{Dimensions, Scroll},
     term::{Config, TermMode},
-    vte::ansi::{Color, Processor},
+    vte::ansi::{Color, CursorShape, CursorStyle, NamedColor, Processor, Rgb},
 };
 use anyhow::{Result, bail};
 use eframe::egui::{Color32, Context};
@@ -13,7 +14,7 @@ use std::{
     path::Path,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         mpsc::{SyncSender, sync_channel},
     },
     time::Duration,
@@ -45,42 +46,58 @@ impl Size {
         }
     }
 }
+fn terminal_config() -> Config {
+    Config {
+        scrolling_history: 10_000,
+        default_cursor_style: CursorStyle {
+            shape: CursorShape::Beam,
+            blinking: false,
+        },
+        vi_mode_cursor_style: Some(CursorStyle {
+            shape: CursorShape::HollowBlock,
+            blinking: false,
+        }),
+        ..Default::default()
+    }
+}
 enum Command {
     Input(Vec<u8>),
     Resize(Size),
+    Selection(SelectionAction),
     Stop,
 }
 #[derive(Clone)]
 pub struct Listener {
-    replies: Arc<Mutex<Vec<Vec<u8>>>>,
+    replies: Arc<Mutex<Vec<Event>>>,
     ctx: Context,
 }
 impl EventListener for Listener {
     fn send_event(&self, event: Event) {
-        match event {
-            Event::PtyWrite(s) => {
-                if let Ok(mut replies) = self.replies.lock() {
-                    replies.push(s.into_bytes());
-                }
-            }
-            Event::ColorRequest(index, format) => {
-                let c = color(Color::Indexed(index.min(255) as u8));
-                if let Ok(mut replies) = self.replies.lock() {
-                    replies.push(
-                        format(alacritty_terminal::vte::ansi::Rgb {
-                            r: c.r(),
-                            g: c.g(),
-                            b: c.b(),
-                        })
-                        .into_bytes(),
-                    );
-                }
-            }
-            _ => {} // OSC 52 clipboard access is denied, including reads.
+        if matches!(event, Event::PtyWrite(_) | Event::ColorRequest(_, _))
+            && let Ok(mut replies) = self.replies.lock()
+        {
+            replies.push(event);
         }
+        // OSC 52 clipboard access is denied, including reads.
         self.ctx.request_repaint();
     }
 }
+fn protocol_reply(term: &Term<Listener>, event: Event) -> Option<Vec<u8>> {
+    match event {
+        Event::PtyWrite(text) => Some(text.into_bytes()),
+        Event::ColorRequest(index, format) if index <= NamedColor::DimForeground as usize => {
+            let fallback = color_index(index);
+            let rgb = term.colors()[index].unwrap_or(Rgb {
+                r: fallback.r(),
+                g: fallback.g(),
+                b: fallback.b(),
+            });
+            Some(format(rgb).into_bytes())
+        }
+        _ => None,
+    }
+}
+
 struct ProcessLifecycle {
     killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
     exited: bool,
@@ -91,7 +108,10 @@ pub struct Terminal {
     pub alive: Arc<AtomicBool>,
     pub error: Arc<Mutex<Option<String>>>,
     pub size: Size,
+    pub copy_mode: bool,
+    ctx: Context,
     mode: Arc<AtomicU32>,
+    pub revision: Arc<AtomicU64>,
     stopping: Arc<AtomicBool>,
     lifecycle: Arc<Mutex<ProcessLifecycle>>,
     host: Option<std::thread::JoinHandle<()>>,
@@ -131,16 +151,11 @@ impl Terminal {
             replies: replies.clone(),
             ctx: ctx.clone(),
         };
-        let term = Arc::new(Mutex::new(Term::new(
-            Config {
-                scrolling_history: 10_000,
-                ..Default::default()
-            },
-            &size,
-            listener,
-        )));
+        let term = Arc::new(Mutex::new(Term::new(terminal_config(), &size, listener)));
         let mode = Arc::new(AtomicU32::new(term.lock().unwrap().mode().bits()));
         let parser_mode = mode.clone();
+        let revision = Arc::new(AtomicU64::new(0));
+        let parser_revision = revision.clone();
         let alive = Arc::new(AtomicBool::new(true));
         let error = Arc::new(Mutex::new(None));
         let response_tx = tx.clone();
@@ -157,11 +172,18 @@ impl Terminal {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
-                        if let Ok(mut t) = parser_term.lock() {
+                        let pending = if let Ok(mut t) = parser_term.lock() {
                             parser.advance(&mut *t, &buf[..n]);
                             parser_mode.store(t.mode().bits(), Ordering::Release);
-                        }
-                        let pending = std::mem::take(&mut *replies.lock().unwrap());
+                            parser_revision.fetch_add(1, Ordering::Release);
+                            let events = std::mem::take(&mut *replies.lock().unwrap());
+                            events
+                                .into_iter()
+                                .filter_map(|event| protocol_reply(&t, event))
+                                .collect::<Vec<_>>()
+                        } else {
+                            Vec::new()
+                        };
                         for bytes in pending {
                             if response_tx.send(Command::Input(bytes)).is_err() {
                                 break;
@@ -182,9 +204,12 @@ impl Terminal {
             read_ctx.request_repaint();
         });
         let host_term = term.clone();
+        let host_revision = revision.clone();
+        let host_mode = mode.clone();
         let host_alive = alive.clone();
         let host_error = error.clone();
         let host_lifecycle = lifecycle.clone();
+        let selection_ctx = ctx.clone();
         let host = std::thread::spawn(move || {
             loop {
                 if host_stopping.load(Ordering::Acquire) {
@@ -196,9 +221,31 @@ impl Terminal {
                 }
                 let result = match rx.recv_timeout(Duration::from_millis(250)) {
                     Ok(Command::Input(bytes)) => writer.write_all(&bytes),
+                    Ok(Command::Selection(action)) => {
+                        let text = host_term
+                            .lock()
+                            .map_err(|_| std::io::Error::other("terminal state unavailable"))
+                            .map(|mut term| {
+                                let text = selection::apply(&mut *term, action);
+                                host_mode.store(term.mode().bits(), Ordering::Release);
+                                text
+                            });
+                        match text {
+                            Ok(text) => {
+                                if let Some(text) = text {
+                                    ctx.copy_text(text);
+                                }
+                                ctx.request_repaint();
+                                Ok(())
+                            }
+                            Err(error) => Err(error),
+                        }
+                    }
                     Ok(Command::Resize(s)) => {
                         if let Ok(mut t) = host_term.lock() {
                             t.resize(s);
+                            host_revision.fetch_add(1, Ordering::Release);
+                            ctx.request_repaint();
                         }
                         pair.master.resize(s.pty()).map_err(std::io::Error::other)
                     }
@@ -238,11 +285,41 @@ impl Terminal {
             alive,
             error,
             size,
+            copy_mode: false,
+            ctx: selection_ctx,
             mode,
+            revision,
             stopping,
             lifecycle,
             host: Some(host),
         })
+    }
+    pub fn selection_action(&mut self, action: SelectionAction) -> Result<()> {
+        if self.alive.load(Ordering::Acquire) {
+            self.tx.try_send(Command::Selection(action)).map_err(|_| {
+                anyhow::anyhow!("terminal control queue unavailable; retry selection")
+            })?;
+        } else {
+            // Retained output remains selectable after the shell/control worker exits.
+            let mut term = self
+                .term
+                .try_lock()
+                .map_err(|_| anyhow::anyhow!("terminal state busy; retry selection"))?;
+            if let Some(text) = selection::apply(&mut *term, action) {
+                self.ctx.copy_text(text);
+            }
+            self.mode.store(term.mode().bits(), Ordering::Release);
+            self.ctx.request_repaint();
+        }
+        match action {
+            SelectionAction::Enter => self.copy_mode = true,
+            SelectionAction::Exit | SelectionAction::Copy { exit: true } => self.copy_mode = false,
+            _ => {}
+        }
+        Ok(())
+    }
+    pub fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Acquire)
     }
     pub fn mode(&self) -> TermMode {
         TermMode::from_bits_retain(self.mode.load(Ordering::Acquire))
@@ -300,6 +377,10 @@ pub fn color(c: Color) -> Color32 {
         Color::Indexed(i) => i as usize,
         Color::Named(n) => n as usize,
     };
+    color_index(index)
+}
+
+fn color_index(index: usize) -> Color32 {
     const PALETTE: [[u8; 3]; 16] = [
         [28, 31, 38],
         [231, 115, 131],
@@ -331,8 +412,16 @@ pub fn color(c: Color) -> Color32 {
         )
     } else if index < 256 {
         Color32::from_gray((8 + (index - 232) * 10) as u8)
-    } else if index == 257 {
+    } else if index == NamedColor::Background as usize {
         Color32::from_rgb(24, 27, 34)
+    } else if index == NamedColor::Cursor as usize {
+        Color32::from_rgb(130, 198, 180)
+    } else if (NamedColor::DimBlack as usize..=NamedColor::DimWhite as usize).contains(&index) {
+        color_index(index - NamedColor::DimBlack as usize).gamma_multiply(0.65)
+    } else if index == NamedColor::BrightForeground as usize {
+        color_index(NamedColor::BrightWhite as usize)
+    } else if index == NamedColor::DimForeground as usize {
+        color_index(NamedColor::Foreground as usize).gamma_multiply(0.65)
     } else {
         Color32::from_rgb(216, 221, 230)
     }
@@ -356,6 +445,58 @@ mod tests {
         assert_eq!(t.columns(), 30);
     }
     #[test]
+    fn typing_uses_a_beam_and_applications_can_change_or_reset_the_cursor() {
+        let mut term = Term::new(terminal_config(), &Size { cols: 20, rows: 5 }, VoidListener);
+        let mut parser: Processor = Processor::new();
+        assert_eq!(term.renderable_content().cursor.shape, CursorShape::Beam);
+        for (sequence, shape) in [
+            (b"\x1b[2 q".as_slice(), CursorShape::Block),
+            (b"\x1b[4 q".as_slice(), CursorShape::Underline),
+            (b"\x1b[6 q".as_slice(), CursorShape::Beam),
+            (b"\x1b[0 q".as_slice(), CursorShape::Beam),
+            (b"\x1b[?25l".as_slice(), CursorShape::Hidden),
+            (b"\x1b[?25h".as_slice(), CursorShape::Beam),
+        ] {
+            parser.advance(&mut term, sequence);
+            assert_eq!(term.renderable_content().cursor.shape, shape);
+        }
+        selection::apply(&mut term, SelectionAction::Enter);
+        assert_eq!(
+            term.renderable_content().cursor.shape,
+            CursorShape::HollowBlock
+        );
+        selection::apply(&mut term, SelectionAction::Exit);
+        assert_eq!(term.renderable_content().cursor.shape, CursorShape::Beam);
+    }
+    #[test]
+    fn terminal_color_queries_report_dark_background_and_current_dynamic_colors() {
+        let replies = Arc::new(Mutex::new(Vec::new()));
+        let listener = Listener {
+            replies: replies.clone(),
+            ctx: Context::default(),
+        };
+        let mut term = Term::new(terminal_config(), &Size { cols: 20, rows: 5 }, listener);
+        let mut parser: Processor = Processor::new();
+        parser.advance(&mut term, b"\x1b]10;?\x07\x1b]11;?\x07");
+        let responses: Vec<_> = std::mem::take(&mut *replies.lock().unwrap())
+            .into_iter()
+            .filter_map(|event| protocol_reply(&term, event))
+            .collect();
+        assert_eq!(
+            responses,
+            [
+                b"\x1b]10;rgb:d8d8/dddd/e6e6\x07".to_vec(),
+                b"\x1b]11;rgb:1818/1b1b/2222\x07".to_vec()
+            ]
+        );
+        parser.advance(&mut term, b"\x1b]11;#123456\x07\x1b]11;?\x1b\\");
+        let responses: Vec<_> = std::mem::take(&mut *replies.lock().unwrap())
+            .into_iter()
+            .filter_map(|event| protocol_reply(&term, event))
+            .collect();
+        assert_eq!(responses, [b"\x1b]11;rgb:1212/3434/5656\x1b\\".to_vec()]);
+    }
+    #[test]
     fn palette_truecolor_and_cube() {
         assert_eq!(color(Color::Indexed(196)), Color32::RED);
     }
@@ -366,11 +507,12 @@ mod pty_tests {
     use super::*;
     #[test]
     fn reaped_shell_is_not_signalled_again_when_pane_closes() {
-        let terminal = Terminal::spawn(
+        let ctx = Context::default();
+        let mut terminal = Terminal::spawn(
             Uuid::new_v4(),
             &std::env::current_dir().unwrap(),
             Path::new("/tmp/unused-test.sock"),
-            Context::default(),
+            ctx.clone(),
         )
         .unwrap();
         terminal.input(b"exit\r".to_vec()).unwrap();
@@ -385,6 +527,34 @@ mod pty_tests {
             terminal.lifecycle.lock().unwrap().exited,
             "shell was not reaped"
         );
+        terminal.host.take().unwrap().join().unwrap();
+        assert!(!terminal.alive.load(Ordering::Acquire));
+        terminal.selection_action(SelectionAction::Enter).unwrap();
+        terminal
+            .selection_action(SelectionAction::Move {
+                motion: alacritty_terminal::vi_mode::ViMotion::First,
+                extend: false,
+            })
+            .unwrap();
+        terminal.selection_action(SelectionAction::Toggle).unwrap();
+        terminal
+            .selection_action(SelectionAction::Move {
+                motion: alacritty_terminal::vi_mode::ViMotion::Last,
+                extend: false,
+            })
+            .unwrap();
+        let selected = terminal.term.lock().unwrap().selection_to_string().unwrap();
+        terminal
+            .selection_action(SelectionAction::Copy { exit: true })
+            .unwrap();
+        let out = ctx.run(Default::default(), |_| {});
+        assert!(
+            out.platform_output.commands.iter().any(|command| {
+                matches!(command, eframe::egui::OutputCommand::CopyText(text) if *text == selected)
+            }),
+            "retained output did not reach the clipboard command queue"
+        );
+        assert!(!terminal.copy_mode);
         drop(terminal);
     }
     #[test]

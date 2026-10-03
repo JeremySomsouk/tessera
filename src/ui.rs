@@ -1,12 +1,15 @@
 use crate::{
     integration::{Endpoint, now},
     model::{Session, SessionState, Task, TaskState},
+    search::TerminalSearch,
+    selection::{SelectionAction, key_action},
     terminal::{Size, Terminal, color},
 };
 use alacritty_terminal::{
     index::{Column, Line, Point, Side},
     selection::{Selection, SelectionType},
     term::{TermMode, cell::Flags},
+    vte::ansi::{CursorShape, NamedColor},
 };
 use eframe::egui::{
     self, Color32, FontId, Key, Modifiers, Pos2, Rect, RichText, Sense, Stroke, Vec2,
@@ -174,6 +177,7 @@ fn default_font() -> f32 {
 }
 struct Pane {
     terminal: Terminal,
+    search: TerminalSearch,
 }
 pub struct App {
     saved: Saved,
@@ -283,11 +287,7 @@ impl App {
             Ok(e) => app.endpoint = Some(e),
             Err(e) => app.error = format!("Event endpoint unavailable: {e}"),
         }
-        cc.egui_ctx.set_visuals(if app.saved.light {
-            egui::Visuals::light()
-        } else {
-            egui::Visuals::dark()
-        });
+        configure_appearance(&cc.egui_ctx, app.saved.light);
         // Restore metadata only. Live processes never survive application shutdown in v0.1.
         if app.saved.workspaces.is_empty() {
             app.add_workspace(&cc.egui_ctx);
@@ -304,7 +304,13 @@ impl App {
             .unwrap_or_else(|| std::path::Path::new(""));
         match Terminal::spawn(id, &PathBuf::from(directory), socket, ctx.clone()) {
             Ok(terminal) => {
-                self.panes.insert(id, Pane { terminal });
+                self.panes.insert(
+                    id,
+                    Pane {
+                        terminal,
+                        search: TerminalSearch::default(),
+                    },
+                );
                 true
             }
             Err(e) => {
@@ -313,15 +319,20 @@ impl App {
             }
         }
     }
-    fn add_workspace(&mut self, ctx: &egui::Context) {
+    fn add_workspace(&mut self, ctx: &egui::Context) -> bool {
         if self.saved.workspaces.len() >= 32 {
             self.error = "Workspace limit (32) reached".into();
-            return;
+            return false;
         }
         let directory = self.new_directory.clone();
+        if !PathBuf::from(&directory).is_dir() {
+            self.error =
+                format!("Working directory does not exist or is not a directory: {directory}");
+            return false;
+        }
         let id = Uuid::new_v4();
         if !self.spawn(id, ctx, &directory) {
-            return;
+            return false;
         }
         let title = PathBuf::from(&directory)
             .file_name()
@@ -340,6 +351,7 @@ impl App {
         self.active = self.saved.workspaces.len() - 1;
         self.overview = false;
         self.dirty = true;
+        true
     }
     fn split(&mut self, ctx: &egui::Context, vertical: bool) {
         if self.panes.len() >= 32 {
@@ -436,14 +448,45 @@ impl App {
         if ctx.input_mut(|i| i.consume_key(command | Modifiers::SHIFT, Key::O)) {
             self.overview = !self.overview;
         }
+        if !self.overview
+            && !self.palette
+            && self.close.is_none()
+            && ctx.input_mut(|i| i.consume_key(command, Key::F))
+            && let Some(pane) = self
+                .saved
+                .workspaces
+                .get(self.active)
+                .and_then(|w| self.panes.get_mut(&w.focus))
+        {
+            if pane.terminal.copy_mode
+                && let Err(error) = pane.terminal.selection_action(SelectionAction::Exit)
+            {
+                self.error = error.to_string();
+            }
+            pane.search.open();
+        }
+        if !self.overview
+            && !self.palette
+            && self.close.is_none()
+            && ctx.input_mut(|i| i.consume_key(command | Modifiers::SHIFT, Key::Space))
+            && let Some(pane) = self
+                .saved
+                .workspaces
+                .get(self.active)
+                .and_then(|w| self.panes.get_mut(&w.focus))
+        {
+            pane.search.close();
+            if let Err(error) = pane.terminal.selection_action(SelectionAction::Enter) {
+                self.error = error.to_string();
+            }
+        }
         if ctx.input_mut(|i| i.consume_key(command, Key::T)) {
             self.add_workspace(ctx);
         }
-        if ctx.input_mut(|i| i.consume_key(command, Key::D)) {
-            self.split(ctx, true);
-        }
         if ctx.input_mut(|i| i.consume_key(command | Modifiers::SHIFT, Key::D)) {
             self.split(ctx, false);
+        } else if ctx.input_mut(|i| i.consume_key(command, Key::D)) {
+            self.split(ctx, true);
         }
         if ctx.input_mut(|i| i.consume_key(command | Modifiers::SHIFT, Key::Enter)) {
             self.maximized = !self.maximized;
@@ -460,24 +503,13 @@ impl App {
             let id = s.key();
             self.focus_session(&id);
         }
-        for (n, key) in [
-            Key::Num1,
-            Key::Num2,
-            Key::Num3,
-            Key::Num4,
-            Key::Num5,
-            Key::Num6,
-            Key::Num7,
-            Key::Num8,
-            Key::Num9,
-        ]
-        .iter()
-        .enumerate()
+        if let Some(index) =
+            ctx.input_mut(|input| workspace_shortcut(input, command, self.saved.workspaces.len()))
         {
-            if n < self.saved.workspaces.len() && ctx.input_mut(|i| i.consume_key(command, *key)) {
-                self.active = n;
-                self.overview = false;
-            }
+            self.active = index;
+            self.overview = false;
+            self.palette = false;
+            self.maximized = false;
         }
         if !self.palette
             && !self.overview
@@ -765,35 +797,46 @@ impl App {
                 ui.label(RichText::new("TESSERA").strong());
                 ui.separator();
                 if ui
-                    .selectable_label(self.overview, "Overview  ⇧⌘O")
+                    .selectable_label(self.overview, "Overview")
+                    .on_hover_text(shortcut("Overview", "Shift+O"))
                     .clicked()
                 {
                     self.overview = !self.overview;
                 }
-                if ui.button("+ Workspace").clicked() {
+                if ui
+                    .button("+ Workspace")
+                    .on_hover_text(shortcut("Workspace settings", "Shift+P"))
+                    .clicked()
+                {
                     self.palette = true;
                 }
-                if ui.button("Split ↔").clicked() {
+                if ui
+                    .button("Split ↔")
+                    .on_hover_text(shortcut("Side-by-side split", "D"))
+                    .clicked()
+                {
                     self.split(ctx, true);
                 }
-                if ui.button("Split ↕").clicked() {
+                if ui
+                    .button("Split ↕")
+                    .on_hover_text(shortcut("Stacked split", "Shift+D"))
+                    .clicked()
+                {
                     self.split(ctx, false);
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
                         .button(if self.saved.light { "Dark" } else { "Light" })
+                        .on_hover_text("Switch appearance")
                         .clicked()
                     {
                         self.saved.light = !self.saved.light;
-                        ctx.set_visuals(if self.saved.light {
-                            egui::Visuals::light()
-                        } else {
-                            egui::Visuals::dark()
-                        });
+                        configure_appearance(ctx, self.saved.light);
                         self.dirty = true;
                     }
                     if ui
                         .add(egui::Slider::new(&mut self.font_size, 11.0..=24.0).show_value(false))
+                        .on_hover_text("Terminal font size")
                         .changed()
                     {
                         self.saved.font_size = self.font_size;
@@ -810,6 +853,11 @@ impl App {
                                 index == self.active && !self.overview,
                                 format!("{}  {}", index + 1, w.task.title),
                             )
+                            .on_hover_text(if index < 9 {
+                                shortcut("Switch workspace", &(index + 1).to_string())
+                            } else {
+                                "Switch workspace".into()
+                            })
                             .clicked()
                         {
                             self.active = index;
@@ -824,7 +872,7 @@ impl App {
             ui.horizontal(|ui| {
                 if self.error.is_empty() {
                     ui.label(
-                        RichText::new("⌘D split · ⇧⌘D stack · ⌥⌘→ next pane · ⇧⌘P commands")
+                        RichText::new(if cfg!(target_os = "macos") { "Cmd+D split · Cmd+Shift+D stack · Cmd+Alt+Right next pane · Cmd+Shift+P commands" } else { "Ctrl+Alt+D split · Ctrl+Alt+Shift+D stack · Ctrl+Alt+Right next pane · Ctrl+Alt+Shift+P commands" })
                             .small(),
                     );
                 } else {
@@ -844,10 +892,12 @@ impl App {
             for (id,rect) in rects {
                 ui.scope_builder(egui::UiBuilder::new().max_rect(rect).id_salt(id),|ui| {
                     if let Some(pane)=self.panes.get_mut(&id) {
-                        ui.horizontal(|ui| {ui.label(RichText::new(if focused==id {"● Terminal"}else{"Terminal"}).color(if focused==id{ACCENT}else{ui.visuals().weak_text_color()}));if ui.small_button("×").clicked(){self.close=Some(id);}
+                        ui.horizontal(|ui| {ui.label(RichText::new(if focused==id {"● Terminal"}else{"Terminal"}).color(if focused==id{ACCENT}else{ui.visuals().weak_text_color()}));if ui.small_button("Select").on_hover_text(shortcut("Keyboard selection", "Shift+Space")).clicked(){pane.search.close();if let Err(error)=pane.terminal.selection_action(SelectionAction::Enter){self.error=error.to_string();}self.saved.workspaces[self.active].focus=id;self.dirty=true;}
+if ui.small_button("Find").on_hover_text(shortcut("Find in terminal", "F")).clicked(){if pane.terminal.copy_mode && let Err(error)=pane.terminal.selection_action(SelectionAction::Exit){self.error=error.to_string();}pane.search.open();self.saved.workspaces[self.active].focus=id;self.dirty=true;}
+if ui.small_button("×").on_hover_text(shortcut("Stop terminal", "Shift+W")).clicked(){self.close=Some(id);}
 if !pane.terminal.alive.load(Ordering::Acquire){ui.label("Shell exited");}});
                         if let Some(err)=pane.terminal.error.try_lock().ok().and_then(|e|e.clone()) {ui.small(err);}
-                        let (clicked,result)=terminal_view(ui,&mut pane.terminal,focused==id&&!self.palette&&self.close.is_none(),self.font_size);
+                        let (clicked,result)=terminal_view(ui,&mut pane.terminal,&mut pane.search,focused==id&&!self.palette&&self.close.is_none(),self.font_size);
                         if clicked {self.saved.workspaces[self.active].focus=id;self.dirty=true;}
                         if let Err(e)=result {self.error=e.to_string();}
                     }else{ui.heading("Workspace restored");ui.label("The previous processes have stopped. Start fresh login shells in this layout.");if ui.button("Resume workspace").clicked(){self.resume(ctx,self.active);}}
@@ -860,32 +910,62 @@ if !pane.terminal.alive.load(Ordering::Acquire){ui.label("Shell exited");}});
                 .resizable(false)
                 .show(ctx, |ui| {
                     ui.label("Working directory");
-                    ui.text_edit_singleline(&mut self.new_directory);
-                    if ui.button("Create workspace").clicked() {
-                        self.add_workspace(ctx);
-                        self.palette = false;
+                    let directory = ui.add(
+                        egui::TextEdit::singleline(&mut self.new_directory)
+                            .id(egui::Id::new("workspace-directory")),
+                    );
+                    let create = ui.add_enabled(
+                        !self.new_directory.trim().is_empty(),
+                        egui::Button::new("Create workspace"),
+                    );
+                    if create.clicked() || submitted(ui, &directory) {
+                        if self.add_workspace(ctx) {
+                            self.palette = false;
+                        } else {
+                            directory.request_focus();
+                        }
                     }
                     ui.separator();
                     ui.label("Find workspace");
-                    ui.text_edit_singleline(&mut self.filter);
+                    let filter = ui.add(
+                        egui::TextEdit::singleline(&mut self.filter)
+                            .id(egui::Id::new("workspace-filter")),
+                    );
+                    let open_first = submitted(ui, &filter);
+                    let filter_text = self.filter.to_lowercase();
+                    let mut first = true;
                     for (i, w) in self.saved.workspaces.iter().enumerate() {
-                        if w.task
-                            .title
-                            .to_lowercase()
-                            .contains(&self.filter.to_lowercase())
-                            && ui.button(&w.task.title).clicked()
-                        {
+                        if !w.task.title.to_lowercase().contains(&filter_text) {
+                            continue;
+                        }
+                        let button = ui.button(&w.task.title);
+                        if button.clicked() || (open_first && first) {
                             self.active = i;
                             self.overview = false;
                             self.palette = false;
                         }
+                        first = false;
+                    }
+                    if first {
+                        ui.small("No matching workspace");
+                        if open_first {
+                            filter.request_focus();
+                        }
                     }
                     ui.separator();
-                    if ui.button("Toggle Overview").clicked() {
+                    if ui
+                        .button("Toggle Overview")
+                        .on_hover_text(shortcut("Overview", "Shift+O"))
+                        .clicked()
+                    {
                         self.overview = !self.overview;
                         self.palette = false;
                     }
-                    if ui.button("Maximize / restore pane").clicked() {
+                    if ui
+                        .button("Maximize / restore pane")
+                        .on_hover_text(shortcut("Maximize / restore pane", "Shift+Enter"))
+                        .clicked()
+                    {
                         self.maximized = !self.maximized;
                         self.palette = false;
                     }
@@ -926,17 +1006,115 @@ impl eframe::App for App {
         }
     }
 }
+fn configure_appearance(ctx: &egui::Context, light: bool) {
+    let mut visuals = if light {
+        egui::Visuals::light()
+    } else {
+        egui::Visuals::dark()
+    };
+    for widget in [
+        &mut visuals.widgets.noninteractive,
+        &mut visuals.widgets.inactive,
+        &mut visuals.widgets.hovered,
+        &mut visuals.widgets.active,
+        &mut visuals.widgets.open,
+    ] {
+        widget.corner_radius = egui::CornerRadius::same(6);
+    }
+    visuals.window_corner_radius = egui::CornerRadius::same(8);
+    ctx.set_visuals(visuals);
+    ctx.style_mut(|style| {
+        style.spacing.button_padding = Vec2::new(9.0, 5.0);
+        style.spacing.item_spacing = Vec2::new(8.0, 6.0);
+    });
+}
+
+fn shortcut(action: &str, keys: &str) -> String {
+    let command = if cfg!(target_os = "macos") {
+        "Cmd"
+    } else {
+        "Ctrl+Alt"
+    };
+    format!("{action} — {command}+{keys}")
+}
+
+fn workspace_shortcut(
+    input: &mut egui::InputState,
+    command: Modifiers,
+    count: usize,
+) -> Option<usize> {
+    let number = |key| {
+        [
+            Key::Num1,
+            Key::Num2,
+            Key::Num3,
+            Key::Num4,
+            Key::Num5,
+            Key::Num6,
+            Key::Num7,
+            Key::Num8,
+            Key::Num9,
+        ]
+        .iter()
+        .position(|candidate| *candidate == key)
+    };
+    let mut selected = None;
+    input.events.retain(|event| {
+        if let egui::Event::Key {
+            key,
+            physical_key,
+            pressed: true,
+            modifiers,
+            ..
+        } = event
+            && modifiers.matches_logically(command)
+            && let Some(index) = physical_key.and_then(number).or_else(|| number(*key))
+            && index < count
+        {
+            selected = Some(index);
+            return false;
+        }
+        true
+    });
+    selected
+}
+
+fn submitted(ui: &egui::Ui, response: &egui::Response) -> bool {
+    response.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter))
+}
+
+fn cursor_rect(shape: CursorShape, pos: Pos2, cell: Vec2) -> Option<Rect> {
+    match shape {
+        CursorShape::Beam => Some(Rect::from_min_size(pos, Vec2::new(2.0, cell.y))),
+        CursorShape::Underline => Some(Rect::from_min_size(
+            pos + Vec2::new(0.0, cell.y - 2.0),
+            Vec2::new(cell.x, 2.0),
+        )),
+        CursorShape::Block | CursorShape::HollowBlock => Some(Rect::from_min_size(pos, cell)),
+        CursorShape::Hidden => None,
+    }
+}
+
 fn terminal_view(
     ui: &mut egui::Ui,
     terminal: &mut Terminal,
+    search: &mut TerminalSearch,
     focused: bool,
     font_size: f32,
 ) -> (bool, anyhow::Result<()>) {
+    let copying = terminal.copy_mode;
+    let searching = search.is_open();
+    if copying {
+        ui.small(
+            "Copy mode · arrows move · Shift extends · Space selects · Enter copies · Esc exits",
+        );
+    }
+    search.show(ui, terminal, focused);
     let font = FontId::monospace(font_size);
     let cell = ui.fonts_mut(|f| Vec2::new(f.glyph_width(&font, 'M'), f.row_height(&font)));
     let rect = ui.available_rect_before_wrap();
     let response = ui.allocate_rect(rect, Sense::click_and_drag());
-    if focused || response.clicked() {
+    if !searching && (focused || response.clicked()) {
         if !response.has_focus() {
             response.request_focus();
         }
@@ -969,8 +1147,10 @@ fn terminal_view(
     let mut mode = terminal.mode();
     let mut selected = None;
     if let Ok(mut term) = terminal.term.try_lock() {
+        search.invalidate(terminal.revision());
         mode = *term.mode();
-        let reporting = mode.intersects(TermMode::MOUSE_MODE) && !ui.input(|i| i.modifiers.shift);
+        let reporting =
+            !copying && mode.intersects(TermMode::MOUSE_MODE) && !ui.input(|i| i.modifiers.shift);
         if !reporting && let Some(pos) = response.interact_pointer_pos() {
             let point = Point::new(
                 Line(
@@ -1021,6 +1201,10 @@ fn terminal_view(
             if content.selection.is_some_and(|s| s.contains(indexed.point)) {
                 bg = Color32::from_rgb(55, 85, 91);
             }
+            if search.contains(indexed.point) {
+                bg = Color32::from_rgb(184, 151, 64);
+                fg = Color32::from_rgb(24, 27, 34);
+            }
             if c.flags.contains(Flags::DIM) {
                 fg = fg.gamma_multiply(0.65);
             }
@@ -1044,22 +1228,44 @@ fn terminal_view(
                 );
             }
         }
-        if focused && mode.contains(TermMode::SHOW_CURSOR) && content.display_offset == 0 {
+        if focused
+            && ((copying && mode.contains(TermMode::VI))
+                || (mode.contains(TermMode::SHOW_CURSOR) && content.display_offset == 0))
+        {
             let p = content.cursor.point;
-            let pos =
-                grid_rect.min + Vec2::new(p.column.0 as f32 * cell.x, p.line.0 as f32 * cell.y);
-            painter.rect_stroke(
-                Rect::from_min_size(pos, cell),
-                0.0,
-                Stroke::new(1.0_f32, ACCENT),
-                egui::StrokeKind::Inside,
-            );
+            let pos = grid_rect.min
+                + Vec2::new(
+                    p.column.0 as f32 * cell.x,
+                    (p.line.0 + content.display_offset as i32) as f32 * cell.y,
+                );
+            let cursor_color = content.colors[NamedColor::Cursor as usize]
+                .map(|rgb| Color32::from_rgb(rgb.r, rgb.g, rgb.b))
+                .unwrap_or(ACCENT);
+            if let Some(rect) = cursor_rect(content.cursor.shape, pos, cell) {
+                match content.cursor.shape {
+                    CursorShape::HollowBlock => {
+                        painter.rect_stroke(
+                            rect,
+                            0.0,
+                            Stroke::new(1.0, cursor_color),
+                            egui::StrokeKind::Inside,
+                        );
+                    }
+                    CursorShape::Block => {
+                        painter.rect_filled(rect, 0.0, cursor_color.gamma_multiply(0.55));
+                    }
+                    _ => {
+                        painter.rect_filled(rect, 0.0, cursor_color);
+                    }
+                }
+            }
         }
         selected = term.selection_to_string();
     } else {
         ui.ctx().request_repaint_after(Duration::from_millis(16));
     }
-    let reporting = mode.intersects(TermMode::MOUSE_MODE) && !ui.input(|i| i.modifiers.shift);
+    let reporting =
+        !copying && mode.intersects(TermMode::MOUSE_MODE) && !ui.input(|i| i.modifiers.shift);
     if response.hovered() {
         let scroll = ui.input(|i| i.raw_scroll_delta.y);
         if scroll.abs() > 0.0 {
@@ -1067,8 +1273,15 @@ fn terminal_view(
         }
     }
     let clicked = response.clicked() || response.drag_started();
-    if (!focused && !clicked) || (!response.has_focus() && ui.ctx().wants_keyboard_input()) {
+    if searching
+        || (!focused && !clicked)
+        || (!response.has_focus() && ui.ctx().wants_keyboard_input())
+    {
         return (clicked, Ok(()));
+    }
+    if copying {
+        let result = copy_input(terminal, ui.input(|i| i.events.clone()));
+        return (clicked, result);
     }
     let mut result = Ok(());
     for event in ui.input(|i| i.events.clone()) {
@@ -1144,6 +1357,31 @@ fn terminal_view(
     }
     (clicked, result)
 }
+fn copy_input(terminal: &mut Terminal, events: Vec<egui::Event>) -> anyhow::Result<()> {
+    for event in events {
+        let action = match event {
+            egui::Event::Copy => Some(SelectionAction::Copy { exit: false }),
+            egui::Event::Key {
+                key,
+                pressed: true,
+                modifiers,
+                ..
+            } => key_action(key, modifiers),
+            _ => None,
+        };
+        if let Some(action) = action {
+            terminal.selection_action(action)?;
+            if matches!(
+                action,
+                SelectionAction::Exit | SelectionAction::Copy { exit: true }
+            ) {
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn encode_key(key: Key, m: Modifiers, mode: TermMode) -> Option<Vec<u8>> {
     if m.ctrl {
         let c = match key {
@@ -1379,11 +1617,7 @@ mod render_tests {
             ("narrow", 640.0, 700.0, false),
         ] {
             let ctx = egui::Context::default();
-            ctx.set_visuals(if light {
-                egui::Visuals::light()
-            } else {
-                egui::Visuals::dark()
-            });
+            configure_appearance(&ctx, light);
             let mut app = fixture(6);
             let input = egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(width, height))),
@@ -1403,6 +1637,155 @@ mod render_tests {
             }
         }
     }
+    fn command() -> Modifiers {
+        if cfg!(target_os = "macos") {
+            Modifiers::MAC_CMD
+        } else {
+            Modifiers::CTRL | Modifiers::ALT
+        }
+    }
+
+    fn key_event(key: Key, physical_key: Option<Key>, modifiers: Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    #[test]
+    fn custom_workspace_names_and_layout_keys_do_not_break_number_shortcuts() {
+        let ctx = egui::Context::default();
+        let mut app = fixture(5);
+        app.saved.workspaces[3].task.title = "Custom workspace".into();
+        app.palette = true;
+        app.maximized = true;
+        let _ = ctx.run(
+            egui::RawInput {
+                modifiers: command(),
+                events: vec![key_event(Key::Quote, Some(Key::Num4), command())],
+                ..Default::default()
+            },
+            |ctx| app.shortcuts(ctx),
+        );
+        assert_eq!(app.active, 3);
+        assert!(!app.overview && !app.palette && !app.maximized);
+        assert_eq!(
+            app.saved.workspaces[app.active].task.title,
+            "Custom workspace"
+        );
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![key_event(Key::Num2, None, command() | Modifiers::SHIFT)],
+                ..Default::default()
+            },
+            |ctx| app.shortcuts(ctx),
+        );
+        assert_eq!(app.active, 1);
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![
+                    key_event(Key::Num3, Some(Key::Num3), Modifiers::NONE),
+                    key_event(Key::Num9, None, command()),
+                ],
+                ..Default::default()
+            },
+            |ctx| app.shortcuts(ctx),
+        );
+        assert_eq!(
+            app.active, 1,
+            "ordinary typing or unavailable workspace changed focus"
+        );
+    }
+
+    #[test]
+    fn stacked_split_shortcut_creates_one_stacked_split() {
+        let ctx = egui::Context::default();
+        let mut app = fixture(1);
+        app.saved.workspaces[0].task.directory = std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        app.resume(&ctx, 0);
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![key_event(Key::D, None, command() | Modifiers::SHIFT)],
+                ..Default::default()
+            },
+            |ctx| app.shortcuts(ctx),
+        );
+        assert_eq!(app.panes.len(), 2);
+        assert!(matches!(
+            app.saved.workspaces[0].layout,
+            Layout::Split {
+                vertical: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn enter_in_workspace_fields_creates_or_opens_and_preserves_invalid_input() {
+        let ctx = egui::Context::default();
+        let mut app = fixture(2);
+        let dir = tempfile::tempdir().unwrap();
+        app.new_directory = dir.path().to_string_lossy().into_owned();
+        app.palette = true;
+        let frame = |app: &mut App, events| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 760.0))),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.draw(ctx),
+            );
+        };
+        frame(&mut app, vec![]);
+        ctx.memory_mut(|memory| memory.request_focus(egui::Id::new("workspace-directory")));
+        frame(&mut app, vec![key_event(Key::Enter, None, Modifiers::NONE)]);
+        assert_eq!(app.saved.workspaces.len(), 3);
+        assert_eq!(app.panes.len(), 1);
+        assert!(!app.palette);
+
+        app.palette = true;
+        app.new_directory = dir.path().join("missing").to_string_lossy().into_owned();
+        frame(&mut app, vec![]);
+        ctx.memory_mut(|memory| memory.request_focus(egui::Id::new("workspace-directory")));
+        frame(&mut app, vec![key_event(Key::Enter, None, Modifiers::NONE)]);
+        assert!(app.palette);
+        assert_eq!(app.saved.workspaces.len(), 3);
+        assert_eq!(app.panes.len(), 1);
+        assert!(app.error.contains("not a directory"));
+
+        app.saved.workspaces[1].task.title = "Unique match".into();
+        app.filter = "Unique".into();
+        frame(&mut app, vec![]);
+        ctx.memory_mut(|memory| memory.request_focus(egui::Id::new("workspace-filter")));
+        frame(&mut app, vec![key_event(Key::Enter, None, Modifiers::NONE)]);
+        assert_eq!(app.active, 1);
+        assert!(!app.palette);
+    }
+
+    #[test]
+    fn terminal_cursor_geometry_distinguishes_typing_and_selection() {
+        let cell = Vec2::new(9.0, 20.0);
+        let beam = cursor_rect(CursorShape::Beam, Pos2::ZERO, cell).unwrap();
+        assert_eq!(beam.size(), Vec2::new(2.0, 20.0));
+        let underline = cursor_rect(CursorShape::Underline, Pos2::ZERO, cell).unwrap();
+        assert_eq!(underline.min.y, 18.0);
+        assert_eq!(underline.height(), 2.0);
+        assert_eq!(
+            cursor_rect(CursorShape::HollowBlock, Pos2::ZERO, cell)
+                .unwrap()
+                .size(),
+            cell
+        );
+        assert!(cursor_rect(CursorShape::Hidden, Pos2::ZERO, cell).is_none());
+    }
+
     #[test]
     fn focused_terminal_receives_keyboard_input_once() {
         let ctx = egui::Context::default();
@@ -1418,7 +1801,13 @@ mod render_tests {
             ctx.clone(),
         )
         .unwrap();
-        app.panes.insert(pane, Pane { terminal });
+        app.panes.insert(
+            pane,
+            Pane {
+                terminal,
+                search: TerminalSearch::default(),
+            },
+        );
         for _ in 0..2 {
             let _ = ctx.run(
                 egui::RawInput {
@@ -1456,6 +1845,90 @@ mod render_tests {
             std::fs::read(&output_path).expect("terminal widget swallowed keyboard input"),
             b"x",
             "keyboard input was duplicated"
+        );
+        let command = format!("printf y >> '{}'", output_path.display());
+        app.panes.get_mut(&pane).unwrap().search.open();
+        let frame = |app: &mut App, events| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(640.0, 480.0))),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.draw(ctx),
+            );
+        };
+        frame(&mut app, vec![]);
+        frame(&mut app, vec![egui::Event::Text(command.clone())]);
+        let key = |key| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        };
+        frame(&mut app, vec![key(Key::Enter)]);
+        frame(&mut app, vec![key(Key::Escape)]);
+        assert!(!app.panes[&pane].search.is_open());
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            std::fs::read(&output_path).unwrap(),
+            b"x",
+            "search input leaked into shell"
+        );
+        frame(&mut app, vec![egui::Event::Text(format!("{command}\r"))]);
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            if std::fs::read(&output_path).is_ok_and(|bytes| bytes == b"xy") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            std::fs::read(&output_path).unwrap(),
+            b"xy",
+            "terminal focus was not restored"
+        );
+        let command = format!("printf z >> '{}'\r", output_path.display());
+        app.panes
+            .get_mut(&pane)
+            .unwrap()
+            .terminal
+            .selection_action(SelectionAction::Enter)
+            .unwrap();
+        let held = grid.lock().unwrap();
+        frame(
+            &mut app,
+            vec![
+                egui::Event::Text(command.clone()),
+                egui::Event::Paste(command.clone()),
+                egui::Event::Ime(egui::ImeEvent::Commit(command.clone())),
+                key(Key::ArrowLeft),
+                key(Key::Space),
+                key(Key::Enter),
+                egui::Event::Text(command.clone()),
+            ],
+        );
+        assert!(!app.panes[&pane].terminal.copy_mode);
+        drop(held);
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            std::fs::read(&output_path).unwrap(),
+            b"xy",
+            "copy-mode input leaked into shell"
+        );
+        frame(&mut app, vec![egui::Event::Text(command)]);
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            if std::fs::read(&output_path).is_ok_and(|bytes| bytes == b"xyz") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            std::fs::read(&output_path).unwrap(),
+            b"xyz",
+            "copy mode did not restore terminal input"
         );
     }
     #[test]

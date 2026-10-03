@@ -1,5 +1,7 @@
 mod integration;
 mod model;
+mod search;
+mod selection;
 mod terminal;
 mod ui;
 fn main() -> anyhow::Result<()> {

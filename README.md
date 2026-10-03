@@ -83,12 +83,20 @@ On macOS, `Command` below is Cmd. On Linux, use Ctrl+Alt so ordinary terminal Ct
 | Stacked split | Command+Shift+D |
 | Maximize / restore pane | Command+Shift+Enter |
 | Next pane | Command+Alt+Right |
+| Find in the focused terminal | Command+F |
+| Keyboard copy mode | Command+Shift+Space |
 | Workspace 1–9 | Command+1–9 |
 | Workspace picker / commands | Command+Shift+P |
 | Session needing attention | Command+Shift+N |
 | Stop pane, with confirmation | Command+Shift+W |
 
-In Overview, Up/Down select a session, Enter opens its terminal, and Escape returns. These keys remain normal terminal input in a pane. Drag split separators to resize. Drag terminal text to select; Cmd+C copies, Cmd+V pastes. Shift bypasses terminal mouse reporting for selection. Use the font slider and Light/Dark button in the toolbar.
+In Overview, Up/Down select a session, Enter opens its terminal, and Escape returns. These keys remain normal terminal input in a pane. Drag split separators to resize. Drag terminal text to select; Cmd+C copies, Cmd+V pastes. Shift bypasses terminal mouse reporting for selection. Use the font slider and Light/Dark button in the toolbar. Hover actions and workspace tabs to see their shortcuts. Workspace number shortcuts follow tab position and support the physical number row on layouts such as AZERTY. In the workspace dialog, Enter in Working directory creates a workspace; Enter in Find workspace opens the first match. Invalid directories keep the dialog open for correction.
+
+Normal terminal typing uses a slim beam caret; applications can request block, underline, beam or hidden cursors. Terminal color queries report the actual palette and application overrides, so dark-theme detection uses the real background.
+
+**Terminal search:** use Command+F (Ctrl+Alt+F on Linux) or the pane’s Find button. Search is literal and case-sensitive across the current screen and retained scrollback. Enter / Shift+Enter and Next / Previous navigate matches, wrapping at the ends; Escape closes search and restores terminal input. Only the current match is highlighted. Output changes or resizing clear the highlight; press Enter to search again. Queries stay in memory and are never sent to the shell or saved. Search follows Alacritty’s base-cell text semantics: wide characters and wrapped lines work, but combining marks are omitted and text hidden in the other terminal screen is excluded.
+
+**Keyboard selection:** Command+Shift+Space (Ctrl+Alt+Shift+Space on Linux) or the pane’s Select button enters copy mode. Arrows (or H/J/K/L), Home/End and Page Up/Down move the selection cursor; Ctrl+Left/Right move by word. Shift extends a selection, and Space or V toggles selection at the cursor. The normal copy shortcut copies without leaving; Enter copies and returns to the live terminal, while Escape cancels. Typed text, paste and IME commits are suppressed during copy mode. Selection uses the active screen and retained scrollback, including after the shell exits. Opening Find leaves copy mode; entering copy mode closes Find.
 
 ## Recovery and current boundaries
 
