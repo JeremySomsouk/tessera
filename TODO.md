@@ -12,7 +12,9 @@
 - [ ] Validate CI artifacts on Apple Silicon and finish native terminal smoke checklist.
 
 ## Next: terminal and Overview polish
-- [ ] Terminal search, keyboard selection, font/theme/key configuration and native font fallback.
+- [x] Pane-local literal terminal search, scrollback navigation and keyboard controls.
+- [x] Keyboard selection/copy mode with scrollback navigation and input isolation.
+- [ ] Font/theme/key configuration and native font fallback.
 - [ ] Mouse wheel/motion/keypad/function-key coverage, IME preedit and accessibility.
 - [ ] Saved layout recipes, pane moves, workspace close/archive, layout undo.
 - [ ] Durable host process, detach/move/stop choices, reconnect protocol and multiple windows.

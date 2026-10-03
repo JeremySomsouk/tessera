@@ -1,5 +1,7 @@
 mod integration;
 mod model;
+mod search;
+mod selection;
 mod terminal;
 mod ui;
 fn main() -> anyhow::Result<()> {
@@ -79,7 +81,8 @@ fn main() -> anyhow::Result<()> {
         }
         Some("--help" | "-h") => {
             println!(
-                "Tessera 0.1.0\n\nUsage: tessera [hooks | install-hooks [settings.json] | uninstall-hooks [settings.json]]\n\nNo argument opens the terminal application. Run hooks or codex-hooks to preview integration before installing.\nCodex: tessera codex-hooks | install-codex-hooks [hooks.json] | uninstall-codex-hooks [hooks.json]"
+                "Tessera {}\n\nUsage: tessera [hooks | install-hooks [settings.json] | uninstall-hooks [settings.json]]\n\nNo argument opens the terminal application. Run hooks or codex-hooks to preview integration before installing.\nCodex: tessera codex-hooks | install-codex-hooks [hooks.json] | uninstall-codex-hooks [hooks.json]",
+                env!("CARGO_PKG_VERSION")
             );
             Ok(())
         }

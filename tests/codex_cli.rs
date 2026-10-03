@@ -142,3 +142,19 @@ fn codex_cli_round_trip_strips_content_and_tags_provider() {
         json!({})
     );
 }
+
+#[test]
+fn help_and_version_report_the_package_release() {
+    for argument in ["--help", "--version"] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_tessera"))
+            .arg(argument)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            text.contains(env!("CARGO_PKG_VERSION")),
+            "{argument} reports the wrong release"
+        );
+    }
+}
