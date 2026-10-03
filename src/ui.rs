@@ -288,7 +288,7 @@ impl App {
             Err(e) => app.error = format!("Event endpoint unavailable: {e}"),
         }
         configure_appearance(&cc.egui_ctx, app.saved.light);
-        // Restore metadata only. Live processes never survive application shutdown in v0.1.
+        // Restore metadata only. Live processes never survive application shutdown.
         if app.saved.workspaces.is_empty() {
             app.add_workspace(&cc.egui_ctx);
         } else {
