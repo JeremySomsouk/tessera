@@ -11,7 +11,7 @@ use eframe::egui::{Color32, Context};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::{
     io::{Read, Write},
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
@@ -20,6 +20,52 @@ use std::{
     time::Duration,
 };
 use uuid::Uuid;
+#[cfg(target_os = "macos")]
+fn process_directory(pid: u32) -> Result<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    let mut info = std::mem::MaybeUninit::<libc::proc_vnodepathinfo>::zeroed();
+    let size = std::mem::size_of::<libc::proc_vnodepathinfo>();
+    // SAFETY: the writable buffer has exactly the size required by this flavor.
+    let read = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size as libc::c_int,
+        )
+    };
+    if read != size as libc::c_int {
+        bail!(
+            "cannot read shell working directory: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    // SAFETY: proc_pidinfo returned the complete initialized structure.
+    let info = unsafe { info.assume_init() };
+    let bytes: Vec<u8> = info
+        .pvi_cdir
+        .vip_path
+        .iter()
+        .flatten()
+        .take_while(|c| **c != 0)
+        .map(|c| *c as u8)
+        .collect();
+    if bytes.is_empty() {
+        bail!("shell working directory is unavailable");
+    }
+    Ok(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+}
+#[cfg(target_os = "linux")]
+fn process_directory(pid: u32) -> Result<PathBuf> {
+    use anyhow::Context;
+    std::fs::read_link(format!("/proc/{pid}/cwd")).context("cannot read shell working directory")
+}
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn process_directory(_pid: u32) -> Result<PathBuf> {
+    bail!("reading the shell working directory is unsupported on this platform")
+}
+
 #[derive(Clone, Copy)]
 pub struct Size {
     pub cols: usize,
@@ -117,6 +163,8 @@ pub struct Terminal {
     stopping: Arc<AtomicBool>,
     lifecycle: Arc<Mutex<ProcessLifecycle>>,
     host: Option<std::thread::JoinHandle<()>>,
+    shell_pid: Option<u32>,
+    launch_directory: PathBuf,
 }
 impl Terminal {
     pub fn spawn(id: Uuid, directory: &Path, socket: &Path, ctx: Context) -> Result<Self> {
@@ -140,6 +188,7 @@ impl Terminal {
         command.env("TESSERA_PANE", id.to_string());
         command.env("TESSERA_SOCKET", socket);
         let mut child = pair.slave.spawn_command(command)?;
+        let shell_pid = child.process_id();
         let lifecycle = Arc::new(Mutex::new(ProcessLifecycle {
             killer: child.clone_killer(),
             exited: false,
@@ -310,7 +359,18 @@ impl Terminal {
             stopping,
             lifecycle,
             host: Some(host),
+            shell_pid,
+            launch_directory: directory.to_path_buf(),
         })
+    }
+    pub fn current_directory(&self) -> Result<PathBuf> {
+        if !self.alive.load(Ordering::Acquire) {
+            return Ok(self.launch_directory.clone());
+        }
+        let pid = self
+            .shell_pid
+            .ok_or_else(|| anyhow::anyhow!("shell process ID unavailable"))?;
+        process_directory(pid)
     }
     pub fn selection_action(&mut self, action: SelectionAction) -> Result<()> {
         if self.alive.load(Ordering::Acquire) {

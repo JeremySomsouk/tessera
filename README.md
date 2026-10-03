@@ -93,7 +93,7 @@ On macOS, `Command` below is Cmd. On Linux, use Ctrl+Alt so ordinary terminal Ct
 | Action | Shortcut |
 | --- | --- |
 | Overview / previous terminal | Command+Shift+O |
-| New workspace in the current configured directory | Command+T |
+| New terminal workspace in the active pane’s current directory | Command+N or Command+T |
 | Rename current workspace | Command+Shift+R |
 | Side-by-side split | Command+D |
 | Stacked split | Command+Shift+D |
@@ -105,6 +105,8 @@ On macOS, `Command` below is Cmd. On Linux, use Ctrl+Alt so ordinary terminal Ct
 | Workspace picker / commands | Command+Shift+P |
 | Session needing attention | Command+Shift+N |
 | Stop pane | Command+W |
+
+New terminals opened with Command+N or Command+T inherit the focused shell’s current working directory, including changes made with `cd`. Restored workspaces without a live shell use their saved directory; the workspace dialog still uses the directory you enter.
 
 Closing a terminal asks for confirmation. Check “Don’t ask again for any terminal” and confirm to skip future prompts across all workspaces, including after restarting Tessera. Re-enable prompts with “Confirm before stopping terminals” in Workspace & commands. Stopping the last pane removes its workspace; task history is retained. Renaming selects the current name; Enter saves and Escape cancels. The rename dialog rejects blank names.
 
