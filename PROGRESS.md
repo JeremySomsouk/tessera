@@ -70,3 +70,7 @@ Workspace dialog follow-up: Enter submission is captured from the focused direct
 Package and lockfile are 0.2.1. Added focused release notes for Cmd+W, removal of the last-pane workspace, dialog Enter submission and inline invalid-directory feedback. README release commands and current-version description match. The existing tag workflow validates Linux and both Mac architectures before publishing their DMGs.
 
 Release validation: all 41 tests pass including both Unix socket round trips when run outside the sandbox. Formatting, Clippy with warnings denied, debug build, bundle script syntax and diff checks pass. Native interactive acceptance remains outstanding.
+
+2026-10-03 — Immediate terminal stop.
+
+Removed stop confirmation following user feedback. Cmd+W immediately stops the focused terminal and removes its pane/workspace; the × button performs the same action in the current frame after pane rendering. No persistent pending-close state or confirmation window remains. Task/session history retention is unchanged. Shortcut regression now asserts immediate removal and disconnected history.

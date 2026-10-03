@@ -197,7 +197,6 @@ pub struct App {
     palette: bool,
     filter: String,
     maximized: bool,
-    close: Option<Uuid>,
     category: u8,
 }
 fn state_path() -> PathBuf {
@@ -280,7 +279,6 @@ impl App {
             palette: false,
             filter: String::new(),
             maximized: false,
-            close: None,
             category: 0,
         };
         match endpoint {
@@ -407,7 +405,6 @@ impl App {
                 self.dirty = true;
             }
         }
-        self.close = None;
     }
     fn resume(&mut self, ctx: &egui::Context, index: usize) {
         let mut ids = Vec::new();
@@ -486,7 +483,6 @@ impl App {
         }
         if !self.overview
             && !self.palette
-            && self.close.is_none()
             && ctx.input_mut(|i| i.consume_key(command, Key::F))
             && let Some(pane) = self
                 .saved
@@ -503,7 +499,6 @@ impl App {
         }
         if !self.overview
             && !self.palette
-            && self.close.is_none()
             && ctx.input_mut(|i| i.consume_key(command | Modifiers::SHIFT, Key::Space))
             && let Some(pane) = self
                 .saved
@@ -530,8 +525,10 @@ impl App {
         if ctx.input_mut(|i| i.consume_key(command | Modifiers::SHIFT, Key::P)) {
             self.palette = !self.palette;
         }
-        if ctx.input_mut(|i| i.consume_key(command, Key::W)) {
-            self.close = self.saved.workspaces.get(self.active).map(|w| w.focus);
+        if ctx.input_mut(|i| i.consume_key(command, Key::W))
+            && let Some(id) = self.saved.workspaces.get(self.active).map(|w| w.focus)
+        {
+            self.stop_terminal(id);
         }
         if ctx.input_mut(|i| i.consume_key(command | Modifiers::SHIFT, Key::N))
             && let Some(s) = self.saved.sessions.iter().find(|s| s.state.attention())
@@ -924,6 +921,7 @@ impl App {
                 }
             });
         });
+        let mut stop = None;
         egui::CentralPanel::default().show(ctx,|ui| {
             if self.overview {self.overview(ui);return;}
             let Some(w)=self.saved.workspaces.get_mut(self.active) else {ui.label("Create a workspace to start a shell.");return;};
@@ -935,10 +933,10 @@ impl App {
                     if let Some(pane)=self.panes.get_mut(&id) {
                         ui.horizontal(|ui| {ui.label(RichText::new(if focused==id {"● Terminal"}else{"Terminal"}).color(if focused==id{ACCENT}else{ui.visuals().weak_text_color()}));if ui.small_button("Select").on_hover_text(shortcut("Keyboard selection", "Shift+Space")).clicked(){pane.search.close();if let Err(error)=pane.terminal.selection_action(SelectionAction::Enter){self.error=error.to_string();}self.saved.workspaces[self.active].focus=id;self.dirty=true;}
 if ui.small_button("Find").on_hover_text(shortcut("Find in terminal", "F")).clicked(){if pane.terminal.copy_mode && let Err(error)=pane.terminal.selection_action(SelectionAction::Exit){self.error=error.to_string();}pane.search.open();self.saved.workspaces[self.active].focus=id;self.dirty=true;}
-if ui.small_button("×").on_hover_text(shortcut("Stop terminal", "W")).clicked(){self.close=Some(id);}
+if ui.small_button("×").on_hover_text(shortcut("Stop terminal", "W")).clicked(){stop=Some(id);}
 if !pane.terminal.alive.load(Ordering::Acquire){ui.label("Shell exited");}});
                         if let Some(err)=pane.terminal.error.try_lock().ok().and_then(|e|e.clone()) {ui.small(err);}
-                        let (clicked,result)=terminal_view(ui,&mut pane.terminal,&mut pane.search,focused==id&&!self.palette&&self.close.is_none(),self.font_size);
+                        let (clicked,result)=terminal_view(ui,&mut pane.terminal,&mut pane.search,focused==id&&!self.palette&&stop.is_none(),self.font_size);
                         if clicked {self.saved.workspaces[self.active].focus=id;self.dirty=true;}
                         if let Err(e)=result {self.error=e.to_string();}
                     }else{ui.heading("Workspace restored");ui.label("The previous processes have stopped. Start fresh login shells in this layout.");if ui.button("Resume workspace").clicked(){self.resume(ctx,self.active);}}
@@ -1020,9 +1018,8 @@ if !pane.terminal.alive.load(Ordering::Acquire){ui.label("Shell exited");}});
                     }
                 });
         }
-        if let Some(id) = self.close {
-            egui::Window::new("Stop this terminal?").collapsible(false).resizable(false).show(ctx,|ui| {ui.label("The shell and its child processes will be stopped. Closing the last terminal removes its workspace. Task history is retained.");if ui.button("Stop terminal").clicked(){self.stop_terminal(id);}
-if ui.button("Keep running").clicked(){self.close=None;}});
+        if let Some(id) = stop {
+            self.stop_terminal(id);
         }
         if self.dirty {
             if now().saturating_sub(self.last_save) >= 2 {
@@ -1643,7 +1640,6 @@ mod render_tests {
             palette: false,
             filter: String::new(),
             maximized: false,
-            close: None,
             category: 0,
         }
     }
@@ -1754,7 +1750,7 @@ mod render_tests {
     }
 
     #[test]
-    fn command_w_requests_terminal_stop() {
+    fn command_w_stops_terminal_without_confirmation() {
         let ctx = egui::Context::default();
         let mut app = fixture(1);
         let pane = app.saved.workspaces[0].focus;
@@ -1768,8 +1764,9 @@ mod render_tests {
                 assert!(!ctx.input(|i| i.key_pressed(Key::W)));
             },
         );
-        assert_eq!(app.close, Some(pane));
-        assert_eq!(app.saved.workspaces.len(), 1, "confirmation is required");
+        assert!(app.saved.workspaces.is_empty());
+        assert_eq!(app.saved.sessions[0].pane, pane);
+        assert_eq!(app.saved.sessions[0].state, SessionState::Disconnected);
     }
 
     #[test]
@@ -1783,7 +1780,6 @@ mod render_tests {
         app.resume(&ctx, 0);
         let pane = app.saved.workspaces[0].focus;
         let alive = app.panes[&pane].terminal.alive.clone();
-        app.close = Some(pane);
         app.maximized = true;
         app.stop_terminal(pane);
         assert!(!alive.load(Ordering::Acquire));
@@ -1791,7 +1787,6 @@ mod render_tests {
         assert!(app.saved.workspaces.is_empty());
         assert_eq!(app.active, 0);
         assert!(!app.maximized);
-        assert!(app.close.is_none());
         assert!(app.dirty);
         assert_eq!(app.saved.sessions.len(), 1);
         assert_eq!(app.saved.sessions[0].state, SessionState::Disconnected);
