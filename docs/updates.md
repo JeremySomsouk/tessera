@@ -8,7 +8,7 @@ Each architecture has its own `appcast-arm64.xml` or `appcast-x86_64.xml`, serve
 
 ## Missing update controls
 
-Open Workspace & commands with Cmd+Shift+P to find **Check for updates…**. Starting with 0.2.3, the dialog scrolls and retains updater startup errors beside a disabled check button. If Sparkle cannot load or start, reinstall the macOS application bundle; Cargo binaries show that bundle updates are unavailable. In 0.2.2, a startup failure hides the update controls and reports the failure through the general error display, which later errors can replace.
+Open Workspace & commands with Cmd+Shift+P to find **Check for updates…**. Starting with 0.2.4, the dialog scrolls and retains updater startup errors beside a disabled check button. If Sparkle cannot load or start, reinstall the macOS application bundle; Cargo binaries show that bundle updates are unavailable. In 0.2.2 and 0.2.3, a startup failure hides the update controls and reports the failure through the general error display, which later errors can replace.
 
 ## Release key
 
