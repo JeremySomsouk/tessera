@@ -15,3 +15,10 @@ Local environment limitation: no macOS window server; local socket bind is denie
 Current architecture hosts PTYs in worker threads in the app process. UI navigation preserves them; app exit does not. Metadata/history restore is implemented; detached live-process recovery is planned. Specs/connector/review-evidence milestones remain planned, not partially represented by fake views.
 
 Resume work: inspect CI, install the Intel app on the user's Mac, run the native checklist in docs/terminal-compatibility.md, fix functional blockers before starting the local specification board. Keep TODO.md and this file current per increment.
+
+
+2026-10-03 — second increment: Codex integration.
+
+Added Codex lifecycle hooks and preview/install/uninstall commands, respecting CODEX_HOME and preserving existing JSON handlers plus config.toml. Hooks require the user's review/trust via Codex /hooks. Metadata-only transport shares existing bounds. Provider-aware identity keeps same-ID Claude/Codex histories separate; missing provider fields restore as Claude with unchanged selection keys. Mixed-agent Overview labels each card. Interrupt marks attention; task acceptance remains explicit. CI push trigger follows the renamed main branch.
+
+Validation adds provider transitions/history migration, Codex metadata privacy and malformed/oversized rejection, installer preservation/idempotence/exact removal/symlink refusal, and mixed-provider Overview fixtures. Local validation: 18 tests pass; two socket tests are reserved for unrestricted CI (20 total), formatting, Clippy with warnings denied, and build pass. No real inference session is launched. Native interactive Mac/Codex validation remains outstanding.
