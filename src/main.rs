@@ -92,6 +92,9 @@ fn main() -> anyhow::Result<()> {
             "Tessera",
             eframe::NativeOptions {
                 viewport: eframe::egui::ViewportBuilder::default()
+                    .with_icon(eframe::icon_data::from_png_bytes(include_bytes!(
+                        "../assets/app-icon-window.png"
+                    ))?)
                     .with_inner_size([1180.0, 760.0])
                     .with_min_inner_size([640.0, 400.0]),
                 ..Default::default()
