@@ -20,6 +20,10 @@ Portable tests: real shell input/output and resize (`stty size`), cursor-positio
 
 Search omits combining marks under Alacritty’s base-cell semantics; output changes invalidate the current match until the next search action. No full IME preedit, configurable system font/fallback, full mouse-motion protocol, Kitty keyboard protocol, all function/keypad encodings, cursor blinking, bold/italic rendering, OSC title in pane chrome, OSC hyperlinks, terminfo auditing, accessibility grid, or daemon-hosted reconnect. Ordinary terminal painting stays dark when application chrome is light. These gaps mean the app is runnable but should remain an alpha alongside your existing terminal.
 
+## File drops
+
+Saved-file drops paste shell-escaped paths into the pane under the pointer, falling back to the focused pane when the platform supplies no pointer position. Multiple files use individual bracketed pastes when requested by the terminal application. Find, copy mode and dialogs block drops. Missing paths and control-character filenames produce an error; save screenshot previews as files if the platform does not expose a path. Tests cover escaping, paste boundaries, input limits, search isolation and a real PTY receiving a drop in an unfocused split without Enter. Native screenshot-preview dragging remains unverified.
+
 ## Codex question clicks
 
 Enable **Clickable Codex questions** in Workspace & commands. In Codex's numbered question prompt, clicking an option selects it; press Enter to submit. Shift/drag retains text selection. Native mouse-reporting applications keep their own input handling. Compatibility only recognizes the visible question prompt with its selection marker and keyboard footer; ordinary numbered output, scrollback, search, copy mode, and notes entry do not receive synthetic keys. This is checked against Codex 0.160.0; future prompt layouts may require an update.

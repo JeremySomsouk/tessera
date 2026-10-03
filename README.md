@@ -4,7 +4,7 @@
 
 A desktop terminal workspace with a single Overview of real Claude Code and Codex sessions.
 
-**0.2.3 improves Vim/Neovim cursor rendering.** Signed automatic macOS updates, workspace renaming, trackpad scrolling and the saved terminal-close preference were added in 0.2.2. It combines real login-shell PTYs, resizable splits, keyboard navigation, persistent workspace metadata, and a hook-driven agent Overview. Specification editing, issue connectors, and detached session hosting follow in later increments.
+**0.2.4 adds screenshot file drops and makes update failures visible.** It combines real login-shell PTYs, resizable splits, keyboard navigation, persistent workspace metadata, signed automatic macOS updates, and a hook-driven agent Overview. Specification editing, issue connectors, and detached session hosting follow in later increments.
 
 ## Start on macOS
 
@@ -31,8 +31,8 @@ CI produces separate Intel (`Tessera-x86_64.dmg`) and Apple Silicon (`Tessera-ar
 To publish a version, tag the release commit containing this workflow and push the tag:
 
 ```sh
-git tag v0.2.3
-git push origin v0.2.3
+git tag v0.2.4
+git push origin v0.2.4
 ```
 
 Pushing a version tag (`v` followed by a digit) runs all checks and builds both DMGs, then publishes them on the [GitHub Releases page](https://github.com/JeremySomsouk/tessera/releases) with checked-in release notes when available, otherwise generated notes. New releases stay in draft until both DMGs and signed update feeds upload successfully. Release tags require the `SPARKLE_ED25519_PRIVATE_KEY` Actions secret; see [update signing](docs/updates.md). A failed publishing job can be rerun to finish the release. Branch pushes and pull requests upload Actions artifacts only.
@@ -117,6 +117,8 @@ Normal terminal typing uses a slim beam caret; applications can request block, u
 **Terminal search:** use Command+F (Ctrl+Alt+F on Linux) or the pane’s Find button. Search is literal and case-sensitive across the current screen and retained scrollback. Enter / Shift+Enter and Next / Previous navigate matches, wrapping at the ends; Escape closes search and restores terminal input. Only the current match is highlighted. Output changes or resizing clear the highlight; press Enter to search again. Queries stay in memory and are never sent to the shell or saved. Search follows Alacritty’s base-cell text semantics: wide characters and wrapped lines work, but combining marks are omitted and text hidden in the other terminal screen is excluded.
 
 **Keyboard selection:** Command+Shift+Space (Ctrl+Alt+Shift+Space on Linux) or the pane’s Select button enters copy mode. Arrows (or H/J/K/L), Home/End and Page Up/Down move the selection cursor; Ctrl+Left/Right move by word. Shift extends a selection, and Space or V toggles selection at the cursor. The normal copy shortcut copies without leaving; Enter copies and returns to the live terminal, while Escape cancels. Typed text, paste and IME commits are suppressed during copy mode. Selection uses the active screen and retained scrollback, including after the shell exits. Opening Find leaves copy mode; entering copy mode closes Find.
+
+**File drops:** drop a saved screenshot or other file onto a running terminal pane to paste its escaped path. Codex recognizes image paths as attachments in its prompt; Enter remains explicit submission. Close Find or copy mode first. If a screenshot preview does not provide a file path, save it and drop the saved file. Tessera does not upload or retain dropped image contents.
 
 ## Recovery and current boundaries
 

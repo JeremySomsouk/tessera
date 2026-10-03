@@ -196,6 +196,7 @@ struct WorkspaceRename {
 
 pub struct App {
     updater: crate::updater::Updater,
+    updater_error: Option<String>,
     saved: Saved,
     panes: HashMap<Uuid, Pane>,
     active: usize,
@@ -274,6 +275,7 @@ impl App {
         });
         let mut app = Self {
             updater: crate::updater::Updater::default(),
+            updater_error: None,
             font_size: if saved.font_size > 0.0 {
                 saved.font_size
             } else {
@@ -308,7 +310,7 @@ impl App {
         }
         match crate::updater::Updater::start() {
             Ok(updater) => app.updater = updater,
-            Err(error) => app.error = format!("Updates unavailable: {error}"),
+            Err(error) => app.updater_error = Some(format!("Updates unavailable: {error}")),
         }
         configure_appearance(&cc.egui_ctx, app.saved.light);
         // Restore metadata only. Live processes never survive application shutdown.
@@ -1107,7 +1109,27 @@ impl App {
             let Some(w)=self.saved.workspaces.get_mut(self.active) else {ui.label("Create a workspace to start a shell.");return;};
             let mut rects=Vec::new();let rect=ui.available_rect_before_wrap();
             if self.maximized {rects.push((w.focus,rect));}else{w.layout.rects(ui,rect,&mut rects);}
-            let focused=w.focus;
+            let mut focused=w.focus;
+            if !self.palette && self.rename.is_none() && self.closing.is_none() {
+                let dropped = ctx.input_mut(|i| std::mem::take(&mut i.raw.dropped_files));
+                if !dropped.is_empty() {
+                    let pointer = ctx.input(|i| i.pointer.latest_pos());
+                    let target = pointer.map_or(Some(focused), |pos| rects.iter().find(|(_, rect)| rect.contains(pos)).map(|(id, _)| *id));
+                    let result = target.and_then(|id| self.panes.get_mut(&id).map(|pane| (id, pane)))
+                        .ok_or_else(|| anyhow::anyhow!("Drop files onto a running terminal pane"))
+                        .and_then(|(id, pane)| {
+                            if pane.search.is_open() || pane.terminal.copy_mode {
+                                anyhow::bail!("Close Find or copy mode before dropping files");
+                            }
+                            pane.terminal.input_at_cursor(dropped_file_input(&dropped, pane.terminal.mode())?)?;
+                            self.saved.workspaces[self.active].focus = id;
+                            focused = id;
+                            self.dirty = true;
+                            Ok(())
+                        });
+                    if let Err(error) = result { self.error = error.to_string(); }
+                }
+            }
             for (id,rect) in rects {
                 ui.scope_builder(egui::UiBuilder::new().max_rect(rect).id_salt(id),|ui| {
                     if let Some(pane)=self.panes.get_mut(&id) {
@@ -1127,6 +1149,7 @@ if !pane.terminal.alive.load(Ordering::Acquire){ui.label("Shell exited");}});
             egui::Window::new("Workspace & commands")
                 .collapsible(false)
                 .resizable(false)
+                .vscroll(true)
                 .show(ctx, |ui| {
                     ui.label("Working directory");
                     let directory = ui.add(
@@ -1221,9 +1244,9 @@ if !pane.terminal.alive.load(Ordering::Acquire){ui.label("Shell exited");}});
                     {
                         self.dirty = true;
                     }
+                    ui.separator();
+                    ui.label(format!("Tessera {}", env!("CARGO_PKG_VERSION")));
                     if self.updater.available() {
-                        ui.separator();
-                        ui.label(format!("Tessera {}", env!("CARGO_PKG_VERSION")));
                         if ui
                             .add_enabled(
                                 self.updater.can_check(),
@@ -1254,6 +1277,11 @@ if !pane.terminal.alive.load(Ordering::Acquire){ui.label("Shell exited");}});
                             self.updater.set_automatic_downloads(download);
                         }
                         ui.small("Downloaded updates install when Tessera quits.");
+                    } else if let Some(error) = &self.updater_error {
+                        ui.add_enabled(false, egui::Button::new("Check for updates…"));
+                        ui.colored_label(ui.visuals().error_fg_color, error);
+                    } else {
+                        ui.small("Automatic updates require the macOS application bundle.");
                     }
                     if ui.button("Close").clicked() {
                         self.palette = false;
@@ -1375,6 +1403,40 @@ fn workspace_submission(ctx: &egui::Context) -> Option<egui::Id> {
     }
     ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Enter))
         .then_some(focused)
+}
+
+fn dropped_file_input(files: &[egui::DroppedFile], mode: TermMode) -> anyhow::Result<Vec<u8>> {
+    let mut text = String::new();
+    for file in files {
+        let path = file.path.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("Save the screenshot as a file, then drop it onto the terminal")
+        })?;
+        let path = path
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("Dropped file path is not valid UTF-8"))?;
+        if path.is_empty() || path.chars().any(char::is_control) {
+            anyhow::bail!("Dropped file path contains unsupported control characters");
+        }
+        if path.len() > 60 * 1024 {
+            anyhow::bail!("Dropped file path exceeds the terminal paste limit");
+        }
+        if !text.is_empty() {
+            text.push(' ');
+        }
+        if mode.contains(TermMode::BRACKETED_PASTE) {
+            text.push_str("\x1b[200~");
+        }
+        text.push('\'');
+        text.push_str(&path.replace('\'', "'\\''"));
+        text.push('\'');
+        if mode.contains(TermMode::BRACKETED_PASTE) {
+            text.push_str("\x1b[201~");
+        }
+        if text.len() > 60 * 1024 {
+            anyhow::bail!("Dropped file paths exceed the terminal paste limit; drop fewer files");
+        }
+    }
+    Ok(text.into_bytes())
 }
 
 fn cursor_rect(shape: CursorShape, pos: Pos2, cell: Vec2) -> Option<Rect> {
@@ -2188,6 +2250,7 @@ mod render_tests {
         let selected = saved.sessions.first().map(Session::key);
         App {
             updater: crate::updater::Updater::default(),
+            updater_error: None,
             saved,
             panes: HashMap::new(),
             active: 0,
@@ -2351,6 +2414,135 @@ mod render_tests {
         assert!(app.rename.is_none());
         assert_eq!(app.saved.workspaces[1].task.title, original);
         assert!(!app.dirty);
+    }
+
+    #[test]
+    fn dropped_paths_are_quoted_and_each_image_gets_its_own_paste() {
+        let files =
+            ["/tmp/Screen shot é.png", "/tmp/a'$(touch nope).png"].map(|path| egui::DroppedFile {
+                path: Some(PathBuf::from(path)),
+                ..Default::default()
+            });
+        let plain = "'/tmp/Screen shot é.png' '/tmp/a'\\''$(touch nope).png'";
+        assert_eq!(
+            dropped_file_input(&files, TermMode::empty()).unwrap(),
+            plain.as_bytes()
+        );
+        assert_eq!(dropped_file_input(&files, TermMode::BRACKETED_PASTE).unwrap(),
+            "\x1b[200~'/tmp/Screen shot é.png'\x1b[201~ \x1b[200~'/tmp/a'\\''$(touch nope).png'\x1b[201~".as_bytes());
+        for path in ["/tmp/bad\nname.png", "/tmp/bad\x1bname.png", ""] {
+            assert!(
+                dropped_file_input(
+                    &[egui::DroppedFile {
+                        path: Some(path.into()),
+                        ..Default::default()
+                    }],
+                    TermMode::empty()
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            dropped_file_input(&[egui::DroppedFile::default()], TermMode::empty())
+                .unwrap_err()
+                .to_string()
+                .contains("Save the screenshot")
+        );
+        assert!(
+            dropped_file_input(
+                &[egui::DroppedFile {
+                    path: Some("x".repeat(64 * 1024).into()),
+                    ..Default::default()
+                }],
+                TermMode::empty()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn file_drop_targets_the_hovered_split_and_reaches_pty_without_enter() {
+        let ctx = egui::Context::default();
+        let mut app = fixture(1);
+        app.overview = false;
+        app.resume(&ctx, 0);
+        let target = app.saved.workspaces[0].focus;
+        app.split(&ctx, true);
+        let other = app.saved.workspaces[0].focus;
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("received");
+        let ready = directory.path().join("ready");
+        let files = vec![egui::DroppedFile {
+            path: Some("/tmp/Screenshot é '1.png".into()),
+            ..Default::default()
+        }];
+        let expected = dropped_file_input(&files, TermMode::BRACKETED_PASTE).unwrap();
+        app.panes[&target].terminal.input(format!(
+            "printf '\\033[?2004h'; stty raw -echo; touch '{}'; dd bs=1 count={} of='{}' 2>/dev/null\r",
+            ready.display(), expected.len(), output.display()
+        ).into_bytes()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !ready.exists()
+            || !app.panes[&target]
+                .terminal
+                .mode()
+                .contains(TermMode::BRACKETED_PASTE)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "PTY did not become ready"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let frame = |app: &mut App, dropped_files| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(640.0, 480.0))),
+                    events: vec![egui::Event::PointerMoved(Pos2::new(150.0, 250.0))],
+                    dropped_files,
+                    ..Default::default()
+                },
+                |ctx| app.draw(ctx),
+            );
+        };
+        frame(&mut app, vec![]);
+        app.panes.get_mut(&target).unwrap().search.open();
+        frame(&mut app, files.clone());
+        assert!(app.error.contains("Close Find"));
+        assert_eq!(app.saved.workspaces[0].focus, other);
+        app.panes.get_mut(&target).unwrap().search.close();
+        frame(&mut app, files);
+        assert_eq!(app.saved.workspaces[0].focus, target);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !std::fs::read(&output).is_ok_and(|bytes| bytes.len() == expected.len()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Drop did not reach target PTY"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(std::fs::read(output).unwrap(), expected);
+        assert!(!expected.contains(&b'\r') && !expected.contains(&b'\n'));
+    }
+
+    #[test]
+    fn updater_failure_remains_visible_after_other_errors_change() {
+        let ctx = egui::Context::default();
+        let mut app = fixture(1);
+        app.palette = true;
+        app.updater_error =
+            Some("Updates unavailable: Cannot load Sparkle; reinstall Tessera".into());
+        app.error = "Unrelated terminal error".into();
+        let mut output = None;
+        for _ in 0..3 {
+            output = Some(ctx.run(egui::RawInput::default(), |ctx| app.draw(ctx)));
+        }
+        let output = output.unwrap();
+        for expected in ["Check for updates…", app.updater_error.as_ref().unwrap()] {
+            assert!(output.shapes.iter().any(|shape| {
+                matches!(&shape.shape, egui::epaint::Shape::Text(text) if text.galley.text() == expected)
+            }), "Missing updater diagnostic: {expected}");
+        }
     }
 
     #[test]
