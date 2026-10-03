@@ -166,6 +166,8 @@ struct Saved {
     light: bool,
     #[serde(default)]
     skip_stop_confirmation: bool,
+    #[serde(default)]
+    clickable_codex_choices: bool,
 }
 fn accent(ui: &egui::Ui) -> Color32 {
     if ui.visuals().dark_mode {
@@ -1084,7 +1086,7 @@ if ui.small_button("Find").on_hover_text(shortcut("Find in terminal", "F")).clic
 if ui.small_button("×").on_hover_text(shortcut("Stop terminal", "W")).clicked(){stop=Some(id);}
 if !pane.terminal.alive.load(Ordering::Acquire){ui.label("Shell exited");}});
                         if let Some(err)=pane.terminal.error.try_lock().ok().and_then(|e|e.clone()) {ui.small(err);}
-                        let (clicked,result)=terminal_view(ui,&mut pane.terminal,&mut pane.search,focused==id&&!self.palette&&self.rename.is_none()&&self.closing.is_none()&&stop.is_none(),self.font_size);
+                        let (clicked,result)=terminal_view(ui,&mut pane.terminal,&mut pane.search,focused==id&&!self.palette&&self.rename.is_none()&&self.closing.is_none()&&stop.is_none(),self.font_size,self.saved.clickable_codex_choices&&!self.palette&&self.rename.is_none()&&self.closing.is_none());
                         if clicked {self.saved.workspaces[self.active].focus=id;self.dirty=true;}
                         if let Err(e)=result {self.error=e.to_string();}
                     }else{ui.heading("Workspace restored");ui.label("The previous processes have stopped. Start fresh login shells in this layout.");if ui.button("Resume workspace").clicked(){self.resume(ctx,self.active);}}
@@ -1177,6 +1179,16 @@ if !pane.terminal.alive.load(Ordering::Acquire){ui.label("Shell exited");}});
                         .changed()
                     {
                         self.saved.skip_stop_confirmation = !confirm_stop;
+                        self.dirty = true;
+                    }
+                    if ui
+                        .checkbox(
+                            &mut self.saved.clickable_codex_choices,
+                            "Clickable Codex questions",
+                        )
+                        .on_hover_text("Click an option to select it. Press Enter to submit.")
+                        .changed()
+                    {
                         self.dirty = true;
                     }
                     if self.updater.available() {
@@ -1353,6 +1365,7 @@ fn terminal_view(
     search: &mut TerminalSearch,
     focused: bool,
     font_size: f32,
+    clickable_choices: bool,
 ) -> (bool, anyhow::Result<()>) {
     let copying = terminal.copy_mode;
     let searching = search.is_open();
@@ -1398,6 +1411,8 @@ fn terminal_view(
     }
     let mut mode = terminal.mode();
     let mut selected = None;
+    let mut choice_prompt = None;
+    let mut choice_revision = 0;
     if let Ok(mut term) = terminal.term.try_lock() {
         search.invalidate(terminal.revision());
         mode = *term.mode();
@@ -1425,6 +1440,31 @@ fn terminal_view(
             {
                 s.update(point, Side::Right);
             }
+        }
+        if clickable_choices
+            && !copying
+            && !searching
+            && terminal.alive.load(Ordering::Acquire)
+            && !mode.intersects(TermMode::MOUSE_MODE)
+            && term.grid().display_offset() == 0
+        {
+            choice_revision = terminal.revision();
+            choice_prompt = ui.ctx().data_mut(|data| {
+                let cache =
+                    data.get_temp_mut_or_default::<ChoiceCache>(response.id.with("choices"));
+                if cache.revision != Some(choice_revision) {
+                    let mut lines = vec![String::with_capacity(cols); rows];
+                    for indexed in term.grid().display_iter() {
+                        let row = indexed.point.line.0;
+                        if row >= 0 && (row as usize) < rows {
+                            lines[row as usize].push(indexed.cell.c);
+                        }
+                    }
+                    cache.prompt = crate::choices::Prompt::parse(&lines).map(std::sync::Arc::new);
+                    cache.revision = Some(choice_revision);
+                }
+                cache.prompt.clone()
+            });
         }
         let content = term.renderable_content();
         let painter = ui.painter().with_clip_rect(grid_rect);
@@ -1557,6 +1597,64 @@ fn terminal_view(
             }
         }
     }
+    let hovered_choice = choice_prompt.as_ref().and_then(|prompt| {
+        let pos = response.hover_pos()?;
+        if ui.input(|i| i.modifiers != Modifiers::NONE) {
+            return None;
+        }
+        prompt
+            .choices
+            .iter()
+            .find(|choice| {
+                Rect::from_min_max(
+                    grid_rect.min
+                        + Vec2::new(choice.start as f32 * cell.x, choice.row as f32 * cell.y),
+                    grid_rect.min
+                        + Vec2::new(choice.end as f32 * cell.x, (choice.row + 1) as f32 * cell.y),
+                )
+                .contains(pos)
+            })
+            .map(|choice| choice.number)
+    });
+    if hovered_choice.is_some() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let (pressed, released) =
+        ui.input(|i| (i.pointer.primary_pressed(), i.pointer.primary_released()));
+    let was_clicked = response.clicked();
+    let drag_started = response.drag_started();
+    let choice_click = ui.ctx().data_mut(|data| {
+        let press = data.get_temp_mut_or_default::<ChoicePress>(response.id.with("choice_press"));
+        if pressed {
+            press.target = hovered_choice.map(|number| (choice_revision, number));
+        }
+        if drag_started {
+            press.target = None;
+        }
+        if released {
+            let target = press.target.take();
+            if was_clicked && target == hovered_choice.map(|number| (choice_revision, number)) {
+                return hovered_choice;
+            }
+        }
+        None
+    });
+    if let Some(target) = choice_click
+        && let Some(prompt) = &choice_prompt
+        && terminal.revision() == choice_revision
+    {
+        let delta = target as i32 - prompt.selected as i32;
+        if delta != 0 {
+            let key = if delta > 0 {
+                Key::ArrowDown
+            } else {
+                Key::ArrowUp
+            };
+            if let Some(bytes) = encode_key(key, Modifiers::NONE, mode) {
+                result = terminal.input_at_cursor(bytes.repeat(delta.unsigned_abs() as usize));
+            }
+        }
+    }
     let clicked = response.clicked() || response.drag_started();
     if searching
         || (!focused && !clicked)
@@ -1569,6 +1667,7 @@ fn terminal_view(
         return (clicked, result.and(copy_result));
     }
     for event in ui.input(|i| i.events.clone()) {
+        let follow_cursor = !matches!(event, egui::Event::PointerButton { .. });
         let input = match event {
             egui::Event::Text(s) => Some(s.into_bytes()),
             egui::Event::Paste(s) => {
@@ -1633,13 +1732,27 @@ fn terminal_view(
             }
             _ => None,
         };
-        if let Some(bytes) = input
-            && let Err(e) = terminal.input(bytes)
-        {
-            result = Err(e);
+        if let Some(bytes) = input {
+            let sent = if follow_cursor {
+                terminal.input_at_cursor(bytes)
+            } else {
+                terminal.input(bytes)
+            };
+            if let Err(e) = sent {
+                result = Err(e);
+            }
         }
     }
     (clicked, result)
+}
+#[derive(Clone, Default)]
+struct ChoiceCache {
+    revision: Option<u64>,
+    prompt: Option<std::sync::Arc<crate::choices::Prompt>>,
+}
+#[derive(Clone, Default)]
+struct ChoicePress {
+    target: Option<(u64, usize)>,
 }
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum ScrollRoute {
@@ -2240,6 +2353,80 @@ mod render_tests {
     }
 
     #[test]
+    fn clicking_codex_choice_sends_arrow_without_submitting() {
+        let ctx = egui::Context::default();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("choice-input");
+        let mut terminal = Terminal::spawn(
+            Uuid::new_v4(),
+            dir.path(),
+            std::path::Path::new(""),
+            ctx.clone(),
+        )
+        .unwrap();
+        let mut search = TerminalSearch::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 480.0));
+        let mut pos = Pos2::ZERO;
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let font = FontId::monospace(15.0);
+                    let cell =
+                        ui.fonts_mut(|f| Vec2::new(f.glyph_width(&font, 'M'), f.row_height(&font)));
+                    pos = ui.available_rect_before_wrap().shrink(8.0).min
+                        + Vec2::new(6.0 * cell.x, 3.5 * cell.y);
+                    terminal_view(ui, &mut terminal, &mut search, true, 15.0, true)
+                        .1
+                        .unwrap();
+                });
+            },
+        );
+        terminal.input(format!("stty raw -echo; printf '\\033[?1049h\\033[2J\\033[HQuestion 1/1 (1 unanswered)\\r\\nChoose an option.\\r\\n › 1. First\\r\\n   2. Second\\r\\n\\r\\ntab to add notes | enter to submit answer | esc to interrupt'; dd bs=1 count=3 of='{}' 2>/dev/null; stty sane\r", path.display()).into_bytes()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !terminal.mode().contains(TermMode::ALT_SCREEN) {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        for pressed in [true, false] {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events: vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: Modifiers::NONE,
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        terminal_view(ui, &mut terminal, &mut search, true, 15.0, true)
+                            .1
+                            .unwrap();
+                    });
+                },
+            );
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !std::fs::read(&path).is_ok_and(|bytes| bytes.len() == 3) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "click did not select through PTY"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(std::fs::read(path).unwrap(), b"\x1b[B");
+    }
+
+    #[test]
     fn trackpad_gesture_reaches_mouse_application_through_pty() {
         let ctx = egui::Context::default();
         let dir = tempfile::tempdir().unwrap();
@@ -2274,7 +2461,7 @@ mod render_tests {
                         let col = ((pos.x - grid.left()) / cell.x).floor() as usize + 1;
                         let row = ((pos.y - grid.top()) / cell.y).floor() as usize + 1;
                         expected = wheel_input(1, col, row, Modifiers::NONE, TermMode::SGR_MOUSE);
-                        terminal_view(ui, &mut terminal, &mut search, true, 15.0)
+                        terminal_view(ui, &mut terminal, &mut search, true, 15.0, false)
                             .1
                             .unwrap();
                     });
@@ -2309,7 +2496,7 @@ mod render_tests {
                 },
                 |ctx| {
                     egui::CentralPanel::default().show(ctx, |ui| {
-                        terminal_view(ui, &mut terminal, &mut search, true, 15.0)
+                        terminal_view(ui, &mut terminal, &mut search, true, 15.0, false)
                             .1
                             .unwrap();
                     });

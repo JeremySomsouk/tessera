@@ -2,7 +2,7 @@
 
 ## Implemented
 
-Real login shell in a PTY, inherited environment/startup files, PTY resizing, parser-driven ANSI colors (16/256/truecolor), alternate screen, beam typing caret and application-requested cursor shapes, bounded scrollback, Unicode/wide/combining character state, pane-local literal search with scrollback navigation, drag and keyboard selection/copy, paste/bracketed paste, control keys, application cursor mode, arrow/home/end/edit keys, basic mouse button and wheel reporting (SGR and legacy), accumulated trackpad scrolling, alternate-screen wheel-to-arrow input, IME commit input, splits and preserved live pane identity. OSC 52 clipboard reads/writes are denied. TERM is xterm-256color.
+Real login shell in a PTY, inherited environment/startup files, PTY resizing, parser-driven ANSI colors (16/256/truecolor), alternate screen, beam typing caret and application-requested cursor shapes, bounded scrollback, Unicode/wide/combining character state, pane-local literal search with scrollback navigation, drag and keyboard selection/copy, paste/bracketed paste, control keys, application cursor mode, arrow/home/end/edit keys, basic mouse button and wheel reporting (SGR and legacy), accumulated trackpad scrolling, return to live input on typing/paste, opt-in clickable Codex question choices, alternate-screen wheel-to-arrow input, IME commit input, splits and preserved live pane identity. OSC 52 clipboard reads/writes are denied. TERM is xterm-256color.
 
 ## Checked during implementation
 
@@ -19,3 +19,9 @@ Portable tests: real shell input/output and resize (`stty size`), cursor-positio
 ## Known gaps
 
 Search omits combining marks under Alacritty’s base-cell semantics; output changes invalidate the current match until the next search action. No full IME preedit, configurable system font/fallback, full mouse-motion protocol, Kitty keyboard protocol, all function/keypad encodings, cursor blinking, bold/italic rendering, OSC title in pane chrome, OSC hyperlinks, terminfo auditing, accessibility grid, or daemon-hosted reconnect. Ordinary terminal painting stays dark when application chrome is light. These gaps mean the app is runnable but should remain an alpha alongside your existing terminal.
+
+## Codex question clicks
+
+Enable **Clickable Codex questions** in Workspace & commands. In Codex's numbered question prompt, clicking an option selects it; press Enter to submit. Shift/drag retains text selection. Native mouse-reporting applications keep their own input handling. Compatibility only recognizes the visible question prompt with its selection marker and keyboard footer; ordinary numbered output, scrollback, search, copy mode, and notes entry do not receive synthetic keys. This is checked against Codex 0.160.0; future prompt layouts may require an update.
+
+Typing, keyboard navigation, IME commits, and pasting return scrollback to the live input. Scrolling, copying, and terminal protocol replies preserve the current view.
