@@ -104,3 +104,10 @@ Validation: all 50 Rust tests pass including Unix socket and real PTY cases; the
 Keyboard input and paste now return to the bottom through the existing terminal control queue before writing, even under parser contention. Mouse/wheel and protocol responses preserve scrollback. Added an opt-in persisted “Clickable Codex questions” preference, recognizing the visible numbered question prompt and sending only arrow keys to select an option. Enter remains explicit confirmation. Native mouse reporting, copy/search/history, modifiers and stale/dragged clicks are excluded; parsing is cached by terminal output revision. Codex 0.160.0 prompt layout is the compatibility target. Native acceptance with a live Codex question remains pending.
 
 Validation: all 54 Rust tests pass, including a real PTY receiving an arrow from a UI click and typing/paste returning from scrollback under lock contention. Formatting, Clippy with warnings denied, release build, appcast test, shell syntax and diff checks pass.
+
+
+2026-10-04 — new terminals inherit the focused shell directory.
+
+Cmd+N and Cmd+T now open a workspace using the focused shell's live working directory rather than the workspace dialog's last configured directory. Reads use the child shell PID with macOS proc_pidinfo or Linux /proc, without injecting commands or changing shell configuration. Restored/exited shells use their saved/launch directory; live lookup errors are shown instead of silently opening elsewhere. The workspace dialog still honors its explicit directory. Regression covers a focused split pane after cd into a directory with spaces and Unicode and verifies the new real shell directory.
+
+Validation: all 55 Rust tests pass, including the real-shell Cmd+N regression; formatting, Clippy with warnings denied, release build, appcast test, shell syntax and diff checks pass locally. Linux/Apple Silicon CI remains pending.

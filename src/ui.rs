@@ -342,12 +342,42 @@ impl App {
             }
         }
     }
+    fn add_workspace_from_terminal(&mut self, ctx: &egui::Context) {
+        let directory = if let Some(workspace) = self.saved.workspaces.get(self.active) {
+            if let Some(pane) = self.panes.get(&workspace.focus) {
+                match pane.terminal.current_directory() {
+                    Ok(path) => match path.into_os_string().into_string() {
+                        Ok(directory) => directory,
+                        Err(_) => {
+                            self.error =
+                                "Cannot open workspace: working directory is not valid UTF-8"
+                                    .into();
+                            return;
+                        }
+                    },
+                    Err(error) => {
+                        self.error = format!("Cannot open workspace in current directory: {error}");
+                        return;
+                    }
+                }
+            } else {
+                workspace.task.directory.clone()
+            }
+        } else {
+            self.new_directory.clone()
+        };
+        if self.add_workspace_in(ctx, directory) {
+            self.palette = false;
+        }
+    }
     fn add_workspace(&mut self, ctx: &egui::Context) -> bool {
+        self.add_workspace_in(ctx, self.new_directory.clone())
+    }
+    fn add_workspace_in(&mut self, ctx: &egui::Context, directory: String) -> bool {
         if self.saved.workspaces.len() >= 32 {
             self.error = "Workspace limit (32) reached".into();
             return false;
         }
-        let directory = self.new_directory.clone();
         if !PathBuf::from(&directory).is_dir() {
             self.error =
                 format!("Working directory does not exist or is not a directory: {directory}");
@@ -661,8 +691,8 @@ impl App {
                 self.error = error.to_string();
             }
         }
-        if ctx.input_mut(|i| i.consume_key(command, Key::T)) {
-            self.add_workspace(ctx);
+        if ctx.input_mut(|i| i.consume_key(command, Key::N) || i.consume_key(command, Key::T)) {
+            self.add_workspace_from_terminal(ctx);
         }
         if ctx.input_mut(|i| i.consume_key(command | Modifiers::SHIFT, Key::D)) {
             self.split(ctx, false);
@@ -2571,6 +2601,60 @@ mod render_tests {
             .remove("skip_stop_confirmation");
         let restored: Saved = serde_json::from_value(old).unwrap();
         assert!(!restored.skip_stop_confirmation);
+    }
+
+    #[test]
+    fn command_n_inherits_focused_shell_directory_after_cd() {
+        let ctx = egui::Context::default();
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("nested folder α");
+        std::fs::create_dir(&nested).unwrap();
+        let nested = nested.canonicalize().unwrap();
+        let mut app = fixture(1);
+        app.saved.workspaces[0].task.directory = dir.path().to_string_lossy().into_owned();
+        app.resume(&ctx, 0);
+        let original = app.saved.workspaces[0].focus;
+        app.split(&ctx, true);
+        let focused = app.saved.workspaces[0].focus;
+        assert_ne!(original, focused);
+        let source = &app.panes[&focused].terminal;
+        let quoted = nested.to_string_lossy().replace('\'', "'\\''");
+        source
+            .input(format!("cd -- '{quoted}'\r").into_bytes())
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !source.current_directory().is_ok_and(|path| path == nested) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "shell did not change directory"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        app.new_directory = dir.path().join("unrelated").to_string_lossy().into_owned();
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![key_event(Key::N, None, command())],
+                ..Default::default()
+            },
+            |ctx| app.shortcuts(ctx),
+        );
+        assert_eq!(app.saved.workspaces.len(), 2);
+        assert_eq!(app.active, 1);
+        assert_eq!(
+            PathBuf::from(&app.saved.workspaces[1].task.directory),
+            nested
+        );
+        assert_eq!(app.saved.workspaces[0].focus, focused);
+        let new = &app.panes[&app.saved.workspaces[1].focus].terminal;
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !new.current_directory().is_ok_and(|path| path == nested) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "new shell started in wrong directory"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(app.dirty);
     }
 
     #[test]
