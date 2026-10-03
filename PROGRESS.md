@@ -32,6 +32,10 @@ Validation: source PNG dimensions/alpha and small-size visual inspection, shell 
 
 The existing macOS packaging script now stages the signed release application and an Applications shortcut in a compressed, checksum-verified DMG. CI uploads separate Intel and Apple Silicon DMGs instead of application ZIPs. The same script builds local DMGs without additional packaging dependencies.
 
+2026-10-03 — GitHub Release publishing.
+
+Version tag pushes now run the existing Linux/macOS verification matrix, then publish both architecture DMGs to GitHub Releases. Only the publishing job receives contents write permission. It verifies both artifacts exist, creates a draft with generated notes, uploads both files, and publishes; reruns can resume a partially completed release. Branch and pull-request builds remain artifact-only. README includes the tag/push commands. Actual release publication requires pushing a version tag containing this workflow change.
+
 2026-10-03 — Pane-local terminal search.
 
 Implemented literal, case-sensitive search across each pane's active screen and retained scrollback. Cmd+F (Ctrl+Alt+F on Linux) and Find open compact controls; Enter/Shift+Enter or Next/Previous navigate with wraparound, highlight the current match and scroll it into view. Escape returns keyboard input to the terminal. Queries are bounded to 256 characters, held only in memory and never sent to the shell or persisted.

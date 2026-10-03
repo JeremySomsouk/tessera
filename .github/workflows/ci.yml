@@ -2,6 +2,7 @@ name: Build and verify
 on:
   push:
     branches: [main]
+    tags: ['v[0-9]*']
   pull_request:
   workflow_dispatch:
 permissions:
@@ -38,3 +39,32 @@ jobs:
           name: Tessera-${{ matrix.os }}
           path: dist/Tessera-*.dmg
           if-no-files-found: error
+  release:
+    name: Publish GitHub Release
+    needs: verify
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: Tessera-macos-*
+          merge-multiple: true
+          path: dist
+      - name: Publish both macOS DMGs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          test -s dist/Tessera-arm64.dmg
+          test -s dist/Tessera-x86_64.dmg
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" --verify-tag --draft \
+              --title "Tessera $RELEASE_TAG" --generate-notes
+          fi
+          gh release upload "$RELEASE_TAG" \
+            dist/Tessera-arm64.dmg dist/Tessera-x86_64.dmg --clobber
+          gh release edit "$RELEASE_TAG" --draft=false
