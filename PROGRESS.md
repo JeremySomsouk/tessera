@@ -56,3 +56,17 @@ Validation: 35 tests pass including normally ignored Unix socket tests. Added co
 2026-10-03 — 0.2.0 release preparation.
 
 Package and lockfile are 0.2.0. CLI help/version and macOS bundle release metadata derive from Cargo; bundle build numbering preserves an increasing value from the original build 1. Added CLI version regression and checked bundle plist metadata. The release workflow verifies tag/package agreement, uses the checked-in 0.2.0 notes, and publishes only after the Linux/Intel/Apple Silicon matrix and both DMG builds succeed. All terminal search/selection increments and screenshot fixes remain together on feat/terminal-search. Local release checks: 36 tests including socket round trips, formatting, Clippy with warnings denied, build, bundle/workflow shell syntax and plist assertions pass. Native interactive acceptance remains outstanding.
+
+2026-10-03 — Terminal close shortcut and workspace cleanup.
+
+Changed Stop terminal to Cmd+W (Ctrl+Alt+W on Linux), including hover help and README. The existing stop confirmation remains. Closing a single-pane workspace now removes the workspace instead of leaving a resumable placeholder. Split panes retain their surviving layout and valid focus; tab selection stays valid after removal, maximize resets, and retained sessions immediately become disconnected. The history inspector explains when a terminal has been removed instead of suggesting resuming a deleted workspace.
+
+Validation: 39 tests pass, with two existing Unix socket tests ignored under the default test command. Four close regressions cover the shortcut/confirmation boundary, real-shell shutdown and saved workspace removal, tab selection after removal, and nested split collapse/focus. Formatting, Clippy with warnings denied, debug build and diff checks pass. Native interactive shortcut acceptance remains unperformed.
+
+Workspace dialog follow-up: Enter submission is captured from the focused directory/filter before rendering other views, rather than relying on a text field losing focus later in the frame. Invalid-directory errors are displayed inside the dialog. Added a regression with live terminals and Overview under the dialog, including invalid-directory retry and successful creation. Native interactive Enter acceptance remains unperformed.
+
+2026-10-03 — 0.2.1 fix release preparation.
+
+Package and lockfile are 0.2.1. Added focused release notes for Cmd+W, removal of the last-pane workspace, dialog Enter submission and inline invalid-directory feedback. README release commands and current-version description match. The existing tag workflow validates Linux and both Mac architectures before publishing their DMGs.
+
+Release validation: all 41 tests pass including both Unix socket round trips when run outside the sandbox. Formatting, Clippy with warnings denied, debug build, bundle script syntax and diff checks pass. Native interactive acceptance remains outstanding.

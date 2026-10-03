@@ -4,7 +4,7 @@
 
 A desktop terminal workspace with a single Overview of real Claude Code and Codex sessions.
 
-**0.2.0 adds terminal search, keyboard selection, and input polish.** It combines real login-shell PTYs, resizable splits, keyboard navigation, persistent workspace metadata, and a hook-driven agent Overview. Specification editing, issue connectors, and detached session hosting follow in later increments.
+**0.2.1 fixes terminal closing and workspace dialog submission.** It combines real login-shell PTYs, resizable splits, keyboard navigation, persistent workspace metadata, and a hook-driven agent Overview. Specification editing, issue connectors, and detached session hosting follow in later increments.
 
 ## Start on macOS
 
@@ -31,11 +31,11 @@ CI produces separate Intel (`Tessera-x86_64.dmg`) and Apple Silicon (`Tessera-ar
 To publish a version, tag the release commit containing this workflow and push the tag:
 
 ```sh
-git tag v0.2.0
-git push origin v0.2.0
+git tag v0.2.1
+git push origin v0.2.1
 ```
 
-Pushing a version tag (`v` followed by a digit) runs all checks and builds both DMGs, then publishes them on the [GitHub Releases page](https://github.com/JeremySomsouk/tessera/releases) with generated release notes. New releases stay in draft until both assets upload successfully. A failed publishing job can be rerun to finish the release. Branch pushes and pull requests upload Actions artifacts only.
+Pushing a version tag (`v` followed by a digit) runs all checks and builds both DMGs, then publishes them on the [GitHub Releases page](https://github.com/JeremySomsouk/tessera/releases) with checked-in release notes when available, otherwise generated notes. New releases stay in draft until both assets upload successfully. A failed publishing job can be rerun to finish the release. Branch pushes and pull requests upload Actions artifacts only.
 
 ## Connect Codex CLI
 
@@ -97,9 +97,11 @@ On macOS, `Command` below is Cmd. On Linux, use Ctrl+Alt so ordinary terminal Ct
 | Workspace 1–9 | Command+1–9 |
 | Workspace picker / commands | Command+Shift+P |
 | Session needing attention | Command+Shift+N |
-| Stop pane, with confirmation | Command+Shift+W |
+| Stop pane, with confirmation | Command+W |
 
-In Overview, Up/Down select a session, Enter opens its terminal, and Escape returns. These keys remain normal terminal input in a pane. Drag split separators to resize. Drag terminal text to select; Cmd+C copies, Cmd+V pastes. Shift bypasses terminal mouse reporting for selection. Use the font slider and Light/Dark button in the toolbar. Hover actions and workspace tabs to see their shortcuts. Workspace number shortcuts follow tab position and support the physical number row on layouts such as AZERTY. In the workspace dialog, Enter in Working directory creates a workspace; Enter in Find workspace opens the first match. Invalid directories keep the dialog open for correction.
+Stopping the last pane removes its workspace; task history is retained.
+
+In Overview, Up/Down select a session, Enter opens its terminal, and Escape returns. These keys remain normal terminal input in a pane. Drag split separators to resize. Drag terminal text to select; Cmd+C copies, Cmd+V pastes. Shift bypasses terminal mouse reporting for selection. Use the font slider and Light/Dark button in the toolbar. Hover actions and workspace tabs to see their shortcuts. Workspace number shortcuts follow tab position and support the physical number row on layouts such as AZERTY. In the workspace dialog, Enter in Working directory creates a workspace; Enter in Find workspace opens the first match. Invalid directories show an error inside the dialog and keep it open for correction.
 
 Normal terminal typing uses a slim beam caret; applications can request block, underline, beam or hidden cursors. Terminal color queries report the actual palette and application overrides, so dark-theme detection uses the real background.
 

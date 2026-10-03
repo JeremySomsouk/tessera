@@ -373,6 +373,42 @@ impl App {
             self.maximized = false;
         }
     }
+    fn stop_terminal(&mut self, id: Uuid) {
+        self.panes.remove(&id);
+        let workspace = self.saved.workspaces.iter().position(|w| {
+            let mut ids = Vec::new();
+            w.layout.ids(&mut ids);
+            ids.contains(&id)
+        });
+        if let Some(index) = workspace {
+            if matches!(self.saved.workspaces[index].layout, Layout::Pane(_)) {
+                self.saved.workspaces.remove(index);
+                if index < self.active {
+                    self.active -= 1;
+                }
+                self.active = self
+                    .active
+                    .min(self.saved.workspaces.len().saturating_sub(1));
+            } else {
+                let w = &mut self.saved.workspaces[index];
+                w.layout.remove(id);
+                if w.focus == id {
+                    let mut ids = Vec::new();
+                    w.layout.ids(&mut ids);
+                    w.focus = ids[0];
+                }
+            }
+            self.maximized = false;
+            self.dirty = true;
+        }
+        for session in &mut self.saved.sessions {
+            if session.pane == id && session.state != SessionState::Ended {
+                session.state = SessionState::Disconnected;
+                self.dirty = true;
+            }
+        }
+        self.close = None;
+    }
     fn resume(&mut self, ctx: &egui::Context, index: usize) {
         let mut ids = Vec::new();
         self.saved.workspaces[index].layout.ids(&mut ids);
@@ -494,7 +530,7 @@ impl App {
         if ctx.input_mut(|i| i.consume_key(command | Modifiers::SHIFT, Key::P)) {
             self.palette = !self.palette;
         }
-        if ctx.input_mut(|i| i.consume_key(command | Modifiers::SHIFT, Key::W)) {
+        if ctx.input_mut(|i| i.consume_key(command, Key::W)) {
             self.close = self.saved.workspaces.get(self.active).map(|w| w.focus);
         }
         if ctx.input_mut(|i| i.consume_key(command | Modifiers::SHIFT, Key::N))
@@ -764,8 +800,8 @@ impl App {
             ui.heading("Session context");ui.label(session.state.label());ui.add_space(8.0);
             let live=self.panes.contains_key(&session.pane);
             if ui.add_enabled(live,egui::Button::new("Open live terminal ↗")).clicked() {self.saved.sessions[index].seen=now();self.saved.sessions[index].seen_sequence=self.saved.sessions[index].last_sequence;self.dirty=true;self.focus_session(&id);}
-            if !live {ui.label("This session is disconnected. Resume its workspace to start a new shell.");}
             let wi=self.saved.workspaces.iter().position(|w|{let mut ids=Vec::new();w.layout.ids(&mut ids);ids.contains(&session.pane)});
+            if !live {ui.label(if wi.is_some(){"This session is disconnected. Resume its workspace to start a new shell."}else{"This terminal was closed. Its session history is retained."});}
             if let Some(wi)=wi {
                 ui.add_space(14.0);ui.label("Task title");let w=&mut self.saved.workspaces[wi];if ui.text_edit_singleline(&mut w.task.title).changed() {self.dirty=true;}
                 ui.horizontal_wrapped(|ui| {for (state,label) in [(TaskState::Implementing,"Implementing"),(TaskState::ReviewRequested,"Request review"),(TaskState::Accepted,"Accept task")] {if ui.selectable_label(w.task.state==state,label).clicked() {w.task.state=state;self.dirty=true;}}});
@@ -783,6 +819,11 @@ impl App {
             self.error = error;
         }
         self.shortcuts(ctx);
+        let workspace_submit = if self.palette {
+            workspace_submission(ctx)
+        } else {
+            None
+        };
         egui::TopBottomPanel::top("chrome").show(ctx, |ui| {
             ui.add_space(7.0);
             ui.horizontal_wrapped(|ui| {
@@ -894,7 +935,7 @@ impl App {
                     if let Some(pane)=self.panes.get_mut(&id) {
                         ui.horizontal(|ui| {ui.label(RichText::new(if focused==id {"● Terminal"}else{"Terminal"}).color(if focused==id{ACCENT}else{ui.visuals().weak_text_color()}));if ui.small_button("Select").on_hover_text(shortcut("Keyboard selection", "Shift+Space")).clicked(){pane.search.close();if let Err(error)=pane.terminal.selection_action(SelectionAction::Enter){self.error=error.to_string();}self.saved.workspaces[self.active].focus=id;self.dirty=true;}
 if ui.small_button("Find").on_hover_text(shortcut("Find in terminal", "F")).clicked(){if pane.terminal.copy_mode && let Err(error)=pane.terminal.selection_action(SelectionAction::Exit){self.error=error.to_string();}pane.search.open();self.saved.workspaces[self.active].focus=id;self.dirty=true;}
-if ui.small_button("×").on_hover_text(shortcut("Stop terminal", "Shift+W")).clicked(){self.close=Some(id);}
+if ui.small_button("×").on_hover_text(shortcut("Stop terminal", "W")).clicked(){self.close=Some(id);}
 if !pane.terminal.alive.load(Ordering::Acquire){ui.label("Shell exited");}});
                         if let Some(err)=pane.terminal.error.try_lock().ok().and_then(|e|e.clone()) {ui.small(err);}
                         let (clicked,result)=terminal_view(ui,&mut pane.terminal,&mut pane.search,focused==id&&!self.palette&&self.close.is_none(),self.font_size);
@@ -918,12 +959,17 @@ if !pane.terminal.alive.load(Ordering::Acquire){ui.label("Shell exited");}});
                         !self.new_directory.trim().is_empty(),
                         egui::Button::new("Create workspace"),
                     );
-                    if create.clicked() || submitted(ui, &directory) {
+                    if create.clicked()
+                        || workspace_submit == Some(egui::Id::new("workspace-directory"))
+                    {
                         if self.add_workspace(ctx) {
                             self.palette = false;
                         } else {
                             directory.request_focus();
                         }
+                    }
+                    if !self.error.is_empty() {
+                        ui.colored_label(ui.visuals().error_fg_color, &self.error);
                     }
                     ui.separator();
                     ui.label("Find workspace");
@@ -931,7 +977,7 @@ if !pane.terminal.alive.load(Ordering::Acquire){ui.label("Shell exited");}});
                         egui::TextEdit::singleline(&mut self.filter)
                             .id(egui::Id::new("workspace-filter")),
                     );
-                    let open_first = submitted(ui, &filter);
+                    let open_first = workspace_submit == Some(egui::Id::new("workspace-filter"));
                     let filter_text = self.filter.to_lowercase();
                     let mut first = true;
                     for (i, w) in self.saved.workspaces.iter().enumerate() {
@@ -975,7 +1021,7 @@ if !pane.terminal.alive.load(Ordering::Acquire){ui.label("Shell exited");}});
                 });
         }
         if let Some(id) = self.close {
-            egui::Window::new("Stop this terminal?").collapsible(false).resizable(false).show(ctx,|ui| {ui.label("The shell and its child processes will be stopped. Task history is retained.");if ui.button("Stop terminal").clicked(){self.panes.remove(&id);for w in &mut self.saved.workspaces {if w.layout.remove(id){let mut ids=Vec::new();w.layout.ids(&mut ids);w.focus=ids[0];}}self.close=None;self.dirty=true;}
+            egui::Window::new("Stop this terminal?").collapsible(false).resizable(false).show(ctx,|ui| {ui.label("The shell and its child processes will be stopped. Closing the last terminal removes its workspace. Task history is retained.");if ui.button("Stop terminal").clicked(){self.stop_terminal(id);}
 if ui.button("Keep running").clicked(){self.close=None;}});
         }
         if self.dirty {
@@ -1079,8 +1125,15 @@ fn workspace_shortcut(
     selected
 }
 
-fn submitted(ui: &egui::Ui, response: &egui::Response) -> bool {
-    response.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter))
+fn workspace_submission(ctx: &egui::Context) -> Option<egui::Id> {
+    let focused = ctx.memory(|memory| memory.focused())?;
+    if focused != egui::Id::new("workspace-directory")
+        && focused != egui::Id::new("workspace-filter")
+    {
+        return None;
+    }
+    ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Enter))
+        .then_some(focused)
 }
 
 fn cursor_rect(shape: CursorShape, pos: Pos2, cell: Vec2) -> Option<Rect> {
@@ -1701,6 +1754,89 @@ mod render_tests {
     }
 
     #[test]
+    fn command_w_requests_terminal_stop() {
+        let ctx = egui::Context::default();
+        let mut app = fixture(1);
+        let pane = app.saved.workspaces[0].focus;
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![key_event(Key::W, None, command())],
+                ..Default::default()
+            },
+            |ctx| {
+                app.shortcuts(ctx);
+                assert!(!ctx.input(|i| i.key_pressed(Key::W)));
+            },
+        );
+        assert_eq!(app.close, Some(pane));
+        assert_eq!(app.saved.workspaces.len(), 1, "confirmation is required");
+    }
+
+    #[test]
+    fn stopping_last_terminal_removes_workspace_and_stops_shell() {
+        let ctx = egui::Context::default();
+        let mut app = fixture(1);
+        app.saved.workspaces[0].task.directory = std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        app.resume(&ctx, 0);
+        let pane = app.saved.workspaces[0].focus;
+        let alive = app.panes[&pane].terminal.alive.clone();
+        app.close = Some(pane);
+        app.maximized = true;
+        app.stop_terminal(pane);
+        assert!(!alive.load(Ordering::Acquire));
+        assert!(app.panes.is_empty());
+        assert!(app.saved.workspaces.is_empty());
+        assert_eq!(app.active, 0);
+        assert!(!app.maximized);
+        assert!(app.close.is_none());
+        assert!(app.dirty);
+        assert_eq!(app.saved.sessions.len(), 1);
+        assert_eq!(app.saved.sessions[0].state, SessionState::Disconnected);
+        let restored: Saved =
+            serde_json::from_slice(&serde_json::to_vec(&app.saved).unwrap()).unwrap();
+        assert!(restored.workspaces.is_empty());
+        app.stop_terminal(pane); // Repeated close is harmless.
+    }
+
+    #[test]
+    fn stopping_workspace_preserves_active_tab_identity() {
+        let mut app = fixture(3);
+        app.active = 1;
+        let active_task = app.saved.workspaces[1].task.id;
+        app.stop_terminal(app.saved.workspaces[0].focus);
+        assert_eq!(app.active, 0);
+        assert_eq!(app.saved.workspaces[app.active].task.id, active_task);
+        app.active = 1;
+        app.stop_terminal(app.saved.workspaces[1].focus);
+        assert_eq!(app.active, 0);
+        assert_eq!(app.saved.workspaces[0].task.id, active_task);
+    }
+
+    #[test]
+    fn stopping_split_pane_preserves_survivors_and_focus() {
+        let mut app = fixture(1);
+        let a = app.saved.workspaces[0].focus;
+        let b = Uuid::new_v4();
+        let c = Uuid::new_v4();
+        app.saved.workspaces[0].layout.split(a, b, true);
+        app.saved.workspaces[0].layout.split(b, c, false);
+        app.saved.workspaces[0].focus = c;
+        app.stop_terminal(b);
+        let mut ids = Vec::new();
+        app.saved.workspaces[0].layout.ids(&mut ids);
+        assert_eq!(ids, vec![a, c]);
+        assert_eq!(app.saved.workspaces[0].focus, c);
+        app.stop_terminal(c);
+        assert_eq!(app.saved.workspaces[0].focus, a);
+        assert!(matches!(app.saved.workspaces[0].layout, Layout::Pane(id) if id == a));
+        app.stop_terminal(a);
+        assert!(app.saved.workspaces.is_empty());
+    }
+
+    #[test]
     fn stacked_split_shortcut_creates_one_stacked_split() {
         let ctx = egui::Context::default();
         let mut app = fixture(1);
@@ -1767,6 +1903,45 @@ mod render_tests {
         frame(&mut app, vec![key_event(Key::Enter, None, Modifiers::NONE)]);
         assert_eq!(app.active, 1);
         assert!(!app.palette);
+    }
+
+    #[test]
+    fn workspace_enter_takes_priority_over_overview_and_live_terminal() {
+        let ctx = egui::Context::default();
+        let mut app = fixture(1);
+        let dir = tempfile::tempdir().unwrap();
+        app.saved.workspaces[0].task.directory = dir.path().to_string_lossy().into_owned();
+        app.resume(&ctx, 0);
+        let original = app.saved.workspaces[0].focus;
+        let frame = |app: &mut App, events| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 760.0))),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.draw(ctx),
+            );
+        };
+        for overview in [false, true] {
+            app.overview = overview;
+            app.palette = true;
+            app.new_directory = dir.path().join("missing").to_string_lossy().into_owned();
+            frame(&mut app, vec![]);
+            ctx.memory_mut(|memory| memory.request_focus(egui::Id::new("workspace-directory")));
+            frame(&mut app, vec![key_event(Key::Enter, None, Modifiers::NONE)]);
+            assert!(app.palette);
+            assert_eq!(app.overview, overview);
+            assert_eq!(app.saved.workspaces.len(), 1);
+            assert!(app.error.contains("not a directory"));
+            assert!(ctx.memory(|memory| memory.has_focus(egui::Id::new("workspace-directory"))));
+        }
+        app.new_directory = dir.path().to_string_lossy().into_owned();
+        frame(&mut app, vec![key_event(Key::Enter, None, Modifiers::NONE)]);
+        assert!(!app.palette);
+        assert_eq!(app.saved.workspaces.len(), 2);
+        assert_eq!(app.panes.len(), 2);
+        assert!(app.panes.contains_key(&original));
     }
 
     #[test]
