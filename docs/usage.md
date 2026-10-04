@@ -41,6 +41,12 @@ Normal terminal typing uses a slim beam caret; applications can request block, u
 
 Every startup opens one fresh login-shell terminal in the application’s starting directory. Previous tabs and split layouts are discarded. Themes, font sizes, terminal preferences, and bounded session histories are saved locally. The saved Light/Dark appearance applies from the first frame, independently of the system theme. Previous sessions are marked disconnected unless already ended; their histories remain available in Overview. Closing a pane stops its shell; quitting the app stops hosted shells. Independently detached `nohup`/daemon processes are outside this lifecycle.
 
-This increment has one application window, no external session daemon, no remote SSH tracking, no specification editor, and no Jira/GitHub connector. Hook histories contain event/tool names, not prompts, arguments, results, transcripts, or permission decisions. Ordinary terminal output remains in memory only. The terminal renderer is an initial implementation; see [compatibility](terminal-compatibility.md) before treating it as a replacement for a mature terminal.
+This increment has one application window, no external session daemon, no remote SSH tracking, no Jira/GitHub connector. Hook histories contain event/tool names, not prompts, arguments, results, transcripts, or permission decisions. Ordinary terminal output remains in memory only. The terminal renderer is an initial implementation; see [compatibility](terminal-compatibility.md) before treating it as a replacement for a mature terminal.
 
 [Agent hooks](integration.md) · [Terminal compatibility](terminal-compatibility.md)
+
+## Reviewing specifications
+
+In Specs, choose **Propose a change**, edit or paste the proposed title, directory and Markdown scope, and compare the original with the proposal. **Accept changes** saves a new immutable revision; **Cancel proposal** leaves your draft unchanged. Field-only acceptance is tucked under Advanced and discards the remaining proposed fields. Pending proposals survive restart. If the draft or saved revision changes during review, acceptance is blocked: cancel and prepare a fresh proposal. Proposals are entered locally; agents do not update them automatically.
+
+Expand Revision history to compare any saved version with your draft. **Restore this version** first saves your current draft, then creates a new revision from the selected snapshot. Existing launch links still point to their original revision. A pending proposal must be accepted or cancelled before restoring.

@@ -1951,10 +1951,67 @@ impl App {
                 match spec.save_revision() { Ok(_) => self.dirty = true, Err(e) => self.error = e.to_string() }
             }
             egui::CollapsingHeader::new(format!("Revision history · {}", spec.revisions.len())).show(ui, |ui| {
+                let mut restore = None;
                 for (i, revision) in spec.revisions.iter().enumerate().rev() {
-                    egui::CollapsingHeader::new(format!("Revision {} · {}", i + 1, revision.title)).id_salt((spec.id, i)).show(ui, |ui| { ui.label(&revision.directory); ui.label(&revision.markdown); });
+                    egui::CollapsingHeader::new(format!("Revision {} · {}", i + 1, revision.title)).id_salt((spec.id, i)).show(ui, |ui| {
+                        ui.label("Compare this snapshot with the current draft");
+                        ui.label(format!("Changed fields: title {}, directory {}, scope {}", revision.title != spec.draft.title, revision.directory != spec.draft.directory, revision.markdown != spec.draft.markdown));
+                        ui.columns(2, |columns| {
+                            columns[0].strong("Saved revision");
+                            columns[0].label(&revision.title);
+                            columns[0].label(&revision.directory);
+                            columns[0].label(&revision.markdown);
+                            columns[1].strong("Current draft");
+                            columns[1].label(&spec.draft.title);
+                            columns[1].label(&spec.draft.directory);
+                            columns[1].label(&spec.draft.markdown);
+                        });
+                        if ui.add_enabled(spec.proposal.is_none() && revision != &spec.draft, egui::Button::new("Restore this version")).clicked() { restore = Some(i + 1); }
+                    });
+                }
+                if let Some(number) = restore {
+                    match spec.restore_revision(number) { Ok(()) => self.dirty = true, Err(e) => self.error = e.to_string() }
                 }
             });
+            ui.separator();
+            if spec.proposal.is_none() && ui.button("Propose a change").clicked() {
+                match spec.begin_proposal() { Ok(()) => self.dirty = true, Err(e) => self.error = e.to_string() }
+            }
+            let current = spec.proposal_is_current();
+            if let Some(proposal) = &mut spec.proposal {
+                ui.strong(format!("Review proposal against revision {}", proposal.base));
+                ui.label("Edit or paste the proposed scope, compare it with the original, then accept or cancel. Running agents keep their original scope.");
+                ui.label(format!("Changed fields: title {}, directory {}, scope {}", proposal.replacement.title != proposal.expected_draft.title, proposal.replacement.directory != proposal.expected_draft.directory, proposal.replacement.markdown != proposal.expected_draft.markdown));
+                if !current { ui.colored_label(ui.visuals().error_fg_color, "Conflict: the draft or saved revision changed. Discard and prepare a new proposal."); }
+                ui.columns(2, |columns| {
+                    columns[0].strong("Base revision");
+                    columns[0].label(&proposal.expected_draft.title);
+                    columns[0].label(&proposal.expected_draft.directory);
+                    columns[0].label(&proposal.expected_draft.markdown);
+                    columns[1].strong("Proposed revision");
+                    self.dirty |= columns[1].text_edit_singleline(&mut proposal.replacement.title).changed();
+                    self.dirty |= columns[1].text_edit_singleline(&mut proposal.replacement.directory).changed();
+                    self.dirty |= columns[1].add(egui::TextEdit::multiline(&mut proposal.replacement.markdown).desired_width(f32::INFINITY).desired_rows(8).code_editor()).changed();
+                });
+                let mut accept = None;
+                let mut discard = false;
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(current, egui::Button::new("Accept changes")).clicked() { accept = Some((true, true, true)); }
+                    discard = ui.button("Cancel proposal").clicked();
+                });
+                egui::CollapsingHeader::new("Advanced: accept selected fields").show(ui, |ui| {
+                    ui.label("Accepting one field closes the proposal and discards the other proposed fields.");
+                    ui.horizontal_wrapped(|ui| {
+                        for (label, fields) in [("Title only", (true, false, false)), ("Scope only", (false, true, false)), ("Directory only", (false, false, true))] {
+                            if ui.add_enabled(current, egui::Button::new(label)).clicked() { accept = Some(fields); }
+                        }
+                    });
+                });
+                if discard { spec.proposal = None; self.dirty = true; }
+                else if let Some((title, markdown, directory)) = accept {
+                    match spec.accept_proposal(title, markdown, directory) { Ok(()) => self.dirty = true, Err(e) => self.error = e.to_string() }
+                }
+            }
             ui.separator();
             ui.horizontal(|ui| { ui.strong("Launch context preview"); ui.selectable_value(&mut self.spec_codex, false, "Claude"); ui.selectable_value(&mut self.spec_codex, true, "Codex"); });
             ui.label("The current draft is saved as an immutable revision. The agent starts in a new terminal after you confirm Launch agent.");
@@ -4152,6 +4209,47 @@ mod render_tests {
     }
 
     #[test]
+    fn proposal_review_keeps_primary_actions_simple_and_reports_conflicts() {
+        for width in [640.0, 1180.0] {
+            let ctx = egui::Context::default();
+            let mut app = fixture(0);
+            let mut spec = crate::specs::Specification::new("/tmp".into());
+            spec.draft.markdown = "Original scope".into();
+            spec.begin_proposal().unwrap();
+            app.selected_spec = Some(spec.id);
+            app.saved.specifications.push(spec);
+            for conflicted in [false, true] {
+                if conflicted {
+                    app.saved.specifications[0].draft.markdown = "New edit".into();
+                }
+                let out = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(
+                            Pos2::ZERO,
+                            Vec2::new(width, 1800.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| app.specifications(ui));
+                    },
+                );
+                let text: Vec<_> = out
+                    .shapes
+                    .iter()
+                    .filter_map(|shape| match &shape.shape {
+                        egui::epaint::Shape::Text(text) => Some(text.galley.text()),
+                        _ => None,
+                    })
+                    .collect();
+                assert!(text.iter().any(|t| t.contains("Accept changes")));
+                assert!(text.iter().any(|t| t.contains("Cancel proposal")));
+                assert!(!text.contains(&"Scope only"));
+                assert_eq!(text.iter().any(|t| t.contains("Conflict:")), conflicted);
+            }
+        }
+    }
+    #[test]
     fn specification_invalid_directory_explains_disabled_launch() {
         let ctx = egui::Context::default();
         let mut app = fixture(0);
@@ -4225,6 +4323,8 @@ mod render_tests {
                 spec.draft.title = "Add project navigation".into();
                 spec.draft.markdown = "## Goal\nMake project navigation accessible.\n\n## Acceptance\n- Keyboard navigation works\n- Existing routes remain available".into();
                 spec.save_revision().unwrap();
+                spec.begin_proposal().unwrap();
+                spec.proposal.as_mut().unwrap().replacement.markdown = "## Goal\nMake navigation accessible and intuitive.\n\n## Acceptance\n- Keyboard navigation works\n- Existing routes remain available".into();
                 app.selected_spec = Some(spec.id);
                 app.saved.specifications.push(spec);
                 app.specifications_view = true;

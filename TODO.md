@@ -26,7 +26,9 @@
 
 ## Then: specifications
 - [x] Local Markdown board/editor, stable spec revisions, pinned task-launch context preview and Claude/Codex launches.
-- [ ] Claude proposal against a base revision, diff review, stale conflicts, selective acceptance.
+- [x] Local proposal against a base revision, side-by-side review, stale conflicts, field-selective acceptance.
+- [x] Compare immutable revisions and restore while preserving unsaved drafts.
+- [ ] Automatic agent proposal ingestion and line-level selective acceptance.
 - [ ] Scope amendments with acknowledgement, independent worktrees and collision warnings.
 
 ## Connectors and release
