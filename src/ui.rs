@@ -362,6 +362,28 @@ impl App {
             self.palette = false;
         }
     }
+    fn open_selection_tab(&mut self, ctx: &egui::Context, source: Uuid, text: &str) {
+        let result = (|| {
+            let text = selection_paste_text(text)?;
+            let directory = self
+                .panes
+                .get(&source)
+                .ok_or_else(|| anyhow::anyhow!("Source terminal is unavailable"))?
+                .terminal
+                .current_directory()?
+                .into_os_string()
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("working directory is not valid UTF-8"))?;
+            if self.add_workspace_in(ctx, directory) {
+                let id = self.saved.workspaces[self.active].focus;
+                self.panes[&id].terminal.paste(&text)?;
+            }
+            Ok::<_, anyhow::Error>(())
+        })();
+        if let Err(error) = result {
+            self.error = format!("Cannot open selected text in a terminal: {error}");
+        }
+    }
     fn add_workspace(&mut self, ctx: &egui::Context) -> bool {
         if !self.add_workspace_in(ctx, self.new_directory.clone()) {
             return false;
@@ -1135,6 +1157,7 @@ impl App {
             });
         });
         let mut stop = None;
+        let mut selection_tab = None;
         egui::CentralPanel::default().show(ctx, |ui| {
             if self.overview {
                 self.overview(ui);
@@ -1244,7 +1267,7 @@ impl App {
                         {
                             ui.small(err);
                         }
-                        let (clicked, result) = terminal_view(
+                        let (clicked, result, new_tab) = terminal_view(
                             ui,
                             &mut pane.terminal,
                             &mut pane.search,
@@ -1259,6 +1282,9 @@ impl App {
                                 && self.rename.is_none()
                                 && self.closing.is_none(),
                         );
+                        if let Some(text) = new_tab {
+                            selection_tab = Some((id, text));
+                        }
                         if clicked {
                             self.saved.workspaces[self.active].focus = id;
                             self.dirty = true;
@@ -1272,6 +1298,9 @@ impl App {
                 });
             }
         });
+        if let Some((source, text)) = selection_tab {
+            self.open_selection_tab(ctx, source, &text);
+        }
         if self.palette {
             let response = egui::Modal::new(egui::Id::new("workspace-commands")).show(ctx, |ui| {
                 ui.set_width(380.0_f32.min((ctx.content_rect().width() - 40.0).max(120.0)));
@@ -1661,7 +1690,7 @@ fn terminal_view(
     focused: bool,
     font_size: f32,
     clickable_choices: bool,
-) -> (bool, anyhow::Result<()>) {
+) -> (bool, anyhow::Result<()>, Option<String>) {
     let copying = terminal.copy_mode;
     let searching = search.is_open();
     if copying {
@@ -1705,35 +1734,73 @@ fn terminal_view(
         );
     }
     let mut mode = terminal.mode();
+    // Reserve primary drags for local selection. Latch the explicit mouse-input
+    // override at press time so changing modifiers cannot split a gesture.
+    let (primary_pressed, primary_down, primary_released, modifiers, press_origin) =
+        ui.input(|i| {
+            (
+                i.pointer.primary_pressed(),
+                i.pointer.primary_down(),
+                i.pointer.primary_released(),
+                i.modifiers,
+                i.pointer.press_origin(),
+            )
+        });
+    let primary_reporting = ui.ctx().data_mut(|data| {
+        let reporting = data.get_temp_mut_or_default::<bool>(response.id.with("primary_reporting"));
+        if primary_pressed {
+            *reporting = !copying
+                && !searching
+                && mode.intersects(TermMode::MOUSE_MODE)
+                && modifiers.alt
+                && !modifiers.shift
+                && response.contains_pointer()
+                && press_origin.is_some_and(|pos| grid_rect.contains(pos));
+        } else if !primary_down && !primary_released {
+            *reporting = false;
+        }
+        *reporting
+    });
     let mut selected = None;
     let mut choice_prompt = None;
     let mut choice_revision = 0;
     if let Ok(mut term) = terminal.term.try_lock() {
         search.invalidate(terminal.revision());
         mode = *term.mode();
-        let reporting =
-            !copying && mode.intersects(TermMode::MOUSE_MODE) && !ui.input(|i| i.modifiers.shift);
-        if !reporting && let Some(pos) = response.interact_pointer_pos() {
-            let point = Point::new(
-                Line(
-                    ((pos.y - grid_rect.top()) / cell.y)
-                        .floor()
-                        .clamp(0.0, rows as f32 - 1.0) as i32
-                        - term.grid().display_offset() as i32,
-                ),
-                Column(
-                    ((pos.x - grid_rect.left()) / cell.x)
-                        .floor()
-                        .clamp(0.0, cols as f32 - 1.0) as usize,
-                ),
-            );
-            if response.drag_started() {
-                term.selection = Some(Selection::new(SelectionType::Simple, point, Side::Left));
+        if !primary_reporting && let Some(pos) = response.interact_pointer_pos() {
+            let display_offset = term.grid().display_offset() as i32;
+            let point_at = |pos: Pos2| {
+                Point::new(
+                    Line(
+                        ((pos.y - grid_rect.top()) / cell.y)
+                            .floor()
+                            .clamp(0.0, rows as f32 - 1.0) as i32
+                            - display_offset,
+                    ),
+                    Column(
+                        ((pos.x - grid_rect.left()) / cell.x)
+                            .floor()
+                            .clamp(0.0, cols as f32 - 1.0) as usize,
+                    ),
+                )
+            };
+            if response.drag_started_by(egui::PointerButton::Primary)
+                && let Some(origin) = ui.input(|i| i.pointer.press_origin())
+            {
+                term.selection = Some(Selection::new(
+                    SelectionType::Simple,
+                    point_at(origin),
+                    Side::Left,
+                ));
             }
-            if response.dragged()
+            let point = point_at(pos);
+            if response.dragged_by(egui::PointerButton::Primary)
                 && let Some(s) = &mut term.selection
             {
                 s.update(point, Side::Right);
+            }
+            if response.clicked_by(egui::PointerButton::Primary) {
+                term.selection = None;
             }
         }
         if clickable_choices
@@ -1924,6 +1991,8 @@ fn terminal_view(
     });
     if hovered_choice.is_some() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    } else if response.hovered() && !primary_reporting {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
     }
     let (pressed, released) =
         ui.input(|i| (i.pointer.primary_pressed(), i.pointer.primary_released()));
@@ -1961,16 +2030,81 @@ fn terminal_view(
             }
         }
     }
-    let clicked = response.clicked() || response.drag_started();
+    let mut new_tab = None;
+    let menu_id = response.id.with("selection_menu_text");
+    if response.secondary_clicked() && !modifiers.alt {
+        ui.ctx().data_mut(|data| {
+            data.insert_temp(menu_id, selected.clone().unwrap_or_default());
+        });
+    }
+    let mut menu_action = None;
+    let menu_was_open = response.context_menu_opened();
+    if !modifiers.alt || response.context_menu_opened() {
+        response.context_menu(|ui| {
+            let text = ui
+                .ctx()
+                .data(|data| data.get_temp::<String>(menu_id))
+                .unwrap_or_default();
+            if text.is_empty() {
+                ui.add_enabled(false, egui::Label::new("Select text for actions"));
+                return;
+            }
+            for (action, label) in [
+                (SelectionMenuAction::Copy, "Copy"),
+                (SelectionMenuAction::Paste, "Paste into this terminal"),
+                (SelectionMenuAction::NewTab, "Open in new terminal tab"),
+                (SelectionMenuAction::Search, "Search in browser"),
+            ] {
+                let enabled = action != SelectionMenuAction::Paste
+                    || (!copying && !searching && terminal.alive.load(Ordering::Acquire));
+                let button = ui.add_enabled(enabled, egui::Button::new(label));
+                let button = if matches!(
+                    action,
+                    SelectionMenuAction::Paste | SelectionMenuAction::NewTab
+                ) {
+                    button.on_hover_text("Paste as one line without pressing Enter")
+                } else {
+                    button
+                };
+                if button.clicked() {
+                    menu_action = Some((action, text));
+                    ui.close();
+                    break;
+                }
+            }
+        });
+    }
+    if let Some((action, text)) = menu_action {
+        ui.ctx().data_mut(|data| data.remove::<String>(menu_id));
+        match action {
+            SelectionMenuAction::Copy => ui.ctx().copy_text(text),
+            SelectionMenuAction::Paste => {
+                result = selection_paste_text(&text).and_then(|text| terminal.paste(&text));
+                response.request_focus();
+            }
+            SelectionMenuAction::NewTab => new_tab = Some(text),
+            SelectionMenuAction::Search => ui
+                .ctx()
+                .open_url(egui::OpenUrl::new_tab(selection_search_url(&text))),
+        }
+        return (true, result, new_tab);
+    }
+    let menu_open = response.context_menu_opened();
+    if !menu_open && menu_was_open {
+        ui.ctx().data_mut(|data| data.remove::<String>(menu_id));
+    }
+    let clicked = response.clicked() || response.drag_started() || response.secondary_clicked();
     if searching
+        || menu_open
+        || menu_was_open
         || (!focused && !clicked)
         || (!response.has_focus() && ui.ctx().wants_keyboard_input())
     {
-        return (clicked, result);
+        return (clicked, result, new_tab);
     }
     if copying {
         let copy_result = copy_input(terminal, ui.input(|i| i.events.clone()));
-        return (clicked, result.and(copy_result));
+        return (clicked, result.and(copy_result), new_tab);
     }
     for event in ui.input(|i| i.events.clone()) {
         let follow_cursor = !matches!(event, egui::Event::PointerButton { .. });
@@ -2006,7 +2140,14 @@ fn terminal_view(
                 button,
                 pressed,
                 ..
-            } if reporting && grid_rect.contains(pos) => {
+            } if (if button == egui::PointerButton::Primary {
+                primary_reporting
+            } else if button == egui::PointerButton::Secondary {
+                reporting && modifiers.alt
+            } else {
+                reporting
+            }) && grid_rect.contains(pos) =>
+            {
                 let code = match button {
                     egui::PointerButton::Primary => 0,
                     egui::PointerButton::Middle => 1,
@@ -2049,7 +2190,49 @@ fn terminal_view(
             }
         }
     }
-    (clicked, result)
+    (clicked, result, new_tab)
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SelectionMenuAction {
+    Copy,
+    Paste,
+    NewTab,
+    Search,
+}
+
+fn selection_paste_text(text: &str) -> anyhow::Result<String> {
+    // A selection action stages text, never submits shell commands. Flatten line
+    // breaks even when a new shell has not enabled bracketed paste yet.
+    let text: String = text
+        .chars()
+        .map(|c| {
+            if matches!(c, '\n' | '\r' | '\t') {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    if text.chars().any(char::is_control) {
+        anyhow::bail!("Selected text contains control characters; copy it instead");
+    }
+    if text.len() > 64 * 1024 - 12 {
+        anyhow::bail!("Selected text exceeds the terminal paste limit; select less text");
+    }
+    Ok(text)
+}
+
+fn selection_search_url(text: &str) -> String {
+    use std::fmt::Write;
+    let mut url = String::from("https://www.google.com/search?q=");
+    for byte in text.trim().bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            url.push(byte as char);
+        } else {
+            write!(url, "%{byte:02X}").expect("writing to String cannot fail");
+        }
+    }
+    url
 }
 #[derive(Clone, Default)]
 struct ChoiceCache {
@@ -3074,6 +3257,297 @@ mod render_tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(std::fs::read(path).unwrap(), b"\x1b[B");
+    }
+
+    #[test]
+    fn primary_drag_selects_mouse_reporting_text_without_copy_mode() {
+        pointer_selection_regression(false);
+    }
+
+    #[test]
+    fn alt_click_preserves_application_mouse_input() {
+        pointer_selection_regression(true);
+    }
+
+    fn pointer_selection_regression(reporting: bool) {
+        let ctx = egui::Context::default();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pointer-input");
+        let mut terminal = Terminal::spawn(
+            Uuid::new_v4(),
+            dir.path(),
+            std::path::Path::new(""),
+            ctx.clone(),
+        )
+        .unwrap();
+        let mut search = TerminalSearch::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(640.0, 480.0));
+        let mut start = Pos2::ZERO;
+        let mut end = Pos2::ZERO;
+        let mut frame = |terminal: &mut Terminal, events, modifiers| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events,
+                    modifiers,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let font = FontId::monospace(15.0);
+                        let cell = ui.fonts_mut(|f| {
+                            Vec2::new(f.glyph_width(&font, 'M'), f.row_height(&font))
+                        });
+                        let grid = ui.available_rect_before_wrap().shrink(8.0);
+                        start = grid.min + Vec2::new(0.25 * cell.x, 0.5 * cell.y);
+                        end = grid.min + Vec2::new(6.25 * cell.x, 0.5 * cell.y);
+                        terminal_view(ui, terminal, &mut search, true, 15.0, true)
+                            .1
+                            .unwrap();
+                    });
+                },
+            )
+        };
+        frame(&mut terminal, vec![], Modifiers::NONE);
+        let count = if reporting { 18 } else { 1 };
+        terminal.input(format!("stty raw -echo; printf '\\033[?1049h\\033[?1000h\\033[?1006h\\033[2J\\033[Hselectable text'; dd bs=1 count={count} of='{}' 2>/dev/null; stty sane\r", path.display()).into_bytes()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !terminal
+            .mode()
+            .contains(TermMode::ALT_SCREEN | TermMode::MOUSE_REPORT_CLICK | TermMode::SGR_MOUSE)
+        {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Resolve the cell coordinates before releasing the frame closure's borrows.
+        frame(&mut terminal, vec![], Modifiers::NONE);
+        drop(frame);
+        let frame = |terminal: &mut Terminal, search: &mut TerminalSearch, events, modifiers| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events,
+                    modifiers,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        terminal_view(ui, terminal, search, true, 15.0, true)
+                            .1
+                            .unwrap();
+                    });
+                },
+            )
+        };
+        let modifiers = if reporting {
+            Modifiers::ALT
+        } else {
+            Modifiers::NONE
+        };
+        frame(
+            &mut terminal,
+            &mut search,
+            vec![egui::Event::PointerMoved(start)],
+            modifiers,
+        );
+        frame(
+            &mut terminal,
+            &mut search,
+            vec![egui::Event::PointerButton {
+                pos: start,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers,
+            }],
+            modifiers,
+        );
+        if !reporting {
+            // A fast drag must anchor at the press, even if Alt changes mid-gesture.
+            frame(
+                &mut terminal,
+                &mut search,
+                vec![egui::Event::PointerMoved(end)],
+                Modifiers::ALT,
+            );
+        }
+        let release = if reporting { start } else { end };
+        frame(
+            &mut terminal,
+            &mut search,
+            vec![egui::Event::PointerButton {
+                pos: release,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Modifiers::NONE,
+            }],
+            Modifiers::NONE,
+        );
+        assert!(!terminal.copy_mode);
+        if reporting {
+            assert!(terminal.term.lock().unwrap().selection.is_none());
+        } else {
+            assert_eq!(
+                terminal
+                    .term
+                    .lock()
+                    .unwrap()
+                    .selection_to_string()
+                    .as_deref(),
+                Some("selecta")
+            );
+            let output = frame(
+                &mut terminal,
+                &mut search,
+                vec![egui::Event::Copy],
+                Modifiers::NONE,
+            );
+            assert!(output.platform_output.commands.iter().any(|command| {
+                matches!(command, egui::OutputCommand::CopyText(text) if text == "selecta")
+            }));
+            for pressed in [true, false] {
+                frame(
+                    &mut terminal,
+                    &mut search,
+                    vec![egui::Event::PointerButton {
+                        pos: end,
+                        button: egui::PointerButton::Secondary,
+                        pressed,
+                        modifiers: Modifiers::NONE,
+                    }],
+                    Modifiers::NONE,
+                );
+            }
+            let output = frame(&mut terminal, &mut search, vec![], Modifiers::NONE);
+            let menu_button = |label: &str| {
+                output
+                    .shapes
+                    .iter()
+                    .find_map(|shape| match &shape.shape {
+                        egui::epaint::Shape::Text(text) if text.galley.job.text == label => {
+                            Some(text.pos + text.galley.rect.center().to_vec2())
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| panic!("Missing selection menu action: {label}"))
+            };
+            for label in [
+                "Copy",
+                "Paste into this terminal",
+                "Open in new terminal tab",
+                "Search in browser",
+            ] {
+                assert!(screen.contains(menu_button(label)));
+            }
+            let pos = menu_button("Search in browser");
+            // The menu keeps the original text even if output clears selection.
+            terminal.term.lock().unwrap().selection = None;
+            frame(
+                &mut terminal,
+                &mut search,
+                vec![egui::Event::PointerMoved(pos)],
+                Modifiers::NONE,
+            );
+            frame(
+                &mut terminal,
+                &mut search,
+                vec![egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Modifiers::NONE,
+                }],
+                Modifiers::NONE,
+            );
+            let output = frame(
+                &mut terminal,
+                &mut search,
+                vec![egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Modifiers::NONE,
+                }],
+                Modifiers::NONE,
+            );
+            assert!(output.platform_output.commands.iter().any(|command| {
+                matches!(command, egui::OutputCommand::OpenUrl(url) if url.url == "https://www.google.com/search?q=selecta")
+            }));
+            terminal.input(b"x".to_vec()).unwrap();
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !std::fs::read(&path).is_ok_and(|bytes| bytes.len() == count) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "pointer input was lost or leaked into PTY"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            std::fs::read(path).unwrap(),
+            if reporting {
+                b"\x1b[<0;1;1M\x1b[<0;1;1m".as_slice()
+            } else {
+                b"x".as_slice()
+            }
+        );
+    }
+
+    #[test]
+    fn selection_actions_encode_search_and_stage_safe_terminal_text() {
+        assert_eq!(
+            selection_search_url("  Rust & café\n#?  "),
+            "https://www.google.com/search?q=Rust%20%26%20caf%C3%A9%0A%23%3F"
+        );
+        assert_eq!(
+            selection_paste_text("echo first\necho second\r\t").unwrap(),
+            "echo first echo second  "
+        );
+        assert!(selection_paste_text("echo\u{1b}[31m").is_err());
+        assert!(selection_paste_text("echo\u{0}").is_err());
+        assert!(selection_paste_text(&"x".repeat(64 * 1024)).is_err());
+    }
+
+    #[test]
+    fn selection_tab_uses_source_directory_without_executing_text() {
+        let ctx = egui::Context::default();
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = fixture(1);
+        let source = app.saved.workspaces[0].focus;
+        assert!(app.spawn(source, &ctx, dir.path().to_str().unwrap()));
+        let marker = dir.path().join("must-not-run");
+        let text = format!("printf unsafe > '{}'\necho second", marker.display());
+        app.open_selection_tab(&ctx, source, &text);
+        assert!(app.error.is_empty(), "{}", app.error);
+        assert_eq!(app.saved.workspaces.len(), 2);
+        assert_eq!(
+            PathBuf::from(&app.saved.workspaces[1].task.directory)
+                .canonicalize()
+                .unwrap(),
+            dir.path().canonicalize().unwrap()
+        );
+        let target = app.saved.workspaces[1].focus;
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let terminal = &app.panes[&target].terminal;
+            let term = terminal.term.lock().unwrap();
+            let output: String = term.grid().display_iter().map(|cell| cell.cell.c).collect();
+            if output.contains("echo second") {
+                break;
+            }
+            drop(term);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Selected text did not reach new tab"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !marker.exists(),
+            "Selection action submitted a shell command"
+        );
+        app.open_selection_tab(&ctx, source, "bad\u{1b}text");
+        assert_eq!(app.saved.workspaces.len(), 2);
+        assert!(app.error.contains("control characters"));
     }
 
     #[test]
