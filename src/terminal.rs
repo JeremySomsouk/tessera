@@ -149,6 +149,7 @@ fn protocol_reply(term: &Term<Listener>, event: Event) -> Option<Vec<u8>> {
 struct ProcessLifecycle {
     killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
     exited: bool,
+    exit_code: Option<u32>,
 }
 pub struct Terminal {
     pub term: Arc<Mutex<Term<Listener>>>,
@@ -178,6 +179,36 @@ impl Terminal {
         });
         let mut command = CommandBuilder::new(shell);
         command.arg("-l");
+        Self::spawn_command(id, directory, socket, ctx, command)
+    }
+
+    pub fn spawn_agent(
+        id: Uuid,
+        directory: &Path,
+        socket: &Path,
+        ctx: Context,
+        launch: &str,
+    ) -> Result<Self> {
+        // Match ordinary terminal PATH setup while keeping POSIX literal quoting.
+        let preferred = std::env::var("SHELL").unwrap_or_else(|_| {
+            if cfg!(target_os = "macos") {
+                "/bin/zsh".into()
+            } else {
+                "/bin/sh".into()
+            }
+        });
+        let shell = if matches!(
+            Path::new(&preferred)
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("sh" | "bash" | "zsh")
+        ) {
+            preferred.as_str()
+        } else {
+            "/bin/sh"
+        };
+        let mut command = CommandBuilder::new(shell);
+        command.args(["-lic", &format!("exec {launch}")]);
         Self::spawn_command(id, directory, socket, ctx, command)
     }
 
@@ -246,6 +277,7 @@ impl Terminal {
         let lifecycle = Arc::new(Mutex::new(ProcessLifecycle {
             killer: child.clone_killer(),
             exited: false,
+            exit_code: None,
         }));
         drop(pair.slave);
         let mut reader = pair.master.try_clone_reader()?;
@@ -386,7 +418,8 @@ impl Terminal {
                 }
                 let exited = {
                     let mut life = host_lifecycle.lock().unwrap();
-                    if matches!(child.try_wait(), Ok(Some(_))) {
+                    if let Ok(Some(status)) = child.try_wait() {
+                        life.exit_code = Some(status.exit_code());
                         life.exited = true;
                         true
                     } else {
@@ -491,6 +524,9 @@ impl Terminal {
         {
             self.size = size;
         }
+    }
+    pub fn exit_code(&self) -> Option<u32> {
+        self.lifecycle.lock().ok().and_then(|life| life.exit_code)
     }
     pub fn paste(&self, s: &str) -> Result<()> {
         let bracketed = self.mode().contains(TermMode::BRACKETED_PASTE);
@@ -697,6 +733,40 @@ mod tests {
 
 #[cfg(test)]
 mod pty_tests {
+    #[test]
+    fn agent_launch_uses_real_pty_directory_and_hook_environment() {
+        let directory = tempfile::tempdir().unwrap();
+        let id = uuid::Uuid::new_v4();
+        let terminal = super::Terminal::spawn_agent(
+            id,
+            directory.path(),
+            &directory.path().join("hooks.sock"),
+            eframe::egui::Context::default(),
+            "printf 'READY:%s:%s' \"$TESSERA_PANE\" \"$PWD\"",
+        )
+        .unwrap();
+        let expected = format!("READY:{id}:");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let output: String = terminal
+                .term
+                .lock()
+                .unwrap()
+                .grid()
+                .display_iter()
+                .map(|cell| cell.cell.c)
+                .collect();
+            if output.contains(&expected) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Agent launch output missing: {output}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     use super::*;
     #[test]
     fn fixture_shell_accepts_immediate_input_and_preserves_pane_environment() {

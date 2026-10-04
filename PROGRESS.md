@@ -1,5 +1,21 @@
 # Progress
 
+2026-10-04 — 0.4.0 release preparation.
+
+Package, lockfile, README and publishing instructions now target 0.4.0. Release notes cover local specifications, pinned agent launches and recovery/navigation fixes. User authorized merging PR #23 and publishing the v0.4.0 tag after validation. Native interactive acceptance remains pending.
+
+2026-10-04 — specification launch recovery and navigation fixes.
+
+Specification launches retain terminal output after process exit and persist exit codes. Failures are reported once, with installation/PATH/authentication guidance; an In progress card returns to Ready if no other launch is running. Workspace navigation, creation, terminal actions and Overview commands leave Specs consistently; the command shortcut remains available inside Specs. Empty title/scope and invalid directories explain disabled launch actions inline. Regression scenarios cover a missing executable through a real PTY, retained output, one-time errors, workspace clicks and invalid-directory feedback. Native Mac UI acceptance remains pending.
+
+2026-10-04 — local specifications and agent launch.
+
+Added a local Draft/Ready/In progress board, Markdown editor, immutable deduplicated revision history, working-directory selection, exact launch-context preview, and Claude/Codex launch into a new real PTY. Launches pin a revision and pane identity; Overview links sessions back to the specification, including closed-session history. Cards reopen live terminals. Cmd+Shift+S (Ctrl+Alt+Shift+S on Linux) opens Specs; Overview navigation remains available. Agent completion does not accept a task/spec automatically.
+
+Specifications, drafts, revisions and launch links use existing atomic local persistence with backward-compatible defaults. CLI prompts are quoted as shell literals, reject terminal control characters and are limited to 8000 bytes. Launch uses an interactive login sh/bash/zsh (fallback /bin/sh), preserving hook environment and pane-local Codex --no-daemon. Up to 256 revisions/launches per card are retained. Jira/GitHub import, worktrees and agent-proposed spec diffs remain future increments.
+
+Local validation: formatting, Clippy with warnings denied, debug build, new revision/serialization/literal-shell-prompt tests, direct real-PTY launch regression, legacy saved-state compatibility, keyboard isolation and light/dark/narrow rendering pass. The full local unit suite has 74 passing tests and nine socket/process-lookup failures, reproduced identically on unchanged main (68 passing, same nine failures). Python suite: 14 tests, one platform skip. Native Mac acceptance and CI platform results remain pending at preparation time.
+
 2026-10-04 — agent discovery and 0.3.1 release preparation.
 
 Overview now discovers Codex and Claude executable processes descended from live pane shells in a background worker at most every two seconds. It reads only process IDs, parent IDs and executable names. Discovered rows remain Untracked until lifecycle hooks upgrade their identity/state in place, preserving selection. Only successfully observed process disappearance ends an untracked row; failed scans preserve state. Discovery is local, does not restore terminals, and does not infer turn or approval state.

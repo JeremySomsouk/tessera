@@ -6,7 +6,7 @@ A native terminal workspace for supervising Claude Code and Codex sessions.
 
 Run your usual shell in resizable panes. Switch to **Overview** to see what is running, what needs attention, and what is ready to review. Return to the same live terminal when you need to act.
 
-**0.3.1** makes open agents visible before lifecycle hooks arrive and fixes workspace creation and startup appearance. [Release notes](docs/releases/0.3.1.md)
+**0.4.0** adds a local specification board, revision history and pinned Claude/Codex launches, with retained terminal output and clear launch failures. [Release notes](docs/releases/0.4.0.md)
 
 ## Install
 
@@ -62,6 +62,14 @@ On macOS, use Cmd below. On Linux, replace Cmd with Ctrl+Alt.
 | Stop focused pane | Cmd+W |
 
 Drag terminal text to select it; right-click for copy, paste, new-tab, or browser-search actions. Drop a saved file to paste its path. Neither action submits a command for you. [Full controls and keyboard reference](docs/usage.md)
+
+## Specifications
+
+Open **Specs** (Cmd+Shift+S on macOS, Ctrl+Alt+Shift+S on Linux) to prepare local Markdown cards in Draft, Ready, or In progress. Edit the title, working directory, and scope; **Save revision** retains an immutable snapshot. Revision history remains available after later edits.
+
+Choose Claude or Codex and inspect the exact launch context. **Launch agent** saves the current revision and starts the agent in a new PTY in the existing working directory. Codex uses `--no-daemon`. The command is passed as a quoted literal through an interactive login shell (`$SHELL` for sh/bash/zsh, `/bin/sh` otherwise); the agent executable must be available in that shell's PATH. Hooks and approvals behave as in ordinary agent terminals.
+
+The card lists its launches, pinned revisions and exit results. Agent terminals retain their output after exit until explicitly closed; failed launches show an error and return an In progress card to Ready when no other launch is still running. The card opens running or retained terminals. Overview links each session back to its specification and pinned revision. Agent completion never accepts the specification automatically. Specifications, revision text, and launch links are stored locally with preferences; they are sent to the selected agent only on launch. Launch context is limited to 8000 bytes, with up to 256 revisions and launches per specification. GitHub/Jira import and agent-proposed specification changes are future increments.
 
 ## What persists
 
