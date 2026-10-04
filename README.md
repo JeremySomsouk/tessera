@@ -45,7 +45,7 @@ Approvals stay in the real CLI. Tessera records lifecycle and tool names, not pr
 
 ## Everyday use
 
-Use **Terminal** and **Overview** to switch views. **+ Workspace** opens a directory and optional name. **Commands** searches workspaces and actions; Up/Down select, Enter opens, Escape closes. **Settings** holds appearance, terminal behavior, and updates.
+Use **Terminal** and **Overview** to switch views. **+ Workspace** opens a directory, creating it if needed. The optional name sets the workspace label. **Commands** searches workspaces and actions; Up/Down select, Enter opens, Escape closes. **Settings** holds appearance, terminal behavior, and updates.
 
 On macOS, use Cmd below. On Linux, replace Cmd with Ctrl+Alt.
 
