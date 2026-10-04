@@ -2,13 +2,13 @@
 
 Tessera uses Sparkle 2.10.0 for native update checks, Ed25519 verification, background downloads and installation on quit. The framework is fetched from its upstream GitHub release at packaging time, checked against a pinned SHA-256 digest, and copied into `Contents/Frameworks`. Rust loads only that framework from the application bundle and retains the updater on the AppKit main thread. Cargo binaries and non-macOS builds have no updater.
 
-Automatic checking and downloading are enabled by default, with launch and daily checks. Users can change both settings in Workspace & commands. Sparkle owns and persists these settings in macOS defaults. Updates never trigger a forced Tessera restart; application quit remains the point at which shells stop and downloaded updates install. System profiling is disabled.
+Automatic checking and downloading are enabled by default, with launch and daily checks. Users can change both settings in Workspace & commands → Settings. Sparkle owns and persists these settings in macOS defaults. Updates never trigger a forced Tessera restart; application quit remains the point at which shells stop and downloaded updates install. System profiling is disabled.
 
 Each architecture has its own `appcast-arm64.xml` or `appcast-x86_64.xml`, served from the latest GitHub release. Feeds point at version-specific DMG URLs, contain the exact archive size and signature, and use the app's increasing `CFBundleVersion` (`1.minor.patch` for the current 0.x releases). Both feeds and archives are signed; feed signature failures do not expire, and archives must pass signature verification before extraction. GitHub release publication checks for both DMGs and feeds, both Linux archives, the installer and SHA-256 checksums before ending draft status. The command-line installer retains the macOS application bundle and updater; Linux updates require rerunning the installer.
 
 ## Missing update controls
 
-Open Workspace & commands with Cmd+Shift+P to find **Check for updates…**. Starting with 0.2.4, the dialog scrolls and retains updater startup errors beside a disabled check button. If Sparkle cannot load or start, reinstall the macOS application bundle; Cargo binaries show that bundle updates are unavailable. In 0.2.2 and 0.2.3, a startup failure hides the update controls and reports the failure through the general error display, which later errors can replace.
+Open Workspace & commands with Cmd+Shift+P, then choose **Settings** to find **Check for updates…**. Starting with 0.2.4, the dialog scrolls and retains updater startup errors beside a disabled check button. If Sparkle cannot load or start, reinstall the macOS application bundle; Cargo binaries show that bundle updates are unavailable. In 0.2.2 and 0.2.3, a startup failure hides the update controls and reports the failure through the general error display, which later errors can replace.
 
 ## Release key
 
