@@ -1056,6 +1056,7 @@ impl App {
         } else {
             None
         };
+        let mut pane_action = None;
         egui::TopBottomPanel::top("chrome").show(ctx, |ui| {
             ui.add_space(7.0);
             ui.horizontal_wrapped(|ui| {
@@ -1117,46 +1118,198 @@ impl App {
                     }
                 });
             });
+            ui.add_space(8.0);
+            egui::ScrollArea::horizontal()
+                .id_salt("workspace-tabs")
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 10.0;
+                        ui.spacing_mut().button_padding = Vec2::new(16.0, 9.0);
+                        for (index, w) in self.saved.workspaces.iter().enumerate() {
+                            let selected = index == self.active && !self.overview;
+                            let mut label = egui::text::LayoutJob::default();
+                            label.append(
+                                &format!("{}", index + 1),
+                                0.0,
+                                egui::TextFormat {
+                                    font_id: FontId::proportional(11.0),
+                                    color: ui.visuals().weak_text_color(),
+                                    ..Default::default()
+                                },
+                            );
+                            label.append(
+                                &w.task.title,
+                                10.0,
+                                egui::TextFormat {
+                                    font_id: FontId::proportional(13.0),
+                                    color: ui.visuals().text_color(),
+                                    ..Default::default()
+                                },
+                            );
+                            let response = ui
+                                .add(
+                                    egui::Button::new(label)
+                                        .selected(selected)
+                                        .fill(if selected {
+                                            ACCENT.gamma_multiply(if self.saved.light {
+                                                0.22
+                                            } else {
+                                                0.14
+                                            })
+                                        } else {
+                                            Color32::TRANSPARENT
+                                        })
+                                        .stroke(Stroke::NONE)
+                                        .corner_radius(6),
+                                )
+                                .on_hover_text(if index < 9 {
+                                    shortcut(
+                                        "Switch workspace · right-click for pane actions",
+                                        &(index + 1).to_string(),
+                                    )
+                                } else {
+                                    "Switch workspace · right-click for pane actions".into()
+                                });
+                            if selected {
+                                let rect = response.rect;
+                                ui.painter().line_segment(
+                                    [
+                                        Pos2::new(rect.left() + 12.0, rect.bottom() - 1.0),
+                                        Pos2::new(rect.right() - 12.0, rect.bottom() - 1.0),
+                                    ],
+                                    Stroke::new(
+                                        2.0_f32,
+                                        if self.saved.light {
+                                            Color32::from_rgb(53, 119, 102)
+                                        } else {
+                                            ACCENT
+                                        },
+                                    ),
+                                );
+                            }
+                            response.context_menu(|ui| {
+                                for (action, keys) in [
+                                    ("Find", "F"),
+                                    ("Select", "Shift+Space"),
+                                    ("Stop terminal", "W"),
+                                ] {
+                                    if ui.button(shortcut(action, keys)).clicked() {
+                                        pane_action = Some((w.focus, action));
+                                        self.active = index;
+                                        self.overview = false;
+                                        self.maximized = false;
+                                        ui.close();
+                                    }
+                                }
+                            });
+                            if response.clicked() {
+                                self.active = index;
+                                self.overview = false;
+                                self.maximized = false;
+                            }
+                        }
+                    });
+                });
             ui.add_space(5.0);
-            egui::ScrollArea::horizontal().show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    for (index, w) in self.saved.workspaces.iter().enumerate() {
-                        if ui
-                            .selectable_label(
-                                index == self.active && !self.overview,
-                                format!("{}  {}", index + 1, w.task.title),
-                            )
-                            .on_hover_text(if index < 9 {
-                                shortcut("Switch workspace", &(index + 1).to_string())
+        });
+        if let Some((id, action)) = pane_action {
+            if action == "Stop terminal" {
+                self.request_stop_terminal(id);
+            } else if let Some(pane) = self.panes.get_mut(&id) {
+                if action == "Select" {
+                    pane.search.close();
+                    if let Err(error) = pane.terminal.selection_action(SelectionAction::Enter) {
+                        self.error = error.to_string();
+                    }
+                } else {
+                    if pane.terminal.copy_mode
+                        && let Err(error) = pane.terminal.selection_action(SelectionAction::Exit)
+                    {
+                        self.error = error.to_string();
+                    }
+                    pane.search.open();
+                }
+            }
+        }
+        egui::TopBottomPanel::bottom("status")
+            .frame(
+                egui::Frame::new()
+                    .fill(if self.saved.light {
+                        Color32::from_rgb(234, 240, 238)
+                    } else {
+                        Color32::from_rgb(30, 38, 40)
+                    })
+                    .inner_margin(egui::Margin::symmetric(12, 7))
+                    .stroke(Stroke::new(
+                        1.0_f32,
+                        if self.saved.light {
+                            Color32::from_rgb(204, 216, 212)
+                        } else {
+                            Color32::from_rgb(51, 66, 64)
+                        },
+                    )),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 20.0;
+                    if self.error.is_empty() {
+                        for (action, keys) in [
+                            ("New tab", "T"),
+                            ("Split", "D"),
+                            ("Stack", "Shift+D"),
+                            (
+                                "Next pane",
+                                if cfg!(target_os = "macos") {
+                                    "Alt+Right"
+                                } else {
+                                    "Right"
+                                },
+                            ),
+                            ("Find", "F"),
+                            ("Select", "Shift+Space"),
+                            ("Commands", "Shift+P"),
+                        ] {
+                            let mut hint = egui::text::LayoutJob::default();
+                            hint.append(
+                                action,
+                                0.0,
+                                egui::TextFormat {
+                                    font_id: FontId::proportional(12.0),
+                                    color: ui.visuals().text_color(),
+                                    ..Default::default()
+                                },
+                            );
+                            hint.append(
+                                &format!("  {}", shortcut_keys(keys)),
+                                0.0,
+                                egui::TextFormat {
+                                    font_id: FontId::monospace(11.0),
+                                    color: if self.saved.light {
+                                        Color32::from_rgb(53, 119, 102)
+                                    } else {
+                                        ACCENT
+                                    },
+                                    ..Default::default()
+                                },
+                            );
+                            ui.add(egui::Label::new(hint).wrap_mode(egui::TextWrapMode::Extend));
+                        }
+                    } else {
+                        ui.colored_label(
+                            if self.saved.light {
+                                Color32::from_rgb(160, 42, 42)
                             } else {
-                                "Switch workspace".into()
-                            })
-                            .clicked()
-                        {
-                            self.active = index;
-                            self.overview = false;
-                            self.maximized = false;
+                                Color32::from_rgb(233, 150, 150)
+                            },
+                            &self.error,
+                        );
+                        if ui.small_button("Dismiss").clicked() {
+                            self.error.clear();
                         }
                     }
                 });
             });
-        });
-        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                if self.error.is_empty() {
-                    ui.label(
-                        RichText::new(if cfg!(target_os = "macos") { "Cmd+D split · Cmd+Shift+D stack · Cmd+Alt+Right next pane · Cmd+Shift+P commands" } else { "Ctrl+Alt+D split · Ctrl+Alt+Shift+D stack · Ctrl+Alt+Right next pane · Ctrl+Alt+Shift+P commands" })
-                            .small(),
-                    );
-                } else {
-                    ui.colored_label(Color32::from_rgb(233, 150, 150), &self.error);
-                    if ui.small_button("Dismiss").clicked() {
-                        self.error.clear();
-                    }
-                }
-            });
-        });
-        let mut stop = None;
         let mut selection_tab = None;
         egui::CentralPanel::default().show(ctx, |ui| {
             if self.overview {
@@ -1209,59 +1362,6 @@ impl App {
             for (id, rect) in rects {
                 ui.scope_builder(egui::UiBuilder::new().max_rect(rect).id_salt(id), |ui| {
                     if let Some(pane) = self.panes.get_mut(&id) {
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(if focused == id {
-                                    "● Terminal"
-                                } else {
-                                    "Terminal"
-                                })
-                                .color(if focused == id {
-                                    ACCENT
-                                } else {
-                                    ui.visuals().weak_text_color()
-                                }),
-                            );
-                            if ui
-                                .small_button("Select")
-                                .on_hover_text(shortcut("Keyboard selection", "Shift+Space"))
-                                .clicked()
-                            {
-                                pane.search.close();
-                                if let Err(error) =
-                                    pane.terminal.selection_action(SelectionAction::Enter)
-                                {
-                                    self.error = error.to_string();
-                                }
-                                self.saved.workspaces[self.active].focus = id;
-                                self.dirty = true;
-                            }
-                            if ui
-                                .small_button("Find")
-                                .on_hover_text(shortcut("Find in terminal", "F"))
-                                .clicked()
-                            {
-                                if pane.terminal.copy_mode
-                                    && let Err(error) =
-                                        pane.terminal.selection_action(SelectionAction::Exit)
-                                {
-                                    self.error = error.to_string();
-                                }
-                                pane.search.open();
-                                self.saved.workspaces[self.active].focus = id;
-                                self.dirty = true;
-                            }
-                            if ui
-                                .small_button("×")
-                                .on_hover_text(shortcut("Stop terminal", "W"))
-                                .clicked()
-                            {
-                                stop = Some(id);
-                            }
-                            if !pane.terminal.alive.load(Ordering::Acquire) {
-                                ui.label("Shell exited");
-                            }
-                        });
                         if let Some(err) =
                             pane.terminal.error.try_lock().ok().and_then(|e| e.clone())
                         {
@@ -1274,8 +1374,7 @@ impl App {
                             focused == id
                                 && !self.palette
                                 && self.rename.is_none()
-                                && self.closing.is_none()
-                                && stop.is_none(),
+                                && self.closing.is_none(),
                             self.font_size,
                             self.saved.clickable_codex_choices
                                 && !self.palette
@@ -1459,9 +1558,6 @@ impl App {
             }
         }
         self.rename_dialog(ctx);
-        if let Some(id) = stop {
-            self.request_stop_terminal(id);
-        }
         self.close_dialog(ctx);
         if self.dirty {
             if now().saturating_sub(self.last_save) >= 2 {
@@ -1533,12 +1629,16 @@ fn configure_appearance(ctx: &egui::Context, light: bool) {
 }
 
 fn shortcut(action: &str, keys: &str) -> String {
+    format!("{action} — {}", shortcut_keys(keys))
+}
+
+fn shortcut_keys(keys: &str) -> String {
     let command = if cfg!(target_os = "macos") {
         "Cmd"
     } else {
         "Ctrl+Alt"
     };
-    format!("{action} — {command}+{keys}")
+    format!("{command}+{keys}")
 }
 
 fn workspace_shortcut(
@@ -2770,10 +2870,19 @@ mod render_tests {
             ("dark", 1180.0, 760.0, false),
             ("light", 1180.0, 760.0, true),
             ("narrow", 640.0, 700.0, false),
+            ("terminal-light", 1180.0, 760.0, true),
+            ("terminal-dark", 640.0, 700.0, false),
         ] {
             let ctx = egui::Context::default();
             configure_appearance(&ctx, light);
             let mut app = fixture(6);
+            let directory = tempfile::tempdir().unwrap();
+            if name.starts_with("terminal-") {
+                app.overview = false;
+                app.saved.workspaces[0].task.directory =
+                    directory.path().to_string_lossy().into_owned();
+                start_fixture_terminal(&mut app, &ctx);
+            }
             let input = egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(width, height))),
                 ..Default::default()
