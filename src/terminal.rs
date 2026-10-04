@@ -431,6 +431,9 @@ impl Terminal {
             .ok_or_else(|| anyhow::anyhow!("shell process ID unavailable"))?;
         process_directory(pid)
     }
+    pub fn shell_pid(&self) -> Option<u32> {
+        self.shell_pid
+    }
     pub fn selection_action(&mut self, action: SelectionAction) -> Result<()> {
         if self.alive.load(Ordering::Acquire) {
             self.tx.try_send(Command::Selection(action)).map_err(|_| {

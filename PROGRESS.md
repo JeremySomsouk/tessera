@@ -1,5 +1,13 @@
 # Progress
 
+2026-10-04 — agent discovery and 0.3.1 release preparation.
+
+Overview now discovers Codex and Claude executable processes descended from live pane shells in a background worker at most every two seconds. It reads only process IDs, parent IDs and executable names. Discovered rows remain Untracked until lifecycle hooks upgrade their identity/state in place, preserving selection. Only successfully observed process disappearance ends an untracked row; failed scans preserve state. Discovery is local, does not restore terminals, and does not infer turn or approval state.
+
+The user's installed Codex 0.160.0 was reproduced with a private socket and app-server probe: SessionStart and UserPromptSubmit reached Tessera's helper when the first turn started, but idle CLI startup emitted neither. A shared Codex daemon also retained an expired Tessera socket. Documentation now recommends pane-local `codex --no-daemon`. No user agent was stopped; two current processes were registered as neutral Untracked observations in the running app.
+
+Package/lockfile and release instructions are prepared for 0.3.1. Release notes include the merged workspace-directory and startup-theme/status-shortcut fixes since 0.3.0. No tag or release is published by this draft PR. Regression coverage includes process ancestry/cycles, deduplication, exit handling and first-hook selection-preserving upgrades. Validation before the version bump: 80 Rust tests including sockets, 14 Python tests, formatting, Clippy with warnings denied and release build passed using the installed macOS 26.5 SDK because the default 27.0 SDK is incompatible with the current linker. Native UI/VoiceOver and installed-updater acceptance remain pending.
+
 2026-10-03 — first terminal/Overview increment.
 
 The initial repository contained LICENSE and .gitignore only. Implemented a Rust desktop application using eframe/egui, Alacritty terminal state, and portable-pty. No production demo/fake session data is enabled. Run instructions are in README.md.

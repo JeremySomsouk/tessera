@@ -12,6 +12,7 @@
 - [ ] Validate CI artifacts on Apple Silicon and finish native terminal smoke checklist.
 
 ## Next: terminal and Overview polish
+- [x] Discover local agents before hooks arrive, with explicit untracked state and in-place hook upgrades.
 - [x] Pane-local literal terminal search, scrollback navigation and keyboard controls.
 - [x] Keyboard selection/copy mode with scrollback navigation and input isolation.
 - [x] App-wide appearance, responsive workspace navigation, searchable commands and grouped settings.

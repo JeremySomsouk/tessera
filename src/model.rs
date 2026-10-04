@@ -67,6 +67,8 @@ pub struct Session {
     pub pane: Uuid,
     pub session_id: String,
     #[serde(default)]
+    pub observed_process: Option<u32>,
+    #[serde(default)]
     pub agent: Agent,
     pub state: SessionState,
     pub last_sequence: u128,
@@ -83,6 +85,7 @@ impl Session {
         Self {
             pane,
             session_id,
+            observed_process: None,
             agent: Agent::Claude,
             state: SessionState::Unknown,
             last_sequence: 0,

@@ -18,6 +18,12 @@ SSH does not forward the local endpoint. Remote agents are untracked in v0.1. A 
 
 ## Codex CLI
 
+Overview also discovers local `codex` and `claude` processes descended from Tessera's live pane shells. A background scan runs at most once every two seconds and reads process IDs, parent IDs, and executable names, not arguments, environments, or transcripts. Discovered agents appear as **Untracked** until a lifecycle hook identifies the conversation; the hook upgrades the same row rather than duplicating it. Discovery does not infer running turns, approvals, or completion. A successful scan that no longer finds the process marks only its untracked row ended; failed scans preserve unknown state. Processes outside Tessera and remote agents are not discovered.
+
+Codex 0.160.0 defers `SessionStart` until the first prompt, so opening or resuming an idle CLI does not immediately produce a hook event. Process discovery makes that CLI visible before its first turn.
+
+Start Codex inside each Tessera pane with `codex --no-daemon` on releases that support the shared background server. The shared daemon can outlive Tessera and retain the environment of the pane that originally started it, including an expired `TESSERA_SOCKET` and the wrong `TESSERA_PANE`. Hooks running there cannot reliably identify the current pane. Disabling the daemon for the CLI session keeps hook execution local to its pane without stopping other agents or changing global Codex configuration. For an existing conversation, exit the CLI after its current turn and use `codex --no-daemon resume` to resume it in the same pane.
+
 Release behavior reference: https://developers.openai.com/codex/hooks (consulted 2026-10-03). This integration uses native lifecycle command hooks, not the legacy `notify` callback or transcript files.
 
 `codex-hooks` previews SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, PermissionRequest, Stop, Interrupt, and SessionEnd. Commands invoke the quoted absolute Tessera binary with `codex-hook`, use a two-second timeout, and are synchronous to reduce out-of-order observations. Stop expects JSON output: the helper returns `{}` with exit zero, including outside Tessera and on transport failure. It never emits decisions, context, continuation requests, or permission overrides.
