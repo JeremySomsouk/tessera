@@ -154,3 +154,9 @@ Right-click a selection for Copy, Paste into this terminal, Open in new terminal
 Validation: all 71 Rust tests pass, including local PTYs and Unix sockets. Regressions cover ordinary drag/copy without application input leakage, press anchoring and modifier changes, Option/Alt mouse input, context-menu actions at 640px, selection snapshots, encoded Unicode searches, safe paste limits, and source-directory new tabs without command execution. Formatting, Clippy with warnings denied, native debug build, Python appcast test, shell syntax and diff checks pass. Local compilation uses the installed macOS 15.4 SDK because the default 27.0 SDK is incompatible with the installed linker. Native interactive acceptance remains pending.
 
 Conflict follow-up: merged the compact workspace chrome from main, preserving the new tab action dispatch and all selection actions. Updated Find/Select documentation to point to workspace-tab context menus.
+
+2026-10-04 — 0.2.6 release preparation.
+
+Package and lockfile are 0.2.6. Release notes cover the merged compact terminal chrome and direct selection/text actions; README version and publishing commands match. No runtime behavior changes are introduced by the release bump.
+
+Validation: all 71 Rust tests pass, including PTY and Unix socket cases. Formatting, Clippy with warnings denied, optimized release build, Python appcast test, shell syntax and diff checks pass locally using the installed macOS 15.4 SDK. Main’s Linux/Intel/Apple Silicon CI passed before preparation; the version tag runs the complete verification and signed packaging matrix before publishing. Native interactive acceptance remains pending.

@@ -4,7 +4,7 @@
 
 A desktop terminal workspace with a single Overview of real Claude Code and Codex sessions.
 
-**0.2.5 starts fresh terminals, improves workspace controls, and fixes shell prompt symbols.** It combines real login-shell PTYs, resizable splits, keyboard navigation, saved preferences and session history, signed automatic macOS updates, and a hook-driven agent Overview. Specification editing, issue connectors, and detached session hosting follow in later increments.
+**0.2.6 adds direct terminal text selection, selected-text actions, and more compact terminal controls.** It combines real login-shell PTYs, resizable splits, keyboard navigation, saved preferences and session history, signed automatic macOS updates, and a hook-driven agent Overview. Specification editing, issue connectors, and detached session hosting follow in later increments.
 
 ## Start on macOS
 
@@ -31,8 +31,8 @@ CI produces separate Intel (`Tessera-x86_64.dmg`) and Apple Silicon (`Tessera-ar
 To publish a version, tag the release commit containing this workflow and push the tag:
 
 ```sh
-git tag v0.2.5
-git push origin v0.2.5
+git tag v0.2.6
+git push origin v0.2.6
 ```
 
 Pushing a version tag (`v` followed by a digit) runs all checks and builds both DMGs, then publishes them on the [GitHub Releases page](https://github.com/JeremySomsouk/tessera/releases) with checked-in release notes when available, otherwise generated notes. New releases stay in draft until both DMGs and signed update feeds upload successfully. Release tags require the `SPARKLE_ED25519_PRIVATE_KEY` Actions secret; see [update signing](docs/updates.md). A failed publishing job can be rerun to finish the release. Branch pushes and pull requests upload Actions artifacts only.
