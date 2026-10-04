@@ -320,7 +320,11 @@ impl App {
             .as_ref()
             .map(|e| e.path.as_path())
             .unwrap_or_else(|| std::path::Path::new(""));
-        match Terminal::spawn(id, &PathBuf::from(directory), socket, ctx.clone()) {
+        #[cfg(not(test))]
+        let result = Terminal::spawn(id, &PathBuf::from(directory), socket, ctx.clone());
+        #[cfg(test)]
+        let result = Terminal::spawn_test(id, &PathBuf::from(directory), socket, ctx.clone());
+        match result {
             Ok(terminal) => {
                 self.panes.insert(
                     id,
@@ -3299,7 +3303,7 @@ mod render_tests {
         let ctx = egui::Context::default();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("choice-input");
-        let mut terminal = Terminal::spawn(
+        let mut terminal = Terminal::spawn_test(
             Uuid::new_v4(),
             dir.path(),
             std::path::Path::new(""),
@@ -3382,7 +3386,7 @@ mod render_tests {
         let ctx = egui::Context::default();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pointer-input");
-        let mut terminal = Terminal::spawn(
+        let mut terminal = Terminal::spawn_test(
             Uuid::new_v4(),
             dir.path(),
             std::path::Path::new(""),
@@ -3664,7 +3668,7 @@ mod render_tests {
         let ctx = egui::Context::default();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wheel-input");
-        let mut terminal = Terminal::spawn(
+        let mut terminal = Terminal::spawn_test(
             Uuid::new_v4(),
             dir.path(),
             std::path::Path::new(""),
@@ -4255,7 +4259,7 @@ mod render_tests {
         app.saved.sessions.clear();
         let pane = app.saved.workspaces[0].focus;
         let dir = std::env::current_dir().unwrap();
-        let terminal = Terminal::spawn(
+        let terminal = Terminal::spawn_test(
             pane,
             &dir,
             std::path::Path::new("/tmp/unused-test.sock"),
