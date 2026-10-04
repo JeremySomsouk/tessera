@@ -4,7 +4,7 @@ Tessera uses Sparkle 2.10.0 for native update checks, Ed25519 verification, back
 
 Automatic checking and downloading are enabled by default, with launch and daily checks. Users can change both settings in Workspace & commands. Sparkle owns and persists these settings in macOS defaults. Updates never trigger a forced Tessera restart; application quit remains the point at which shells stop and downloaded updates install. System profiling is disabled.
 
-Each architecture has its own `appcast-arm64.xml` or `appcast-x86_64.xml`, served from the latest GitHub release. Feeds point at version-specific DMG URLs, contain the exact archive size and signature, and use the app's increasing `CFBundleVersion` (`1.minor.patch` for the current 0.x releases). Both feeds and archives are signed; feed signature failures do not expire, and archives must pass signature verification before extraction. GitHub release publication checks for all four assets before ending draft status.
+Each architecture has its own `appcast-arm64.xml` or `appcast-x86_64.xml`, served from the latest GitHub release. Feeds point at version-specific DMG URLs, contain the exact archive size and signature, and use the app's increasing `CFBundleVersion` (`1.minor.patch` for the current 0.x releases). Both feeds and archives are signed; feed signature failures do not expire, and archives must pass signature verification before extraction. GitHub release publication checks for both DMGs and feeds, both Linux archives, the installer and SHA-256 checksums before ending draft status. The command-line installer retains the macOS application bundle and updater; Linux updates require rerunning the installer.
 
 ## Missing update controls
 
@@ -37,6 +37,8 @@ Run Rust formatting, Clippy, tests and build as in CI, plus:
 ```sh
 python3 -m unittest discover -s tests -p 'test_*.py'
 bash -n scripts/bundle-macos.sh scripts/prepare-sparkle.sh
+sh -n install.sh scripts/package-linux.sh
+shellcheck install.sh scripts/package-linux.sh
 ```
 
 On macOS, signed packaging also verifies the app code signature, DMG checksum, archive signature and appcast signature. The remaining native acceptance check is an end-to-end update from an installed 0.2.2 bundle to a later signed release, including installation on quit and preference persistence.

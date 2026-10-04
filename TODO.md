@@ -31,4 +31,5 @@
 - [ ] Jira/GitHub read/import, project configuration and Keychain credential adapter.
 - [ ] Reviewed publish with conflict re-fetch and rich-content preservation.
 - [ ] Verification receipts, staleness, criterion-linked change requests and handoff.
-- [ ] Developer ID signing/notarization, native signed-updater acceptance, Linux packaging.
+- [x] One-command macOS/Linux installer and x86-64/ARM64 release packaging.
+- [ ] Developer ID signing/notarization, native signed-updater acceptance, Linux package smoke testing.

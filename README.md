@@ -6,7 +6,32 @@ A desktop terminal workspace with a single Overview of real Claude Code and Code
 
 **0.2.6 adds direct terminal text selection, selected-text actions, and more compact terminal controls.** It combines real login-shell PTYs, resizable splits, keyboard navigation, saved preferences and session history, signed automatic macOS updates, and a hook-driven agent Overview. Specification editing, issue connectors, and detached session hosting follow in later increments.
 
-## Start on macOS
+## Quickstart
+
+On macOS or Linux (Intel/AMD x86-64 and ARM64):
+
+```sh
+curl -fsSL https://github.com/JeremySomsouk/tessera/releases/latest/download/install.sh | sh
+tessera
+```
+
+The command requires a release containing `install.sh` and `SHA256SUMS`; older releases do not provide these assets. It downloads a prebuilt release and verifies its SHA-256 checksum. No Rust toolchain or `sudo` is needed. macOS installs the complete app with automatic updates in `~/Applications/Tessera.app`; Linux installs the executable in `~/.local/bin`. Both platforms provide the `tessera` command there. If that directory is outside your `PATH`, the installer prints the command to add to your shell startup file:
+
+```sh
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+On macOS, you can also open Tessera from `~/Applications`. Quit Tessera before rerunning the installer. Bundles are ad hoc signed, not notarized; macOS may ask you to approve the app. Linux requires a graphical desktop with X11/Wayland, OpenGL/EGL and libxkbcommon runtime libraries (Ubuntu 22.04+ on x86-64, Ubuntu 24.04+ on ARM64, or compatible distributions). The installer does not install system packages or agent hooks.
+
+Rerun the installer to update Linux. To install a specific release that includes installer assets:
+
+```sh
+curl -fsSL https://github.com/JeremySomsouk/tessera/releases/latest/download/install.sh | TESSERA_VERSION=0.2.7 sh
+```
+
+To remove Tessera, first uninstall any agent hooks using the commands below, then remove `~/.local/bin/tessera` and, on macOS, `~/Applications/Tessera.app`. Your saved preferences and history remain.
+
+## Build from source
 
 With Rust stable and Xcode Command Line Tools installed:
 
@@ -35,7 +60,7 @@ git tag v0.2.6
 git push origin v0.2.6
 ```
 
-Pushing a version tag (`v` followed by a digit) runs all checks and builds both DMGs, then publishes them on the [GitHub Releases page](https://github.com/JeremySomsouk/tessera/releases) with checked-in release notes when available, otherwise generated notes. New releases stay in draft until both DMGs and signed update feeds upload successfully. Release tags require the `SPARKLE_ED25519_PRIVATE_KEY` Actions secret; see [update signing](docs/updates.md). A failed publishing job can be rerun to finish the release. Branch pushes and pull requests upload Actions artifacts only.
+Pushing a version tag (`v` followed by a digit) runs all checks and builds both DMGs, then publishes them on the [GitHub Releases page](https://github.com/JeremySomsouk/tessera/releases) with checked-in release notes when available, otherwise generated notes. New releases stay in draft until both macOS DMGs, signed update feeds, Linux x86-64/ARM64 archives, `SHA256SUMS`, and `install.sh` upload successfully. Linux x86-64 builds use Ubuntu 22.04; ARM64 builds use Ubuntu 24.04. Release tags require the `SPARKLE_ED25519_PRIVATE_KEY` Actions secret; see [update signing](docs/updates.md). A failed publishing job can be rerun to finish the release. Branch pushes and pull requests upload Actions artifacts only.
 
 ## Connect Codex CLI
 
@@ -134,8 +159,11 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 # Includes the local socket transport test on an unrestricted host:
 cargo test --locked -- --include-ignored
+python3 -m unittest discover -s tests -p 'test_*.py'
+sh -n install.sh scripts/package-linux.sh
+shellcheck install.sh scripts/package-linux.sh
 ```
 
-Linux builds need `libxkbcommon-dev`, `libwayland-dev`, and `libegl1-mesa-dev`. The UI also opens on Linux; macOS remains the release target. No Windows frontend is implemented.
+Linux source builds need `libxkbcommon-dev`, `libwayland-dev`, and `libegl1-mesa-dev`. Releases include macOS bundles and Linux binaries. No Windows frontend is implemented.
 
 [Architecture](docs/architecture.md) · [Progress](PROGRESS.md) · [Next increments](TODO.md) · [Performance](docs/performance.md)
