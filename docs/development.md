@@ -49,3 +49,5 @@ shellcheck install.sh scripts/package-linux.sh
 Linux source builds need `libxkbcommon-dev`, `libwayland-dev`, and `libegl1-mesa-dev`. Releases include macOS bundles and Linux binaries. No Windows frontend is implemented.
 
 [Architecture](architecture.md) · [Performance](performance.md) · [Release signing](updates.md)
+
+An explicitly approved release can also be requested by merging a commit whose message contains `[release v0.4.0]` (use the current package version). After all main-branch verification jobs pass, the tagging job checks that the marker matches Cargo.toml, refuses to overwrite a tag pointing elsewhere, creates the tag on that exact verified commit and dispatches the signed release workflow on the tag. Ordinary merges without a release marker do not create tags. This uses GitHub Actions' temporary token; no personal token is required.
