@@ -1923,9 +1923,7 @@ impl App {
                         for (action, keys) in
                             [("New tab", "T"), ("Find", "F"), ("Commands", "Shift+P")]
                         {
-                            ui.label(
-                                RichText::new(format!("{action}  {}", shortcut_keys(keys))).small(),
-                            );
+                            status_shortcut(ui, action, keys);
                         }
                     } else {
                         ui.colored_label(ui.visuals().error_fg_color, &self.error);
@@ -2347,6 +2345,11 @@ fn configure_terminal_fonts(ctx: &egui::Context) {
 }
 
 fn configure_appearance(ctx: &egui::Context, light: bool) {
+    ctx.set_theme(if light {
+        egui::Theme::Light
+    } else {
+        egui::Theme::Dark
+    });
     let mut visuals = if light {
         egui::Visuals::light()
     } else {
@@ -2432,6 +2435,26 @@ fn configure_appearance(ctx: &egui::Context, light: bool) {
         style
             .text_styles
             .insert(egui::TextStyle::Heading, FontId::proportional(22.0));
+    });
+}
+
+fn status_shortcut(ui: &mut egui::Ui, action: &str, keys: &str) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        ui.label(RichText::new(action).size(12.0));
+        egui::Frame::new()
+            .fill(ui.visuals().faint_bg_color)
+            .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+            .corner_radius(3)
+            .inner_margin(egui::Margin::symmetric(5, 2))
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new(shortcut_keys(keys))
+                        .monospace()
+                        .size(12.0)
+                        .color(ui.visuals().text_color()),
+                );
+            });
     });
 }
 
@@ -3342,6 +3365,31 @@ fn encode_key(key: Key, m: Modifiers, mode: TermMode) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn saved_appearance_survives_first_frame_and_system_theme_changes() {
+        for light in [false, true] {
+            let ctx = egui::Context::default();
+            configure_appearance(&ctx, light);
+            let expected = ctx.style().clone();
+            for system_theme in [egui::Theme::Light, egui::Theme::Dark] {
+                let _ = ctx.run(
+                    egui::RawInput {
+                        system_theme: Some(system_theme),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        assert_eq!(ctx.style().visuals.dark_mode, !light);
+                        assert_eq!(ctx.style().visuals.panel_fill, expected.visuals.panel_fill);
+                        assert_eq!(
+                            ctx.style().spacing.button_padding,
+                            expected.spacing.button_padding
+                        );
+                    },
+                );
+            }
+        }
+    }
+
     #[test]
     fn layouts_preserve_pane_identity_when_splitting_and_removing() {
         let a = Uuid::new_v4();
