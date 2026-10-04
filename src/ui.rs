@@ -211,6 +211,7 @@ pub struct App {
     overview: bool,
     selected: Option<String>,
     endpoint: Option<Endpoint>,
+    discovery: Option<crate::discovery::Discovery>,
     error: String,
     writer: SyncSender<Saved>,
     persistence: Option<std::thread::JoinHandle<()>>,
@@ -296,6 +297,7 @@ impl App {
             selected: None,
             error: load_error,
             endpoint: None,
+            discovery: Some(crate::discovery::Discovery::start(cc.egui_ctx.clone())),
             writer,
             persistence: Some(persistence),
             save_error,
@@ -600,23 +602,68 @@ impl App {
         self.add_workspace_in(ctx, self.new_directory.clone());
     }
     fn drain(&mut self) {
+        if let Some(discovery) = &mut self.discovery {
+            let roots = self
+                .panes
+                .iter()
+                .filter_map(|(&pane, state)| state.terminal.shell_pid().map(|pid| (pane, pid)))
+                .collect();
+            if let Some(mut found) = discovery.scan(roots) {
+                found.retain(|&(pane, _, _)| self.panes.contains_key(&pane));
+                self.dirty |= crate::discovery::reconcile(&mut self.saved.sessions, &found, now());
+            }
+        }
         if let Some(endpoint) = &self.endpoint {
             for e in endpoint.receiver.try_iter().take(256) {
                 if !self.panes.contains_key(&e.pane) {
                     continue;
                 }
+                if let Some(existing) = self.saved.sessions.iter().find(|session| {
+                    session.session_id == e.session_id
+                        && session.pane == e.pane
+                        && session.agent == e.agent
+                        && session.observed_process.is_none()
+                }) {
+                    let key = existing.key();
+                    self.saved.sessions.retain(|session| {
+                        let placeholder = session.pane == e.pane
+                            && session.agent == e.agent
+                            && session.observed_process.is_some()
+                            && session.state == SessionState::Unknown;
+                        if placeholder && self.selected.as_deref() == Some(session.key().as_str()) {
+                            self.selected = Some(key.clone());
+                        }
+                        !placeholder
+                    });
+                }
                 let idx = self.saved.sessions.iter().position(|s| {
                     s.session_id == e.session_id && s.pane == e.pane && s.agent == e.agent
                 });
-                let idx = idx.unwrap_or_else(|| {
-                    if self.saved.sessions.len() >= 256 {
-                        self.saved.sessions.remove(0);
+                let idx = idx
+                    .or_else(|| {
+                        self.saved.sessions.iter().position(|session| {
+                            session.pane == e.pane
+                                && session.agent == e.agent
+                                && session.observed_process.is_some()
+                                && session.state == SessionState::Unknown
+                        })
+                    })
+                    .unwrap_or_else(|| {
+                        if self.saved.sessions.len() >= 256 {
+                            self.saved.sessions.remove(0);
+                        }
+                        let mut session = Session::new(e.pane, e.session_id.clone());
+                        session.agent = e.agent;
+                        self.saved.sessions.push(session);
+                        self.saved.sessions.len() - 1
+                    });
+                if self.saved.sessions[idx].observed_process.take().is_some() {
+                    let old_key = self.saved.sessions[idx].key();
+                    self.saved.sessions[idx].session_id = e.session_id.clone();
+                    if self.selected.as_deref() == Some(old_key.as_str()) {
+                        self.selected = Some(self.saved.sessions[idx].key());
                     }
-                    let mut session = Session::new(e.pane, e.session_id.clone());
-                    session.agent = e.agent;
-                    self.saved.sessions.push(session);
-                    self.saved.sessions.len() - 1
-                });
+                }
                 self.dirty |= self.saved.sessions[idx].apply(e, now());
             }
         }
@@ -903,6 +950,8 @@ impl App {
                     section_label(ui, "CODEX");
                     ui.monospace("tessera install-codex-hooks");
                     ui.small("Review and trust the hooks with /hooks in Codex.");
+                    ui.monospace("codex --no-daemon");
+                    ui.small("Start in this pane without the shared background server.");
                     ui.add_space(16.0);
                     if primary_button(ui, "Open terminal").clicked() {
                         self.overview = false;
@@ -1074,7 +1123,11 @@ impl App {
                                                         format!("{} · {}", a.kind, a.detail)
                                                     }
                                                 })
-                                                .unwrap_or_else(|| "Waiting for activity".into());
+                                                .unwrap_or_else(|| if s.observed_process.is_some() {
+                                                    "Agent detected · waiting for lifecycle hooks".into()
+                                                } else {
+                                                    "Waiting for activity".into()
+                                                });
                                             ui.add(
                                                 egui::Label::new(RichText::new(detail).small())
                                                     .truncate(),
@@ -1773,6 +1826,9 @@ impl App {
     }
     fn draw(&mut self, ctx: &egui::Context) {
         self.drain();
+        if self.discovery.is_some() && !self.panes.is_empty() {
+            ctx.request_repaint_after(Duration::from_secs(2));
+        }
         if let Some(error) = self.save_error.lock().ok().and_then(|mut e| e.take()) {
             self.error = error;
         }
@@ -3687,6 +3743,7 @@ mod render_tests {
             overview: true,
             selected,
             endpoint: None,
+            discovery: None,
             error: String::new(),
             writer,
             persistence: None,
@@ -3723,6 +3780,75 @@ mod render_tests {
         )
         .unwrap();
     }
+    #[test]
+    fn first_hook_upgrades_discovered_session_and_preserves_selection() {
+        let ctx = egui::Context::default();
+        let mut app = fixture(0);
+        let directory = tempfile::tempdir().unwrap();
+        app.new_directory = directory.path().to_string_lossy().into_owned();
+        assert!(app.add_workspace(&ctx));
+        let pane = app.saved.workspaces[0].focus;
+        assert!(crate::discovery::reconcile(
+            &mut app.saved.sessions,
+            &[(pane, 123, crate::model::Agent::Codex)],
+            1,
+        ));
+        app.selected = Some(app.saved.sessions[0].key());
+        let (sender, receiver) = sync_channel(1);
+        app.endpoint = Some(Endpoint {
+            path: directory.path().join("unused.sock"),
+            receiver,
+        });
+        sender
+            .send(HookEvent {
+                id: Uuid::new_v4(),
+                pane,
+                sequence: 1,
+                session_id: "actual-conversation".into(),
+                agent: crate::model::Agent::Codex,
+                hook_event_name: "PermissionRequest".into(),
+                detail: "Bash".into(),
+            })
+            .unwrap();
+        app.drain();
+        assert_eq!(app.saved.sessions.len(), 1);
+        let session = &app.saved.sessions[0];
+        assert_eq!(session.session_id, "actual-conversation");
+        assert_eq!(session.state, SessionState::Permission);
+        assert_eq!(session.observed_process, None);
+        assert_eq!(app.selected, Some(session.key()));
+        assert!(!crate::discovery::reconcile(
+            &mut app.saved.sessions,
+            &[(pane, 123, crate::model::Agent::Codex)],
+            2,
+        ));
+        for (sequence, kind) in [(2, "SessionEnd"), (3, "PermissionRequest")] {
+            if sequence == 3 {
+                assert!(crate::discovery::reconcile(
+                    &mut app.saved.sessions,
+                    &[(pane, 123, crate::model::Agent::Codex)],
+                    3,
+                ));
+                app.selected = Some(app.saved.sessions[1].key());
+            }
+            sender
+                .send(HookEvent {
+                    id: Uuid::new_v4(),
+                    pane,
+                    sequence,
+                    session_id: "actual-conversation".into(),
+                    agent: crate::model::Agent::Codex,
+                    hook_event_name: kind.into(),
+                    detail: String::new(),
+                })
+                .unwrap();
+            app.drain();
+        }
+        assert_eq!(app.saved.sessions.len(), 1);
+        assert_eq!(app.saved.sessions[0].history.len(), 3);
+        assert_eq!(app.selected, Some(app.saved.sessions[0].key()));
+    }
+
     #[test]
     fn overview_renders_both_themes_and_narrow_windows() {
         for (name, width, height, light) in [

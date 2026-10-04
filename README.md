@@ -6,7 +6,7 @@ A native terminal workspace for supervising Claude Code and Codex sessions.
 
 Run your usual shell in resizable panes. Switch to **Overview** to see what is running, what needs attention, and what is ready to review. Return to the same live terminal when you need to act.
 
-**0.3.0** redesigns the desktop interface, command center, and app identity. [Release notes](docs/releases/0.3.0.md)
+**0.3.1** makes open agents visible before lifecycle hooks arrive and fixes workspace creation and startup appearance. [Release notes](docs/releases/0.3.1.md)
 
 ## Install
 
@@ -23,7 +23,7 @@ No Rust toolchain or `sudo` needed. The installer verifies release checksums and
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-The command requires a release with installer assets, introduced for 0.3.0. Until it is published, [build from source](docs/development.md) or download a [macOS release](https://github.com/JeremySomsouk/tessera/releases). macOS bundles are ad hoc signed; you may need to approve the first launch. Linux needs an X11/Wayland desktop and OpenGL/EGL runtime libraries. [Installation details](docs/installation.md)
+Installer assets are available from 0.3.0 onward. You can also [build from source](docs/development.md) or download a [macOS release](https://github.com/JeremySomsouk/tessera/releases). macOS bundles are ad hoc signed; you may need to approve the first launch. Linux needs an X11/Wayland desktop and OpenGL/EGL runtime libraries. [Installation details](docs/installation.md)
 
 ## Connect your agents
 
@@ -39,9 +39,9 @@ tessera codex-hooks
 tessera install-codex-hooks
 ```
 
-Run `claude` or `codex` in a Tessera pane. Review the integration in `/hooks`; Codex requires trusting the definitions. Restart existing agent sessions if needed. Hook installation backs up existing configuration. [Integration details and uninstall](docs/integration.md)
+Run `claude` or `codex --no-daemon` in a Tessera pane. Codex's shared daemon can retain another pane's environment or an expired Tessera socket; `--no-daemon` keeps hooks attached to the current pane. Review the integration in `/hooks`; Codex requires trusting the definitions. Restart existing agent sessions if needed. Hook installation backs up existing configuration. [Integration details and uninstall](docs/integration.md)
 
-Approvals stay in the real CLI. Tessera records lifecycle and tool names, not prompts or transcripts. A finished response never accepts a task automatically.
+Open local agents also appear before hooks arrive, labelled **Untracked** until lifecycle tracking starts. Approvals stay in the real CLI. Tessera records lifecycle and tool names, not prompts or transcripts. A finished response never accepts a task automatically.
 
 ## Everyday use
 

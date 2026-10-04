@@ -20,6 +20,8 @@ The current host is independent of view selection but **not of the application p
 
 ## Resource limits
 
+Local agent discovery scans process IDs, parent IDs, and executable names in a background worker at most every two seconds. It is scoped to descendants of live pane shells. Untracked process observations are upgraded in place by lifecycle hooks; they never claim turn activity or approval state. Failed scans do not mean the process exited.
+
 32 workspaces, 32 simultaneously live panes, 256 recorded Claude sessions, 128 activity entries/session, 10,000 scrollback lines/pane, 16 KiB parser chunks, 256 queued terminal commands (64 KiB maximum per input/paste), 256 queued hook events, 64 KiB maximum hook input. Event summaries are bounded to 4 KiB. Overview rows are virtualized and do not paint terminal previews. Idle UI does not request a perpetual frame loop. Persistence is queued and rate-limited to roughly once every two seconds.
 
 Input queue saturation is reported rather than silently accepted. Terminal output bytes are not discarded to improve apparent responsiveness. Clipboard OSC 52 access is denied. Hook payload strings never become shell commands. Hook executable paths are single-quote escaped; installer preserves unrelated groups and refuses malformed/symlink settings files.

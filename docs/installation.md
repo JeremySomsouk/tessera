@@ -19,7 +19,7 @@ On macOS, you can also open Tessera from `~/Applications`. Quit Tessera before r
 Rerun the installer to update Linux. To install a specific release that includes installer assets:
 
 ```sh
-curl -fsSL https://github.com/JeremySomsouk/tessera/releases/latest/download/install.sh | TESSERA_VERSION=0.3.0 sh
+curl -fsSL https://github.com/JeremySomsouk/tessera/releases/latest/download/install.sh | TESSERA_VERSION=0.3.1 sh
 ```
 
 To remove Tessera, first uninstall any agent hooks using the commands below, then remove `~/.local/bin/tessera` and, on macOS, `~/Applications/Tessera.app`. Your saved preferences and history remain.
