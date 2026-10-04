@@ -26,8 +26,8 @@ CI produces separate Intel (`Tessera-x86_64.dmg`) and Apple Silicon (`Tessera-ar
 To publish a version, tag the release commit containing this workflow and push the tag:
 
 ```sh
-git tag v0.4.0
-git push origin v0.4.0
+git tag v0.5.0
+git push origin v0.5.0
 ```
 
 Pushing a version tag (`v` followed by a digit) runs all checks and builds both DMGs, then publishes them on the [GitHub Releases page](https://github.com/JeremySomsouk/tessera/releases) with checked-in release notes when available, otherwise generated notes. New releases stay in draft until both macOS DMGs, signed update feeds, Linux x86-64/ARM64 archives, `SHA256SUMS`, and `install.sh` upload successfully. Linux x86-64 builds use Ubuntu 22.04; ARM64 builds use Ubuntu 24.04. Release tags require the `SPARKLE_ED25519_PRIVATE_KEY` Actions secret; see [update signing](updates.md). A failed publishing job can be rerun to finish the release. Branch pushes and pull requests upload Actions artifacts only.
@@ -50,4 +50,4 @@ Linux source builds need `libxkbcommon-dev`, `libwayland-dev`, and `libegl1-mesa
 
 [Architecture](architecture.md) · [Performance](performance.md) · [Release signing](updates.md)
 
-An explicitly approved release can also be requested by merging a commit whose message starts with `[release v0.4.0]` (use the current package version). After all main-branch verification jobs pass, the tagging job checks that the marker matches Cargo.toml, refuses to overwrite a tag pointing elsewhere, creates the tag on that exact verified commit and dispatches the signed release workflow on the tag. Ordinary merges without a release marker do not create tags. This uses GitHub Actions' temporary token; no personal token is required.
+An explicitly approved release can also be requested by merging a commit whose message starts with `[release v0.5.0]` (use the current package version). After all main-branch verification jobs pass, the tagging job checks that the marker matches Cargo.toml, refuses to overwrite a tag pointing elsewhere, creates the tag on that exact verified commit and dispatches the signed release workflow on the tag. Ordinary merges without a release marker do not create tags. This uses GitHub Actions' temporary token; no personal token is required.

@@ -1,5 +1,11 @@
 # Progress
 
+2026-10-04 — 0.5.0 local specification review and recovery.
+
+Added persisted local scope proposals against an immutable base, side-by-side comparison, explicit accept/cancel, stale-draft and revision conflict rejection, and advanced field-only acceptance. Primary actions remain simple; partial acceptance closes the proposal and discards other fields. Agent output is pasted manually; no automatic agent ingestion is claimed. Revision history compares snapshots with the draft and restores as a new revision after preserving unsaved work. Running sessions retain their pinned revision. Legacy records load with no proposal. Capacity and invalid acceptance failures preserve state.
+
+Package/lockfile and release documentation target 0.5.0. Formatting, Clippy with warnings denied, debug build, two CLI tests (one socket skip), and Python suite (17 pass, one platform skip) pass. Rust unit suite: 82 pass, eight process-directory/lifecycle failures, one socket skip. Unchanged 0.4.0 reproduces precisely those eight failures (77 pass, one skip). New tests cover selective acceptance, proposal persistence, conflicts, invalid fields, immutable launch links, restore/capacity/unsaved preservation, legacy loading, primary actions and hidden advanced controls at two widths. Render fixtures include pending proposals in both themes and minimum windows. Native Mac interaction, release CI, packaging and updater acceptance remain pending. No release published. Remote publication was blocked by automatic approval review; changes are retained locally.
+
 2026-10-04 — 0.4.0 release preparation.
 
 Package, lockfile, README and publishing instructions now target 0.4.0. Release notes cover local specifications, pinned agent launches and recovery/navigation fixes. User authorized merging PR #23 and publishing the v0.4.0 tag after validation. Native interactive acceptance remains pending.
