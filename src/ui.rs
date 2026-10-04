@@ -405,7 +405,20 @@ impl App {
         }
     }
     fn add_workspace(&mut self, ctx: &egui::Context) -> bool {
-        if !self.add_workspace_in(ctx, self.new_directory.clone()) {
+        if self.saved.workspaces.len() >= 32 {
+            self.error = "Workspace limit (32) reached".into();
+            return false;
+        }
+        let directory = self.new_directory.trim();
+        if directory.is_empty() {
+            self.error = "Enter a working directory".into();
+            return false;
+        }
+        if let Err(error) = std::fs::create_dir_all(directory) {
+            self.error = format!("Cannot create working directory {directory}: {error}");
+            return false;
+        }
+        if !self.add_workspace_in(ctx, directory.to_owned()) {
             return false;
         }
         let name = self.new_workspace_name.trim();
@@ -413,6 +426,7 @@ impl App {
             self.saved.workspaces[self.active].task.title = name.to_owned();
         }
         self.new_workspace_name.clear();
+        self.error.clear();
         true
     }
     fn add_workspace_in(&mut self, ctx: &egui::Context, directory: String) -> bool {
@@ -583,7 +597,7 @@ impl App {
         self.active = 0;
         self.overview = false;
         self.dirty = true;
-        self.add_workspace(ctx);
+        self.add_workspace_in(ctx, self.new_directory.clone());
     }
     fn drain(&mut self) {
         if let Some(endpoint) = &self.endpoint {
@@ -1469,6 +1483,11 @@ impl App {
                 .hint_text("Use the directory name"),
         )
         .labelled_by(label.id);
+        ui.label(
+            RichText::new("Missing directories will be created. Name only changes the label.")
+                .small()
+                .color(ui.visuals().weak_text_color()),
+        );
         if !self.error.is_empty() {
             ui.add_space(10.0);
             ui.colored_label(ui.visuals().error_fg_color, &self.error);
@@ -4877,11 +4896,64 @@ mod render_tests {
     }
 
     #[test]
+    fn workspace_creation_makes_missing_directories_and_preserves_state_on_failure() {
+        let ctx = egui::Context::default();
+        let mut app = fixture(0);
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("new project").join("nested");
+        app.new_directory = format!("  {}  ", directory.display());
+        app.new_workspace_name = "  My workspace  ".into();
+        assert!(app.add_workspace(&ctx));
+        assert!(directory.is_dir());
+        assert_eq!(app.saved.workspaces[0].task.title, "My workspace");
+        assert_eq!(
+            app.saved.workspaces[0].task.directory,
+            directory.to_str().unwrap()
+        );
+        assert_eq!(
+            app.panes[&app.saved.workspaces[0].focus]
+                .terminal
+                .current_directory()
+                .unwrap(),
+            directory.canonicalize().unwrap()
+        );
+
+        let file = root.path().join("file");
+        std::fs::write(&file, "occupied").unwrap();
+        app.new_directory = file.join("child").to_string_lossy().into_owned();
+        app.new_workspace_name = "Keep this name".into();
+        assert!(!app.add_workspace(&ctx));
+        assert_eq!(app.saved.workspaces.len(), 1);
+        assert_eq!(app.panes.len(), 1);
+        assert_eq!(app.active, 0);
+        assert_eq!(app.new_workspace_name, "Keep this name");
+        assert!(app.error.contains("Cannot create working directory"));
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "occupied");
+
+        app.new_directory = "   ".into();
+        assert!(!app.add_workspace(&ctx));
+        assert_eq!(app.error, "Enter a working directory");
+        app.new_directory = directory.to_string_lossy().into_owned();
+        assert!(app.add_workspace(&ctx));
+        assert!(app.error.is_empty());
+
+        app.saved
+            .workspaces
+            .resize(32, app.saved.workspaces[0].clone());
+        let blocked = root.path().join("over limit");
+        app.new_directory = blocked.to_string_lossy().into_owned();
+        assert!(!app.add_workspace(&ctx));
+        assert!(!blocked.exists());
+    }
+
+    #[test]
     fn named_workspace_creation_retries_invalid_directory_and_submits_from_name() {
         let ctx = egui::Context::default();
         let mut app = fixture(0);
         let dir = tempfile::tempdir().unwrap();
-        app.new_directory = dir.path().join("missing").to_string_lossy().into_owned();
+        let file = dir.path().join("file");
+        std::fs::write(&file, "occupied").unwrap();
+        app.new_directory = file.to_string_lossy().into_owned();
         app.new_workspace_name = "  Review changes  ".into();
         app.palette = true;
         app.command_page = CommandPage::Create;
@@ -4901,9 +4973,12 @@ mod render_tests {
         assert!(app.saved.workspaces.is_empty());
         assert!(app.palette);
         assert_eq!(app.new_workspace_name, "  Review changes  ");
-        app.new_directory = dir.path().to_string_lossy().into_owned();
+        let project = dir.path().join("new project");
+        app.new_directory = project.to_string_lossy().into_owned();
         ctx.memory_mut(|memory| memory.request_focus(egui::Id::new("new-workspace-name")));
         frame(&mut app, vec![key_event(Key::Enter, None, Modifiers::NONE)]);
+        assert!(project.is_dir());
+        assert!(app.error.is_empty());
         assert_eq!(app.saved.workspaces.len(), 1);
         assert_eq!(app.saved.workspaces[0].task.title, "Review changes");
         assert_eq!(app.saved.workspaces[0].task.directory, app.new_directory);
@@ -4911,10 +4986,7 @@ mod render_tests {
         assert!(!app.palette);
         assert!(app.new_workspace_name.is_empty());
         assert!(app.add_workspace(&ctx));
-        assert_eq!(
-            app.saved.workspaces[1].task.title,
-            dir.path().file_name().unwrap().to_string_lossy()
-        );
+        assert_eq!(app.saved.workspaces[1].task.title, "new project");
     }
 
     #[test]
@@ -4944,14 +5016,16 @@ mod render_tests {
 
         app.palette = true;
         app.command_page = CommandPage::Create;
-        app.new_directory = dir.path().join("missing").to_string_lossy().into_owned();
+        let file = dir.path().join("file");
+        std::fs::write(&file, "occupied").unwrap();
+        app.new_directory = file.to_string_lossy().into_owned();
         frame(&mut app, vec![]);
         ctx.memory_mut(|memory| memory.request_focus(egui::Id::new("workspace-directory")));
         frame(&mut app, vec![key_event(Key::Enter, None, Modifiers::NONE)]);
         assert!(app.palette);
         assert_eq!(app.saved.workspaces.len(), 3);
         assert_eq!(app.panes.len(), 1);
-        assert!(app.error.contains("not a directory"));
+        assert!(app.error.contains("Cannot create working directory"));
 
         app.saved.workspaces[1].task.title = "Unique match".into();
         app.command_page = CommandPage::Commands;
@@ -4985,14 +5059,16 @@ mod render_tests {
             app.overview = overview;
             app.palette = true;
             app.command_page = CommandPage::Create;
-            app.new_directory = dir.path().join("missing").to_string_lossy().into_owned();
+            let file = dir.path().join("file");
+            std::fs::write(&file, "occupied").unwrap();
+            app.new_directory = file.to_string_lossy().into_owned();
             frame(&mut app, vec![]);
             ctx.memory_mut(|memory| memory.request_focus(egui::Id::new("workspace-directory")));
             frame(&mut app, vec![key_event(Key::Enter, None, Modifiers::NONE)]);
             assert!(app.palette);
             assert_eq!(app.overview, overview);
             assert_eq!(app.saved.workspaces.len(), 1);
-            assert!(app.error.contains("not a directory"));
+            assert!(app.error.contains("Cannot create working directory"));
             assert!(ctx.memory(|memory| memory.has_focus(egui::Id::new("workspace-directory"))));
         }
         app.new_directory = dir.path().to_string_lossy().into_owned();
