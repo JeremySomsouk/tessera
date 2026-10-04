@@ -139,9 +139,18 @@ A bundled Noto Sans Symbols 2 fallback covers `✗`, related crosses/checkmarks 
 
 Validation: all 67 Rust tests pass, including Unix socket tests outside the sandbox. New regressions cover startup/history/preferences, invalid-directory recovery, named workspaces, both split directions after `cd`, exact prompt glyph coverage/cell metrics, Ctrl+D split/last-pane cleanup, and panel dismissal in both themes. Formatting, Clippy with warnings denied, release build, Python appcast test, shell syntax and diff checks pass. The local Intel macOS app/DMG passes signature/checksum and 0.2.5/1.2.5 bundle metadata checks; the symbol font license is packaged. Native interactive acceptance remains pending.
 
-
 2026-10-04 — compact terminal chrome and readable shortcuts.
 
 Removed the permanent per-pane Terminal/Select/Find/close row. Find, keyboard selection and stopping the focused pane remain available through shortcuts and workspace-tab context menus. Tabs have wider spacing, padded targets, muted numeric shortcuts and a mint active underline in both themes. The bottom shortcut bar uses a distinct surface and readable action/key pairs that wrap together at the minimum window width. Errors retain a dismiss action and theme-appropriate contrast. The existing render harness also exercises active terminal tabs in light and narrow dark views.
 
 Validation: formatting, Clippy with warnings denied, the full Rust suite including socket tests outside the sandbox, debug build, Python appcast test, shell syntax and diff checks pass. Reviewed rendered light/dark and 640-point layouts; native interactive acceptance remains pending. The installed macOS 27 SDK is incompatible with the available linker, so local checks use the installed macOS 15.4 SDK.
+
+2026-10-04 — immediate terminal selection and text actions.
+
+Primary drags select terminal text directly, including Codex's mouse-reporting screen, without Shift or keyboard copy mode. Selection anchors at the original press; text hover uses the text cursor. Option/Alt-click remains available for application mouse input, and wheel/trackpad routing is unchanged.
+
+Right-click a selection for Copy, Paste into this terminal, Open in new terminal tab, or Search in browser. Actions retain a snapshot while output changes. Browser searches use a percent-encoded Google query in the default browser. Terminal actions flatten line breaks, reject control characters/oversized input, and add no Enter; new tabs inherit the source terminal's current directory. Paste is disabled while Find/copy mode is active or the shell has exited.
+
+Validation: all 71 Rust tests pass, including local PTYs and Unix sockets. Regressions cover ordinary drag/copy without application input leakage, press anchoring and modifier changes, Option/Alt mouse input, context-menu actions at 640px, selection snapshots, encoded Unicode searches, safe paste limits, and source-directory new tabs without command execution. Formatting, Clippy with warnings denied, native debug build, Python appcast test, shell syntax and diff checks pass. Local compilation uses the installed macOS 15.4 SDK because the default 27.0 SDK is incompatible with the installed linker. Native interactive acceptance remains pending.
+
+Conflict follow-up: merged the compact workspace chrome from main, preserving the new tab action dispatch and all selection actions. Updated Find/Select documentation to point to workspace-tab context menus.
