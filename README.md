@@ -6,7 +6,7 @@ A native terminal workspace for supervising Claude Code and Codex sessions.
 
 Run your usual shell in resizable panes. Switch to **Overview** to see what is running, what needs attention, and what is ready to review. Return to the same live terminal when you need to act.
 
-**0.3.1** makes open agents visible before lifecycle hooks arrive and fixes workspace creation and startup appearance. [Release notes](docs/releases/0.3.1.md)
+**0.4.0** adds a local specification board, revision history and pinned Claude/Codex launches, with retained terminal output and clear launch failures. [Release notes](docs/releases/0.4.0.md)
 
 ## Install
 

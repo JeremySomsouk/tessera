@@ -1,5 +1,9 @@
 # Progress
 
+2026-10-04 — 0.4.0 release preparation.
+
+Package, lockfile, README and publishing instructions now target 0.4.0. Release notes cover local specifications, pinned agent launches and recovery/navigation fixes. User authorized merging PR #23 and publishing the v0.4.0 tag after validation. Native interactive acceptance remains pending.
+
 2026-10-04 — specification launch recovery and navigation fixes.
 
 Specification launches retain terminal output after process exit and persist exit codes. Failures are reported once, with installation/PATH/authentication guidance; an In progress card returns to Ready if no other launch is running. Workspace navigation, creation, terminal actions and Overview commands leave Specs consistently; the command shortcut remains available inside Specs. Empty title/scope and invalid directories explain disabled launch actions inline. Regression scenarios cover a missing executable through a real PTY, retained output, one-time errors, workspace clicks and invalid-directory feedback. Native Mac UI acceptance remains pending.
