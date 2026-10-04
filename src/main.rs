@@ -4,6 +4,7 @@ mod integration;
 mod model;
 mod search;
 mod selection;
+mod specs;
 mod terminal;
 mod ui;
 mod updater;

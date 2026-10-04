@@ -158,6 +158,8 @@ struct Workspace {
 }
 #[derive(Default, Clone, Serialize, Deserialize)]
 struct Saved {
+    #[serde(default)]
+    specifications: Vec<crate::specs::Specification>,
     workspaces: Vec<Workspace>,
     sessions: Vec<Session>,
     #[serde(default = "default_font")]
@@ -209,6 +211,9 @@ pub struct App {
     panes: HashMap<Uuid, Pane>,
     active: usize,
     overview: bool,
+    specifications_view: bool,
+    selected_spec: Option<Uuid>,
+    spec_codex: bool,
     selected: Option<String>,
     endpoint: Option<Endpoint>,
     discovery: Option<crate::discovery::Discovery>,
@@ -294,6 +299,9 @@ impl App {
             panes: HashMap::new(),
             active: 0,
             overview: false,
+            specifications_view: false,
+            selected_spec: None,
+            spec_codex: false,
             selected: None,
             error: load_error,
             endpoint: None,
@@ -799,12 +807,23 @@ impl App {
         if self.rename.is_some() || self.closing.is_some() {
             return;
         }
+        if ctx.input_mut(|i| i.consume_key(command | Modifiers::SHIFT, Key::S)) {
+            self.specifications_view = !self.specifications_view;
+        }
+        if ctx.input_mut(|i| i.consume_key(command | Modifiers::SHIFT, Key::O)) {
+            self.overview = if self.specifications_view {
+                true
+            } else {
+                !self.overview
+            };
+            self.specifications_view = false;
+        }
+        if self.specifications_view {
+            return;
+        }
         if ctx.input_mut(|i| i.consume_key(command | Modifiers::SHIFT, Key::R)) {
             self.begin_rename();
             return;
-        }
-        if ctx.input_mut(|i| i.consume_key(command | Modifiers::SHIFT, Key::O)) {
-            self.overview = !self.overview;
         }
         if !self.overview
             && !self.palette
@@ -1239,6 +1258,12 @@ impl App {
             .iter()
             .position(|w| layout_contains(&w.layout, pane));
         let mut open = false;
+        let linked_spec = self.saved.specifications.iter().find_map(|spec| {
+            spec.launches
+                .iter()
+                .find(|launch| launch.pane == pane)
+                .map(|launch| (spec.id, spec.draft.title.clone(), launch.revision))
+        });
         egui::ScrollArea::vertical()
             .id_salt("inspector")
             .max_height(ui.available_height())
@@ -1261,6 +1286,14 @@ impl App {
                     .add_enabled_ui(live, |ui| primary_button(ui, "Open live terminal"))
                     .inner
                     .clicked();
+                if let Some((id, title, revision)) = &linked_spec
+                    && ui
+                        .button(format!("Spec: {title} · revision {revision}"))
+                        .clicked()
+                {
+                    self.selected_spec = Some(*id);
+                    self.specifications_view = true;
+                }
                 if !live {
                     ui.small("Terminal closed · history retained");
                 }
@@ -1824,6 +1857,98 @@ impl App {
             }
         });
     }
+    fn specifications(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.heading("Specifications");
+            if ui.button("+ Specification").clicked() {
+                let directory = self
+                    .saved
+                    .workspaces
+                    .get(self.active)
+                    .map(|w| w.task.directory.clone())
+                    .unwrap_or_else(|| self.new_directory.clone());
+                let spec = crate::specs::Specification::new(directory);
+                self.selected_spec = Some(spec.id);
+                self.saved.specifications.push(spec);
+                self.dirty = true;
+            }
+        });
+        egui::ScrollArea::vertical().id_salt("spec-board").show(ui, |ui| {
+            ui.columns(3, |columns| {
+                for (status, label) in ["Draft", "Ready", "In progress"].iter().enumerate() {
+                    columns[status].strong(*label);
+                    for spec in self.saved.specifications.iter().filter(|s| s.status == status) {
+                        if columns[status].selectable_label(self.selected_spec == Some(spec.id), &spec.draft.title).clicked() { self.selected_spec = Some(spec.id); }
+                    }
+                }
+            });
+            ui.separator();
+            let Some(index) = self.saved.specifications.iter().position(|s| Some(s.id) == self.selected_spec) else { ui.label("Create or select a specification."); return; };
+            let spec = &mut self.saved.specifications[index];
+            ui.label("Title");
+            self.dirty |= ui.text_edit_singleline(&mut spec.draft.title).changed();
+            ui.label("Working directory (must exist)");
+            self.dirty |= ui.text_edit_singleline(&mut spec.draft.directory).changed();
+            ui.horizontal(|ui| {
+                for (status, label) in ["Draft", "Ready", "In progress"].iter().enumerate() {
+                    if ui.selectable_label(spec.status == status, *label).clicked() { spec.status = status; self.dirty = true; }
+                }
+            });
+            ui.label("Specification · Markdown");
+            self.dirty |= ui.add(egui::TextEdit::multiline(&mut spec.draft.markdown).desired_width(f32::INFINITY).desired_rows(10).code_editor()).changed();
+            if ui.button("Save revision").clicked() {
+                match spec.save_revision() { Ok(_) => self.dirty = true, Err(e) => self.error = e.to_string() }
+            }
+            egui::CollapsingHeader::new(format!("Revision history · {}", spec.revisions.len())).show(ui, |ui| {
+                for (i, revision) in spec.revisions.iter().enumerate().rev() {
+                    egui::CollapsingHeader::new(format!("Revision {} · {}", i + 1, revision.title)).id_salt((spec.id, i)).show(ui, |ui| { ui.label(&revision.directory); ui.label(&revision.markdown); });
+                }
+            });
+            ui.separator();
+            ui.horizontal(|ui| { ui.strong("Launch context preview"); ui.selectable_value(&mut self.spec_codex, false, "Claude"); ui.selectable_value(&mut self.spec_codex, true, "Codex"); });
+            ui.label("The current draft is saved as an immutable revision. The agent starts in a new terminal after you confirm Launch agent.");
+            let next = spec.revisions.last().filter(|r| r.title == spec.draft.title && r.markdown == spec.draft.markdown && r.directory == spec.draft.directory).map_or(spec.revisions.len() + 1, |_| spec.revisions.len());
+            let command = crate::specs::command(&spec.draft, next, self.spec_codex);
+            match &command { Ok(command) => { egui::ScrollArea::vertical().id_salt("launch-preview").max_height(100.0).show(ui, |ui| { ui.label(egui::RichText::new(command).monospace()); }); }, Err(e) => { ui.label(e.to_string()); } }
+            let launch = ui.add_enabled(command.is_ok() && !spec.draft.markdown.trim().is_empty() && !spec.draft.title.trim().is_empty() && std::path::Path::new(&spec.draft.directory).is_dir(), egui::Button::new("Launch agent")).clicked();
+            let mut open_pane = None;
+            for launch in spec.launches.iter().rev() {
+                ui.horizontal(|ui| {
+                    ui.label(format!("{} · revision {}", launch.agent, launch.revision));
+                    if ui.add_enabled(self.panes.contains_key(&launch.pane), egui::Button::new("Open terminal")).clicked() { open_pane = Some(launch.pane); }
+                });
+            }
+            if launch {
+                if spec.revisions.len() >= 256 || spec.launches.len() >= 256 { self.error = "Specification revision/launch limit (256) reached".into(); return; }
+                let directory = spec.draft.directory.clone();
+                let title = spec.draft.title.clone();
+                if self.saved.workspaces.len() >= 32 || self.panes.len() >= 32 {
+                    self.error = "Workspace/pane limit (32) reached".into();
+                } else {
+                    let pane = Uuid::new_v4();
+                    let socket = self.endpoint.as_ref().map(|e| e.path.as_path()).unwrap_or_else(|| std::path::Path::new(""));
+                    match Terminal::spawn_agent(pane, std::path::Path::new(&directory), socket, ui.ctx().clone(), command.as_ref().unwrap()) {
+                        Ok(terminal) => {
+                            self.panes.insert(pane, Pane { terminal, search: TerminalSearch::default() });
+                            self.saved.workspaces.push(Workspace { task: Task { id: Uuid::new_v4(), title, directory, state: TaskState::Implementing }, layout: Layout::Pane(pane), focus: pane });
+                            self.active = self.saved.workspaces.len() - 1;
+                            let spec = &mut self.saved.specifications[index];
+                            let revision = spec.save_revision().expect("revision capacity checked before launch");
+                            spec.launches.push(crate::specs::Launch { pane, revision, agent: if self.spec_codex { "Codex" } else { "Claude" }.into() });
+                            spec.status = 2;
+                            self.overview = false;
+                            self.specifications_view = false;
+                            self.dirty = true;
+                        }
+                        Err(e) => self.error = format!("Cannot launch agent: {e}"),
+                    }
+                }
+            }
+            if let Some(pane) = open_pane && let Some(index) = self.saved.workspaces.iter().position(|w| layout_contains(&w.layout, pane)) {
+                self.active = index; self.saved.workspaces[index].focus = pane; self.overview = false; self.specifications_view = false;
+            }
+        });
+    }
     fn draw(&mut self, ctx: &egui::Context) {
         self.drain();
         if self.discovery.is_some() && !self.panes.is_empty() {
@@ -1853,8 +1978,18 @@ impl App {
                     mosaic_mark(ui);
                     ui.label(RichText::new("TESSERA").size(14.0).strong());
                     ui.add_space(18.0);
-                    if ui.selectable_label(!self.overview, "Terminal").clicked() {
+                    if ui
+                        .selectable_label(!self.overview && !self.specifications_view, "Terminal")
+                        .clicked()
+                    {
                         self.overview = false;
+                        self.specifications_view = false;
+                    }
+                    if ui
+                        .selectable_label(self.specifications_view, "Specs")
+                        .clicked()
+                    {
+                        self.specifications_view = true;
                     }
                     let attention = self
                         .saved
@@ -1868,11 +2003,12 @@ impl App {
                         "Overview".into()
                     };
                     if ui
-                        .selectable_label(self.overview, overview)
+                        .selectable_label(self.overview && !self.specifications_view, overview)
                         .on_hover_text(shortcut("Overview", "Shift+O"))
                         .clicked()
                     {
                         self.overview = true;
+                        self.specifications_view = false;
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
@@ -1997,6 +2133,10 @@ impl App {
                     .inner_margin(12.0),
             )
             .show(ctx, |ui| {
+                if self.specifications_view {
+                    self.specifications(ui);
+                    return;
+                }
                 if self.overview {
                     self.overview(ui);
                     return;
@@ -3422,6 +3562,11 @@ fn encode_key(key: Key, m: Modifiers, mode: TermMode) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
     #[test]
+    fn legacy_saved_state_loads_without_specifications() {
+        let saved: Saved = serde_json::from_str(r#"{"workspaces":[],"sessions":[]}"#).unwrap();
+        assert!(saved.specifications.is_empty());
+    }
+    #[test]
     fn saved_appearance_survives_first_frame_and_system_theme_changes() {
         for light in [false, true] {
             let ctx = egui::Context::default();
@@ -3741,6 +3886,9 @@ mod render_tests {
             panes: HashMap::new(),
             active: 0,
             overview: true,
+            specifications_view: false,
+            selected_spec: None,
+            spec_codex: false,
             selected,
             endpoint: None,
             discovery: None,
@@ -3850,8 +3998,36 @@ mod render_tests {
     }
 
     #[test]
+    fn specification_shortcuts_keep_editor_input_out_of_terminals() {
+        let ctx = egui::Context::default();
+        let mut app = fixture(1);
+        app.specifications_view = true;
+        let original = app.saved.workspaces[0].task.title.clone();
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![key_event(Key::R, None, command() | Modifiers::SHIFT)],
+                ..Default::default()
+            },
+            |ctx| app.shortcuts(ctx),
+        );
+        assert!(app.rename.is_none());
+        assert_eq!(app.saved.workspaces[0].task.title, original);
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![key_event(Key::O, None, command() | Modifiers::SHIFT)],
+                ..Default::default()
+            },
+            |ctx| app.shortcuts(ctx),
+        );
+        assert!(!app.specifications_view);
+        assert!(app.overview);
+    }
+    #[test]
     fn overview_renders_both_themes_and_narrow_windows() {
         for (name, width, height, light) in [
+            ("specs-dark", 1180.0, 760.0, false),
+            ("specs-light", 640.0, 700.0, true),
+            ("specs-short", 640.0, 400.0, false),
             ("dark", 1180.0, 760.0, false),
             ("light", 1180.0, 760.0, true),
             ("narrow", 640.0, 700.0, false),
@@ -3868,6 +4044,17 @@ mod render_tests {
             configure_appearance(&ctx, light);
             let mut app = fixture(6);
             let directory = tempfile::tempdir().unwrap();
+            if name.starts_with("specs-") {
+                let mut spec = crate::specs::Specification::new(
+                    directory.path().to_string_lossy().into_owned(),
+                );
+                spec.draft.title = "Add project navigation".into();
+                spec.draft.markdown = "## Goal\nMake project navigation accessible.\n\n## Acceptance\n- Keyboard navigation works\n- Existing routes remain available".into();
+                spec.save_revision().unwrap();
+                app.selected_spec = Some(spec.id);
+                app.saved.specifications.push(spec);
+                app.specifications_view = true;
+            }
             if name.starts_with("terminal-") {
                 app.overview = false;
                 app.saved.workspaces[0].task.directory =

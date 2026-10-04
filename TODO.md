@@ -25,7 +25,7 @@
 - [ ] Native performance instrumentation on Intel 16 GB and Apple Silicon.
 
 ## Then: specifications
-- [ ] Local Markdown board/editor, stable spec revisions, pinned task-launch context preview.
+- [x] Local Markdown board/editor, stable spec revisions, pinned task-launch context preview and Claude/Codex launches.
 - [ ] Claude proposal against a base revision, diff review, stale conflicts, selective acceptance.
 - [ ] Scope amendments with acknowledgement, independent worktrees and collision warnings.
 

@@ -63,6 +63,14 @@ On macOS, use Cmd below. On Linux, replace Cmd with Ctrl+Alt.
 
 Drag terminal text to select it; right-click for copy, paste, new-tab, or browser-search actions. Drop a saved file to paste its path. Neither action submits a command for you. [Full controls and keyboard reference](docs/usage.md)
 
+## Specifications
+
+Open **Specs** (Cmd+Shift+S on macOS, Ctrl+Alt+Shift+S on Linux) to prepare local Markdown cards in Draft, Ready, or In progress. Edit the title, working directory, and scope; **Save revision** retains an immutable snapshot. Revision history remains available after later edits.
+
+Choose Claude or Codex and inspect the exact launch context. **Launch agent** saves the current revision and starts the agent in a new PTY in the existing working directory. Codex uses `--no-daemon`. The command is passed as a quoted literal through an interactive login shell (`$SHELL` for sh/bash/zsh, `/bin/sh` otherwise); the agent executable must be available in that shell's PATH. Hooks and approvals behave as in ordinary agent terminals.
+
+The card lists its launches and opens live terminals. Overview links each session back to its specification and pinned revision. Agent completion never accepts the specification automatically. Specifications, revision text, and launch links are stored locally with preferences; they are sent to the selected agent only on launch. Launch context is limited to 8000 bytes, with up to 256 revisions and launches per specification. GitHub/Jira import and agent-proposed specification changes are future increments.
+
 ## What persists
 
 Preferences and bounded session histories are saved locally. Every launch opens a fresh terminal; previous tabs and splits are not restored. Quitting stops hosted shells.

@@ -181,6 +181,36 @@ impl Terminal {
         Self::spawn_command(id, directory, socket, ctx, command)
     }
 
+    pub fn spawn_agent(
+        id: Uuid,
+        directory: &Path,
+        socket: &Path,
+        ctx: Context,
+        launch: &str,
+    ) -> Result<Self> {
+        // Match ordinary terminal PATH setup while keeping POSIX literal quoting.
+        let preferred = std::env::var("SHELL").unwrap_or_else(|_| {
+            if cfg!(target_os = "macos") {
+                "/bin/zsh".into()
+            } else {
+                "/bin/sh".into()
+            }
+        });
+        let shell = if matches!(
+            Path::new(&preferred)
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("sh" | "bash" | "zsh")
+        ) {
+            preferred.as_str()
+        } else {
+            "/bin/sh"
+        };
+        let mut command = CommandBuilder::new(shell);
+        command.args(["-lic", &format!("exec {launch}")]);
+        Self::spawn_command(id, directory, socket, ctx, command)
+    }
+
     #[cfg(test)]
     pub(crate) fn spawn_test(
         id: Uuid,
@@ -697,6 +727,40 @@ mod tests {
 
 #[cfg(test)]
 mod pty_tests {
+    #[test]
+    fn agent_launch_uses_real_pty_directory_and_hook_environment() {
+        let directory = tempfile::tempdir().unwrap();
+        let id = uuid::Uuid::new_v4();
+        let terminal = super::Terminal::spawn_agent(
+            id,
+            directory.path(),
+            &directory.path().join("hooks.sock"),
+            eframe::egui::Context::default(),
+            "printf 'READY:%s:%s' \"$TESSERA_PANE\" \"$PWD\"",
+        )
+        .unwrap();
+        let expected = format!("READY:{id}:");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let output: String = terminal
+                .term
+                .lock()
+                .unwrap()
+                .grid()
+                .display_iter()
+                .map(|cell| cell.cell.c)
+                .collect();
+            if output.contains(&expected) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Agent launch output missing: {output}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     use super::*;
     #[test]
     fn fixture_shell_accepts_immediate_input_and_preserves_pane_environment() {
