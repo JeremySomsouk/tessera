@@ -8,6 +8,8 @@ Real login shell in a PTY, inherited environment/startup files, PTY resizing, pa
 
 Portable tests: real shell input/output and resize (`stty size`), cursor-position query while output continues, alternate-screen restoration, a wide UTF-8 glyph, Ctrl+C encoding, application cursor encoding, split/remove identity preservation. Additional regressions cover OSC foreground/background replies (including dynamic overrides), cursor-style requests, keyboard selection of wide/combining/wrapped text, copy after shell exit, copy-mode input isolation, custom-title number shortcuts with physical keys, stacked split routing, and workspace dialog Enter actions. Wheel regressions cover small trackpad deltas, mouse/alternate-screen/history routing, modifiers and legacy/SGR encoding. UI geometry/rendering tested headlessly in both appearances and at 640px width.
 
+Automated PTY fixtures run an interactive Bash shell with startup files and line editing disabled, an isolated environment, and a fixed prompt that must appear before input is sent. They exercise UTF-8 directory changes even in the C locale without depending on the runner’s login configuration. Application terminals continue to use the configured login shell and inherited environment.
+
 ## Native acceptance checklist (not yet performed)
 
 - macOS Intel + Apple Silicon launch, quit, reopen into a fresh terminal, Unicode text and font fallback.

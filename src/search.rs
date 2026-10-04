@@ -286,7 +286,7 @@ mod tests {
     #[test]
     fn search_controls_fit_narrow_panes_in_both_themes() {
         let ctx = egui::Context::default();
-        let terminal = Terminal::spawn(
+        let terminal = Terminal::spawn_test(
             uuid::Uuid::new_v4(),
             &std::env::current_dir().unwrap(),
             std::path::Path::new("/tmp/unused-search-test.sock"),

@@ -167,12 +167,8 @@ pub struct Terminal {
     launch_directory: PathBuf,
 }
 impl Terminal {
+    #[cfg(not(test))]
     pub fn spawn(id: Uuid, directory: &Path, socket: &Path, ctx: Context) -> Result<Self> {
-        let size = Size {
-            cols: 100,
-            rows: 30,
-        };
-        let pair = native_pty_system().openpty(size.pty())?;
         let shell = std::env::var("SHELL").unwrap_or_else(|_| {
             if cfg!(target_os = "macos") {
                 "/bin/zsh".into()
@@ -182,6 +178,64 @@ impl Terminal {
         });
         let mut command = CommandBuilder::new(shell);
         command.arg("-l");
+        Self::spawn_command(id, directory, socket, ctx, command)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn spawn_test(
+        id: Uuid,
+        directory: &Path,
+        socket: &Path,
+        ctx: Context,
+    ) -> Result<Self> {
+        // Run an interactive shell without login files or a line editor. In
+        // particular, Readline in a C locale can reinterpret UTF-8 path bytes.
+        // Wait for explicit readiness instead of racing shell initialization.
+        let mut command = CommandBuilder::new("/bin/bash");
+        command.args(["--noprofile", "--norc", "--noediting", "-i"]);
+        command.env_clear();
+        command.env("PATH", "/usr/bin:/bin");
+        command.env("HOME", std::env::temp_dir());
+        command.env("HISTFILE", "/dev/null");
+        command.env("LC_ALL", "C");
+        command.env("PS1", "TESSERA_TEST_READY> ");
+        command.env("PS2", "");
+        let terminal = Self::spawn_command(id, directory, socket, ctx, command)?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let output: String = terminal
+                .term
+                .lock()
+                .unwrap()
+                .grid()
+                .display_iter()
+                .map(|cell| cell.cell.c)
+                .collect();
+            if output.contains("TESSERA_TEST_READY> ") {
+                return Ok(terminal);
+            }
+            if !terminal.alive.load(Ordering::Acquire) || std::time::Instant::now() >= deadline {
+                bail!(
+                    "test shell did not become ready; output: {output:?}; PTY error: {:?}",
+                    terminal.error.lock().unwrap()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn spawn_command(
+        id: Uuid,
+        directory: &Path,
+        socket: &Path,
+        ctx: Context,
+        mut command: CommandBuilder,
+    ) -> Result<Self> {
+        let size = Size {
+            cols: 100,
+            rows: 30,
+        };
+        let pair = native_pty_system().openpty(size.pty())?;
         command.cwd(directory);
         command.env("TERM", "xterm-256color");
         command.env("COLORTERM", "truecolor");
@@ -642,9 +696,47 @@ mod tests {
 mod pty_tests {
     use super::*;
     #[test]
+    fn fixture_shell_accepts_immediate_input_and_preserves_pane_environment() {
+        let directory = tempfile::tempdir().unwrap();
+        let nested = directory.path().join("nested folder α");
+        std::fs::create_dir(&nested).unwrap();
+        let nested = nested.canonicalize().unwrap();
+        let output = directory.path().join("environment");
+        let socket = directory.path().join("test.sock");
+        let id = Uuid::new_v4();
+        let terminal =
+            Terminal::spawn_test(id, directory.path(), &socket, Context::default()).unwrap();
+        let quote = |path: &Path| path.to_string_lossy().replace('\'', "'\\''");
+        terminal
+            .input(
+                format!(
+                    "cd -- '{}'; printf '%s\\n' \"$TESSERA_PANE\" \"$TESSERA_SOCKET\" \"$TERM\" \"$COLORTERM\" \"$PWD\" > '{}'\r",
+                    quote(&nested),
+                    quote(&output),
+                )
+                .into_bytes(),
+            )
+            .unwrap();
+        let expected = format!(
+            "{id}\n{}\nxterm-256color\ntruecolor\n{}\n",
+            socket.display(),
+            nested.display(),
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !std::fs::read_to_string(&output).is_ok_and(|text| text == expected) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "first command did not execute with the expected pane environment"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(terminal.current_directory().unwrap(), nested);
+    }
+
+    #[test]
     fn reaped_shell_is_not_signalled_again_when_pane_closes() {
         let ctx = Context::default();
-        let mut terminal = Terminal::spawn(
+        let mut terminal = Terminal::spawn_test(
             Uuid::new_v4(),
             &std::env::current_dir().unwrap(),
             Path::new("/tmp/unused-test.sock"),
@@ -695,7 +787,7 @@ mod pty_tests {
     }
     #[test]
     fn scrollback_movement_is_queued_while_terminal_state_is_busy() {
-        let terminal = Terminal::spawn(
+        let terminal = Terminal::spawn_test(
             Uuid::new_v4(),
             &std::env::current_dir().unwrap(),
             Path::new(""),
@@ -723,7 +815,7 @@ mod pty_tests {
 
     #[test]
     fn typing_and_paste_return_to_live_input_even_under_contention() {
-        let terminal = Terminal::spawn(
+        let terminal = Terminal::spawn_test(
             Uuid::new_v4(),
             &std::env::current_dir().unwrap(),
             Path::new(""),
@@ -757,7 +849,7 @@ mod pty_tests {
     fn real_shell_input_resize_and_protocol_response() {
         let ctx = Context::default();
         let directory = std::env::current_dir().unwrap();
-        let mut terminal = Terminal::spawn(
+        let mut terminal = Terminal::spawn_test(
             Uuid::new_v4(),
             &directory,
             Path::new("/tmp/unused-tessera-test.sock"),
