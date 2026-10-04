@@ -13,7 +13,7 @@ SHA = "a" * 40
 class TagReleaseTests(unittest.TestCase):
     def test_marker_must_match_package_and_be_unambiguous(self):
         self.assertEqual(release.release_tag("[release v0.4.0] Release", "0.4.0"), "v0.4.0")
-        for message in ["ordinary merge", "[release v0.3.1]", "[release v0.4.0] [release v0.4.0]"]:
+        for message in ["ordinary merge", "Mention in body: [release v0.4.0]", "[release v0.3.1]", "[release v0.4.0] [release v0.4.0]"]:
             with self.assertRaises(ValueError):
                 release.release_tag(message, "0.4.0")
 

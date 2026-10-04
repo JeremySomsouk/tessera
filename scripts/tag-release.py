@@ -4,12 +4,11 @@ import os
 from pathlib import Path
 import re
 import subprocess
-import tomllib
 
 
 def release_tag(message, version):
     markers = re.findall(r"\[release (v[0-9]+\.[0-9]+\.[0-9]+)\]", message)
-    if len(markers) != 1 or markers[0] != f"v{version}":
+    if len(markers) != 1 or markers[0] != f"v{version}" or not message.startswith(f"[release {markers[0]}]"):
         raise ValueError("Exactly one release marker matching Cargo.toml is required")
     return markers[0]
 
@@ -34,6 +33,10 @@ def publish(tag, commit, repository):
 
 
 def main():
+    # Only the ubuntu-latest tagging job needs Python 3.11+ TOML parsing.
+    # Pure validation/publishing helpers remain importable by Python 3.10 CI.
+    import tomllib
+
     if os.environ.get("GITHUB_REF") != "refs/heads/main":
         raise ValueError("Release tagging requires the main branch")
     version = tomllib.loads(Path("Cargo.toml").read_text())["package"]["version"]
