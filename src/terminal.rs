@@ -149,6 +149,7 @@ fn protocol_reply(term: &Term<Listener>, event: Event) -> Option<Vec<u8>> {
 struct ProcessLifecycle {
     killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
     exited: bool,
+    exit_code: Option<u32>,
 }
 pub struct Terminal {
     pub term: Arc<Mutex<Term<Listener>>>,
@@ -276,6 +277,7 @@ impl Terminal {
         let lifecycle = Arc::new(Mutex::new(ProcessLifecycle {
             killer: child.clone_killer(),
             exited: false,
+            exit_code: None,
         }));
         drop(pair.slave);
         let mut reader = pair.master.try_clone_reader()?;
@@ -416,7 +418,8 @@ impl Terminal {
                 }
                 let exited = {
                     let mut life = host_lifecycle.lock().unwrap();
-                    if matches!(child.try_wait(), Ok(Some(_))) {
+                    if let Ok(Some(status)) = child.try_wait() {
+                        life.exit_code = Some(status.exit_code());
                         life.exited = true;
                         true
                     } else {
@@ -521,6 +524,9 @@ impl Terminal {
         {
             self.size = size;
         }
+    }
+    pub fn exit_code(&self) -> Option<u32> {
+        self.lifecycle.lock().ok().and_then(|life| life.exit_code)
     }
     pub fn paste(&self, s: &str) -> Result<()> {
         let bracketed = self.mode().contains(TermMode::BRACKETED_PASTE);

@@ -469,6 +469,7 @@ impl App {
         });
         self.active = self.saved.workspaces.len() - 1;
         self.overview = false;
+        self.specifications_view = false;
         self.dirty = true;
         true
     }
@@ -495,6 +496,7 @@ impl App {
             w.focus = id;
             self.dirty = true;
             self.overview = false;
+            self.specifications_view = false;
             self.maximized = false;
         }
     }
@@ -606,6 +608,7 @@ impl App {
         }
         self.active = 0;
         self.overview = false;
+        self.specifications_view = false;
         self.dirty = true;
         self.add_workspace_in(ctx, self.new_directory.clone());
     }
@@ -681,7 +684,38 @@ impl App {
             .filter_map(|(&id, pane)| pane.terminal.has_exited().then_some(id))
             .collect();
         for id in exited {
-            self.stop_terminal(id);
+            let code = self.panes[&id].terminal.exit_code();
+            let mut linked = false;
+            for spec in &mut self.saved.specifications {
+                if let Some(launch) = spec.launches.iter_mut().find(|launch| launch.pane == id) {
+                    linked = true;
+                    if launch.exit_code.is_none()
+                        && let Some(code) = code
+                    {
+                        launch.exit_code = Some(code);
+                        self.dirty = true;
+                        if code != 0 {
+                            self.error = format!(
+                                "{} exited with code {code}. Output is retained in its terminal; check installation, PATH and authentication, then retry from Specs.",
+                                launch.agent
+                            );
+                            if spec.status == 2
+                                && !spec.launches.iter().any(|launch| {
+                                    self.panes
+                                        .get(&launch.pane)
+                                        .is_some_and(|pane| !pane.terminal.has_exited())
+                                })
+                            {
+                                spec.status = 1;
+                            }
+                        }
+                    }
+                }
+            }
+            // Spec launches retain their output until explicitly closed.
+            if !linked {
+                self.stop_terminal(id);
+            }
         }
         for s in &mut self.saved.sessions {
             if s.state != SessionState::Ended
@@ -713,6 +747,7 @@ impl App {
                 self.active = i;
                 w.focus = pane;
                 self.overview = false;
+                self.specifications_view = false;
                 self.maximized = false;
                 return;
             }
@@ -819,6 +854,9 @@ impl App {
             self.specifications_view = false;
         }
         if self.specifications_view {
+            if ctx.input_mut(|i| i.consume_key(command | Modifiers::SHIFT, Key::P)) {
+                self.open_commands(CommandPage::Commands);
+            }
             return;
         }
         if ctx.input_mut(|i| i.consume_key(command | Modifiers::SHIFT, Key::R)) {
@@ -889,6 +927,7 @@ impl App {
         {
             self.active = index;
             self.overview = false;
+            self.specifications_view = false;
             self.palette = false;
             self.maximized = false;
         }
@@ -974,6 +1013,7 @@ impl App {
                     ui.add_space(16.0);
                     if primary_button(ui, "Open terminal").clicked() {
                         self.overview = false;
+                        self.specifications_view = false;
                     }
                 });
             return;
@@ -1212,6 +1252,7 @@ impl App {
         {
             if ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
                 self.overview = false;
+                self.specifications_view = false;
             }
             let ids: Vec<_> = visible
                 .iter()
@@ -1234,6 +1275,7 @@ impl App {
                 }
                 if ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
                     self.overview = false;
+                    self.specifications_view = false;
                 }
             }
         }
@@ -1383,7 +1425,7 @@ impl App {
         pane_action: &mut Option<(Uuid, &'static str)>,
     ) {
         for (index, w) in self.saved.workspaces.iter().enumerate() {
-            let selected = index == self.active && !self.overview;
+            let selected = index == self.active && !self.overview && !self.specifications_view;
             let title = format!("{}   {}", index + 1, w.task.title);
             let response = command_row(
                 ui,
@@ -1432,6 +1474,7 @@ impl App {
                         *pane_action = Some((w.focus, action));
                         self.active = index;
                         self.overview = false;
+                        self.specifications_view = false;
                         self.maximized = false;
                         ui.close();
                     }
@@ -1440,6 +1483,7 @@ impl App {
             if response.clicked() {
                 self.active = index;
                 self.overview = false;
+                self.specifications_view = false;
                 self.maximized = false;
             }
         }
@@ -1718,6 +1762,7 @@ impl App {
                 CommandAction::Workspace(index) => {
                     self.active = index;
                     self.overview = false;
+                    self.specifications_view = false;
                     self.maximized = false;
                     self.palette = false;
                 }
@@ -1729,7 +1774,12 @@ impl App {
                     self.command_page = CommandPage::Settings;
                 }
                 CommandAction::Overview => {
-                    self.overview = !self.overview;
+                    self.overview = if self.specifications_view {
+                        true
+                    } else {
+                        !self.overview
+                    };
+                    self.specifications_view = false;
                     self.palette = false;
                 }
                 CommandAction::Split | CommandAction::Stack => {
@@ -1739,6 +1789,7 @@ impl App {
                 CommandAction::Maximize => {
                     self.maximized = !self.maximized;
                     self.overview = false;
+                    self.specifications_view = false;
                     self.palette = false;
                 }
                 CommandAction::Rename => self.begin_rename(),
@@ -1910,11 +1961,14 @@ impl App {
             let next = spec.revisions.last().filter(|r| r.title == spec.draft.title && r.markdown == spec.draft.markdown && r.directory == spec.draft.directory).map_or(spec.revisions.len() + 1, |_| spec.revisions.len());
             let command = crate::specs::command(&spec.draft, next, self.spec_codex);
             match &command { Ok(command) => { egui::ScrollArea::vertical().id_salt("launch-preview").max_height(100.0).show(ui, |ui| { ui.label(egui::RichText::new(command).monospace()); }); }, Err(e) => { ui.label(e.to_string()); } }
+            if spec.draft.title.trim().is_empty() { ui.colored_label(ui.visuals().error_fg_color, "Enter a specification title."); }
+            if spec.draft.markdown.trim().is_empty() { ui.colored_label(ui.visuals().error_fg_color, "Write the specification before launching."); }
+            if !std::path::Path::new(&spec.draft.directory).is_dir() { ui.colored_label(ui.visuals().error_fg_color, "Choose an existing working directory."); }
             let launch = ui.add_enabled(command.is_ok() && !spec.draft.markdown.trim().is_empty() && !spec.draft.title.trim().is_empty() && std::path::Path::new(&spec.draft.directory).is_dir(), egui::Button::new("Launch agent")).clicked();
             let mut open_pane = None;
             for launch in spec.launches.iter().rev() {
                 ui.horizontal(|ui| {
-                    ui.label(format!("{} · revision {}", launch.agent, launch.revision));
+                    ui.label(format!("{} · revision {} · {}", launch.agent, launch.revision, launch.exit_code.map_or_else(|| "Started".into(), |code| if code == 0 { "Finished".into() } else { format!("Failed (exit {code})") })));
                     if ui.add_enabled(self.panes.contains_key(&launch.pane), egui::Button::new("Open terminal")).clicked() { open_pane = Some(launch.pane); }
                 });
             }
@@ -1934,10 +1988,10 @@ impl App {
                             self.active = self.saved.workspaces.len() - 1;
                             let spec = &mut self.saved.specifications[index];
                             let revision = spec.save_revision().expect("revision capacity checked before launch");
-                            spec.launches.push(crate::specs::Launch { pane, revision, agent: if self.spec_codex { "Codex" } else { "Claude" }.into() });
+                            spec.launches.push(crate::specs::Launch { pane, revision, agent: if self.spec_codex { "Codex" } else { "Claude" }.into(), exit_code: None });
                             spec.status = 2;
                             self.overview = false;
-                            self.specifications_view = false;
+                self.specifications_view = false;
                             self.dirty = true;
                         }
                         Err(e) => self.error = format!("Cannot launch agent: {e}"),
@@ -1945,7 +1999,8 @@ impl App {
                 }
             }
             if let Some(pane) = open_pane && let Some(index) = self.saved.workspaces.iter().position(|w| layout_contains(&w.layout, pane)) {
-                self.active = index; self.saved.workspaces[index].focus = pane; self.overview = false; self.specifications_view = false;
+                self.active = index; self.saved.workspaces[index].focus = pane; self.overview = false;
+                self.specifications_view = false;
             }
         });
     }
@@ -3995,6 +4050,125 @@ mod render_tests {
         assert_eq!(app.saved.sessions.len(), 1);
         assert_eq!(app.saved.sessions[0].history.len(), 3);
         assert_eq!(app.selected, Some(app.saved.sessions[0].key()));
+    }
+
+    #[test]
+    fn specification_workspace_click_returns_to_terminal() {
+        let ctx = egui::Context::default();
+        let mut app = fixture(1);
+        app.specifications_view = true;
+        let frame = |app: &mut App, events| {
+            ctx.run(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default()
+                        .show(ctx, |ui| app.workspace_navigation(ui, true, &mut None));
+                },
+            )
+        };
+        let out = frame(&mut app, vec![]);
+        let pos = out
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text) if text.galley.text().starts_with("1   ") => {
+                    Some(text.pos + Vec2::new(10.0, 5.0))
+                }
+                _ => None,
+            })
+            .unwrap();
+        frame(
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Modifiers::NONE,
+                },
+            ],
+        );
+        frame(
+            &mut app,
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Modifiers::NONE,
+            }],
+        );
+        assert!(!app.specifications_view);
+        assert!(!app.overview);
+    }
+
+    #[test]
+    fn specification_failed_launch_retains_output_and_reports_failure() {
+        let ctx = egui::Context::default();
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = fixture(0);
+        let pane = Uuid::new_v4();
+        let terminal = Terminal::spawn_agent(
+            pane,
+            directory.path(),
+            std::path::Path::new(""),
+            ctx,
+            "tessera_deliberately_missing_agent",
+        )
+        .unwrap();
+        app.panes.insert(
+            pane,
+            Pane {
+                terminal,
+                search: TerminalSearch::default(),
+            },
+        );
+        let mut spec =
+            crate::specs::Specification::new(directory.path().to_string_lossy().into_owned());
+        spec.status = 2;
+        spec.launches.push(crate::specs::Launch {
+            pane,
+            revision: 1,
+            agent: "Claude".into(),
+            exit_code: None,
+        });
+        app.saved.specifications.push(spec);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !app.panes[&pane].terminal.has_exited() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        app.drain();
+        assert!(app.panes.contains_key(&pane));
+        assert_eq!(app.saved.specifications[0].launches[0].exit_code, Some(127));
+        assert_eq!(app.saved.specifications[0].status, 1);
+        assert!(app.error.contains("exited with code 127"));
+        app.error.clear();
+        app.drain();
+        assert!(app.error.is_empty(), "dismissed error must not reappear");
+    }
+
+    #[test]
+    fn specification_invalid_directory_explains_disabled_launch() {
+        let ctx = egui::Context::default();
+        let mut app = fixture(0);
+        let mut spec = crate::specs::Specification::new("/tessera/nonexistent/path".into());
+        spec.draft.markdown = "Scope".into();
+        app.selected_spec = Some(spec.id);
+        app.saved.specifications.push(spec);
+        let out = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1180.0, 1400.0))),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| app.specifications(ui));
+            },
+        );
+        assert!(out.shapes.iter().any(|shape| matches!(&shape.shape, egui::epaint::Shape::Text(text) if text.galley.text().contains("Choose an existing working directory"))));
     }
 
     #[test]

@@ -12,6 +12,8 @@ pub struct Launch {
     pub pane: Uuid,
     pub revision: usize,
     pub agent: String,
+    #[serde(default)]
+    pub exit_code: Option<u32>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Specification {

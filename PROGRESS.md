@@ -1,5 +1,9 @@
 # Progress
 
+2026-10-04 — specification launch recovery and navigation fixes.
+
+Specification launches retain terminal output after process exit and persist exit codes. Failures are reported once, with installation/PATH/authentication guidance; an In progress card returns to Ready if no other launch is running. Workspace navigation, creation, terminal actions and Overview commands leave Specs consistently; the command shortcut remains available inside Specs. Empty title/scope and invalid directories explain disabled launch actions inline. Regression scenarios cover a missing executable through a real PTY, retained output, one-time errors, workspace clicks and invalid-directory feedback. Native Mac UI acceptance remains pending.
+
 2026-10-04 — local specifications and agent launch.
 
 Added a local Draft/Ready/In progress board, Markdown editor, immutable deduplicated revision history, working-directory selection, exact launch-context preview, and Claude/Codex launch into a new real PTY. Launches pin a revision and pane identity; Overview links sessions back to the specification, including closed-session history. Cards reopen live terminals. Cmd+Shift+S (Ctrl+Alt+Shift+S on Linux) opens Specs; Overview navigation remains available. Agent completion does not accept a task/spec automatically.
