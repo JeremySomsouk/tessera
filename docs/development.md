@@ -50,4 +50,6 @@ Linux source builds need `libxkbcommon-dev`, `libwayland-dev`, and `libegl1-mesa
 
 [Architecture](architecture.md) · [Performance](performance.md) · [Release signing](updates.md)
 
+For a separate native smoke session, set `TESSERA_STATE_PATH` to an absolute file inside a temporary directory before launching the debug executable. This isolates saved work and preferences from your normal Tessera instance. Stop only that test process when finished; quitting the normal application also stops its hosted shells.
+
 An explicitly approved release can also be requested by merging a commit whose message starts with `[release v0.5.0]` (use the current package version). After all main-branch verification jobs pass, the tagging job checks that the marker matches Cargo.toml, refuses to overwrite a tag pointing elsewhere, creates the tag on that exact verified commit and dispatches the signed release workflow on the tag. Ordinary merges without a release marker do not create tags. This uses GitHub Actions' temporary token; no personal token is required.

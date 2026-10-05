@@ -4,9 +4,9 @@
 
 A native terminal workspace for supervising Claude Code and Codex sessions.
 
-Run your usual shell in resizable panes. Switch to **Overview** to see what is running, what needs attention, and what is ready to review. Return to the same live terminal when you need to act.
+Run your usual shell in resizable panes. Open **Work** to see which piece of work needs a decision, inspect its linked Claude Code or Codex sessions, and return to the same terminal to act.
 
-**0.5.4** adds workspace cleanup controls, a resizable sidebar, stable split-terminal redraws, and automatic terminal fonts with icon fallbacks. [Release notes](docs/releases/0.5.4.md)
+**0.6.0** introduces durable work items, explicit developer stages, grouped sessions, and an attention queue with separate history. [Release notes](docs/releases/0.6.0.md)
 
 ## Install
 
@@ -45,14 +45,14 @@ Open local agents also appear before hooks arrive, labelled **Untracked** until 
 
 ## Everyday use
 
-Use **Terminal** and **Overview** to switch views. **+ Workspace** opens a directory, creating it if needed. The optional name sets the workspace label. **Commands** searches workspaces and actions; Up/Down select, Enter opens, Escape closes. **Settings** holds appearance, terminal behavior, and updates.
+Use **Terminal** and **Work** to switch views. **+ Workspace** opens a directory, creating it if needed. The optional name sets the workspace label. **Commands** searches workspaces and actions; Up/Down select, Enter opens, Escape closes. **Settings** holds appearance, terminal behavior, and updates.
 
 On macOS, use Cmd below. On Linux, replace Cmd with Ctrl+Alt.
 
 | Action | Shortcut |
 | --- | --- |
 | Commands / workspace picker | Cmd+Shift+P |
-| Overview / previous terminal | Cmd+Shift+O |
+| Work / previous terminal | Cmd+Shift+O |
 | New workspace in the current directory | Cmd+N or Cmd+T |
 | Split side by side / stacked | Cmd+D / Cmd+Shift+D |
 | Focus neighboring split pane | Cmd+← / → / ↑ / ↓ |
@@ -64,17 +64,21 @@ On macOS, use Cmd below. On Linux, replace Cmd with Ctrl+Alt.
 
 Drag terminal text to select it; right-click for copy, paste, new-tab, or browser-search actions. Drop a saved file to paste its path. Neither action submits a command for you. [Full controls and keyboard reference](docs/usage.md)
 
-## Specifications
+## Work and specifications
 
-Open **Specs** (Cmd+Shift+S on macOS, Ctrl+Alt+Shift+S on Linux) to prepare local Markdown cards in Draft, Ready, or In progress. Edit the title, working directory, and scope; **Save revision** retains an immutable snapshot. Revision history remains available after later edits.
+Work keeps the developer stage separate from agent activity. Choose Define, Plan, Build, Verify, Review or Deliver explicitly. Completed and archived work moves to History; changing a stage does not certify tests, review or delivery. Attention prioritizes observed permission/input requests and uninspected response endings. Raw hook events remain available under tracking details.
 
-Choose Claude or Codex and inspect the exact launch context. **Launch agent** saves the current revision and starts the agent in a new PTY in the existing working directory. Codex uses `--no-daemon`. The command is passed as a quoted literal through an interactive login shell (`$SHELL` for sh/bash/zsh, `/bin/sh` otherwise); the agent executable must be available in that shell's PATH. Hooks and approvals behave as in ordinary agent terminals.
+Ordinary Claude Code and Codex sessions receive lightweight work context. Attach related sessions to the same work item when they share a purpose; sessions in a single terminal workspace can belong to different work. Work titles, directories, stages, specification links and session associations survive terminal closure and application restart. An observed response ending never advances a stage or completes the work automatically.
 
-The card lists its launches, pinned revisions and exit results. Agent terminals retain their output after exit until explicitly closed; failed launches show an error and return an In progress card to Ready when no other launch is still running. The card opens running or retained terminals. Overview links each session back to its specification and pinned revision. Agent completion never accepts the specification automatically. Specifications, revision text, and launch links are stored locally with preferences; they are sent to the selected agent only on launch. Launch context is limited to 8000 bytes, with up to 256 revisions and launches per specification. GitHub/Jira import and agent-proposed specification changes are future increments.
+Select a work item and use **Add specification** or **Open specification and revisions** to prepare local Markdown scope. Edit the title, working directory, and scope; **Save revision** retains an immutable snapshot. Revision history remains available after later edits. Cmd+Shift+S (Ctrl+Alt+Shift+S on Linux) opens specification editing through Work.
+
+Choose Claude or Codex and inspect the exact launch context. **Launch implementation** saves the current revision and starts the agent in a new PTY in the working directory. This launcher explicitly requests implementation; use the terminal for investigation, planning, verification and review. Launching does not change the work stage. Codex uses `--no-daemon`. The command is passed as a quoted literal through an interactive login shell (`$SHELL` for sh/bash/zsh, `/bin/sh` otherwise); the agent executable must be available in that shell's PATH. Hooks and approvals behave as in ordinary agent terminals.
+
+The editor lists launches, pinned revisions and exit results. Agent terminals retain their output after exit until explicitly closed; failed launches show an error. Work links sessions back to their launch specification and pinned revision. Agent completion never accepts the specification automatically. Specifications, revision text, and launch links are stored locally with preferences; they are sent to the selected agent only on launch. Launch context is limited to 8000 bytes, with up to 256 revisions and launches per specification. GitHub/Jira import and agent-proposed specification changes are future increments.
 
 ## What persists
 
-Preferences and bounded session histories are saved locally. Every launch opens a fresh terminal; previous tabs and splits are not restored. Quitting stops hosted shells.
+Preferences, bounded work items, specifications and session histories are saved locally. Every launch opens a fresh terminal; previous tabs and splits are not restored. Retained work does not reconnect old processes. Quitting stops hosted shells.
 
 The macOS app downloads signed updates and installs them when you quit. On Linux, rerun the installer. Tessera is still an alpha: one window, local sessions, and an initial terminal renderer. [Terminal compatibility](docs/terminal-compatibility.md) · [Updates](docs/updates.md)
 
