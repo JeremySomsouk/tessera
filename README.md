@@ -55,6 +55,7 @@ On macOS, use Cmd below. On Linux, replace Cmd with Ctrl+Alt.
 | Overview / previous terminal | Cmd+Shift+O |
 | New workspace in the current directory | Cmd+N or Cmd+T |
 | Split side by side / stacked | Cmd+D / Cmd+Shift+D |
+| Focus neighboring split pane | Cmd+← / → / ↑ / ↓ |
 | Maximize / restore pane | Cmd+Shift+Enter |
 | Find in terminal | Cmd+F |
 | Workspace 1–9 | Cmd+1–9 |

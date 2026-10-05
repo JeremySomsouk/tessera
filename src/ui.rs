@@ -52,6 +52,75 @@ impl Layout {
             _ => false,
         }
     }
+    // Use the split ratios directly: navigation also works before the first paint
+    // and while a pane is maximized, without stale screen coordinates.
+    fn navigation_rects(&self, rect: Rect, out: &mut Vec<(Uuid, Rect)>) {
+        match self {
+            Self::Pane(id) => out.push((*id, rect)),
+            Self::Split {
+                vertical,
+                ratio,
+                a,
+                b,
+            } => {
+                let mut first = rect;
+                let mut second = rect;
+                if *vertical {
+                    let cut = rect.left() + rect.width() * ratio;
+                    first.max.x = cut;
+                    second.min.x = cut;
+                } else {
+                    let cut = rect.top() + rect.height() * ratio;
+                    first.max.y = cut;
+                    second.min.y = cut;
+                }
+                a.navigation_rects(first, out);
+                b.navigation_rects(second, out);
+            }
+        }
+    }
+
+    fn neighbor(&self, focus: Uuid, direction: Key) -> Option<Uuid> {
+        let mut rects = Vec::new();
+        self.navigation_rects(
+            Rect::from_min_size(Pos2::ZERO, Vec2::splat(1.0)),
+            &mut rects,
+        );
+        let source = rects.iter().find(|(id, _)| *id == focus)?.1;
+        let horizontal = matches!(direction, Key::ArrowLeft | Key::ArrowRight);
+        let axis = |rect: Rect| {
+            if horizontal {
+                (rect.left(), rect.right(), rect.top(), rect.bottom())
+            } else {
+                (rect.top(), rect.bottom(), rect.left(), rect.right())
+            }
+        };
+        let (start, end, cross_start, cross_end) = axis(source);
+        let forward = matches!(direction, Key::ArrowRight | Key::ArrowDown);
+        rects
+            .into_iter()
+            .filter_map(|(id, rect)| {
+                if id == focus {
+                    return None;
+                }
+                let (other_start, other_end, other_cross_start, other_cross_end) = axis(rect);
+                let gap = if forward {
+                    other_start - end
+                } else {
+                    start - other_end
+                };
+                let overlap = cross_end.min(other_cross_end) - cross_start.max(other_cross_start);
+                if gap < -f32::EPSILON || overlap <= 0.0 {
+                    return None;
+                }
+                let offset =
+                    ((cross_start + cross_end) - (other_cross_start + other_cross_end)).abs();
+                Some((id, gap.max(0.0), offset))
+            })
+            .min_by(|a, b| a.1.total_cmp(&b.1).then(a.2.total_cmp(&b.2)))
+            .map(|(id, _, _)| id)
+    }
+
     fn ids(&self, out: &mut Vec<Uuid>) {
         match self {
             Self::Pane(id) => out.push(*id),
@@ -930,6 +999,30 @@ impl App {
             self.specifications_view = false;
             self.palette = false;
             self.maximized = false;
+        }
+        if !self.palette && !self.overview {
+            for direction in [
+                Key::ArrowLeft,
+                Key::ArrowRight,
+                Key::ArrowUp,
+                Key::ArrowDown,
+            ] {
+                // Exact modifiers keep the existing next-pane shortcut distinct.
+                let pressed = ctx.input_mut(|input| {
+                    input.modifiers.alt == command.alt
+                        && input.modifiers.ctrl == command.ctrl
+                        && input.modifiers.shift == command.shift
+                        && input.modifiers.mac_cmd == command.mac_cmd
+                        && input.consume_key(command, direction)
+                });
+                if pressed
+                    && let Some(workspace) = self.saved.workspaces.get_mut(self.active)
+                    && let Some(next) = workspace.layout.neighbor(workspace.focus, direction)
+                {
+                    workspace.focus = next;
+                    self.dirty = true;
+                }
+            }
         }
         if !self.palette
             && !self.overview
@@ -1888,6 +1981,7 @@ impl App {
                 ("New terminal", "T"),
                 ("Side-by-side split", "D"),
                 ("Stacked split", "Shift+D"),
+                ("Focus pane in direction", "← / → / ↑ / ↓"),
                 ("Overview", "Shift+O"),
                 ("Commands", "Shift+P"),
                 ("Rename workspace", "Shift+R"),
@@ -3717,6 +3811,32 @@ mod tests {
         assert_eq!(ids, vec![a, c]);
     }
     #[test]
+    fn directional_navigation_respects_nested_splits_and_edges() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let c = Uuid::new_v4();
+        let mut layout = Layout::Pane(a);
+        layout.split(a, b, true);
+        layout.split(b, c, false);
+        assert_eq!(layout.neighbor(a, Key::ArrowRight), Some(b));
+        assert_eq!(layout.neighbor(b, Key::ArrowDown), Some(c));
+        assert_eq!(layout.neighbor(c, Key::ArrowUp), Some(b));
+        assert_eq!(layout.neighbor(c, Key::ArrowLeft), Some(a));
+        assert_eq!(layout.neighbor(a, Key::ArrowLeft), None);
+        assert_eq!(layout.neighbor(b, Key::ArrowRight), None);
+        assert_eq!(layout.neighbor(c, Key::ArrowDown), None);
+        if let Layout::Split { b: right, .. } = &mut layout
+            && let Layout::Split { ratio, .. } = right.as_mut()
+        {
+            *ratio = 0.2;
+        }
+        assert_eq!(layout.neighbor(a, Key::ArrowRight), Some(c));
+        layout.remove(b);
+        assert_eq!(layout.neighbor(a, Key::ArrowRight), Some(c));
+        assert_eq!(Layout::Pane(a).neighbor(a, Key::ArrowRight), None);
+    }
+
+    #[test]
     fn trackpad_scroll_accumulates_small_deltas_without_inventing_lines() {
         let mut scroll = ScrollState::default();
         for _ in 0..3 {
@@ -4383,6 +4503,47 @@ mod render_tests {
             repeat: false,
             modifiers,
         }
+    }
+
+    #[test]
+    fn directional_shortcut_consumes_arrow_and_preserves_maximized_view() {
+        let ctx = egui::Context::default();
+        let mut app = fixture(1);
+        app.overview = false;
+        let a = app.saved.workspaces[0].focus;
+        let b = Uuid::new_v4();
+        app.saved.workspaces[0].layout.split(a, b, true);
+        app.maximized = true;
+        let _ = ctx.run(
+            egui::RawInput {
+                modifiers: command(),
+                events: vec![key_event(Key::ArrowRight, None, command())],
+                ..Default::default()
+            },
+            |ctx| {
+                app.shortcuts(ctx);
+                assert!(!ctx.input(|input| input.events.iter().any(|event| matches!(
+                    event,
+                    egui::Event::Key {
+                        key: Key::ArrowRight,
+                        pressed: true,
+                        ..
+                    }
+                ))));
+            },
+        );
+        assert_eq!(app.saved.workspaces[0].focus, b);
+        assert!(app.maximized);
+        app.palette = true;
+        let _ = ctx.run(
+            egui::RawInput {
+                modifiers: command(),
+                events: vec![key_event(Key::ArrowLeft, None, command())],
+                ..Default::default()
+            },
+            |ctx| app.shortcuts(ctx),
+        );
+        assert_eq!(app.saved.workspaces[0].focus, b);
     }
 
     #[test]
