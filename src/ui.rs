@@ -3035,6 +3035,20 @@ fn configure_terminal_fonts_with(ctx: &egui::Context, detected: crate::fonts::Au
             .push("DetectedIcons".into());
     }
     ctx.data_mut(|data| data.insert_temp(egui::Id::new("terminal-font-label"), label));
+    const TECHNICAL_SYMBOLS: &str = "NotoSansSymbols";
+    fonts.font_data.insert(
+        TECHNICAL_SYMBOLS.into(),
+        std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
+            "../assets/fonts/NotoSansSymbols.ttf"
+        ))),
+    );
+    const MATH_SYMBOLS: &str = "NotoSansMath";
+    fonts.font_data.insert(
+        MATH_SYMBOLS.into(),
+        std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
+            "../assets/fonts/NotoSansMath-Regular.ttf"
+        ))),
+    );
     const SYMBOLS: &str = "NotoSansSymbols2";
     fonts.font_data.insert(
         SYMBOLS.into(),
@@ -3053,7 +3067,12 @@ fn configure_terminal_fonts_with(ctx: &egui::Context, detected: crate::fonts::Au
         .families
         .entry(egui::FontFamily::Monospace)
         .or_default()
-        .extend([SYMBOLS.into(), EMOJI.into()]);
+        .extend([
+            TECHNICAL_SYMBOLS.into(),
+            MATH_SYMBOLS.into(),
+            SYMBOLS.into(),
+            EMOJI.into(),
+        ]);
     ctx.set_fonts(fonts);
 }
 
@@ -4302,7 +4321,7 @@ mod render_tests {
     }
 
     #[test]
-    fn terminal_font_covers_prompt_cross_and_preserves_cell_metrics() {
+    fn terminal_font_covers_claude_and_prompt_symbols_and_preserves_cell_metrics() {
         let ctx = egui::Context::default();
         let font = FontId::monospace(15.0);
         let mut original_metrics = Vec2::ZERO;
@@ -4320,6 +4339,8 @@ mod render_tests {
                     '✘',
                     '✓',
                     '✔',
+                    '⎿',
+                    '⧉',
                     '\u{1f916}',
                     '\u{1f4b0}',
                     '\u{1f4ca}',
@@ -4331,6 +4352,7 @@ mod render_tests {
                     );
                 }
                 assert!(fonts.has_glyphs(&font, "➜  tessera git:(main) ✗ gs"));
+                assert!(fonts.has_glyphs(&font, "⎿ \u{a0}Updated ⧉"));
                 assert_eq!(
                     Vec2::new(fonts.glyph_width(&font, 'M'), fonts.row_height(&font)),
                     original_metrics,
@@ -4368,12 +4390,16 @@ mod render_tests {
                     .iter()
                     .position(|name| name == "DetectedIcons")
                     .unwrap();
-                let bundled = chain
-                    .iter()
-                    .position(|name| name == "NotoSansSymbols2")
-                    .unwrap();
-                assert!(icons < bundled);
-                assert!(fonts.has_glyphs(&FontId::monospace(15.0), "Text \u{1f916}"));
+                for fallback in [
+                    "NotoSansSymbols",
+                    "NotoSansMath",
+                    "NotoSansSymbols2",
+                    "NotoEmoji",
+                ] {
+                    let bundled = chain.iter().position(|name| name == fallback).unwrap();
+                    assert!(icons < bundled);
+                }
+                assert!(fonts.has_glyphs(&FontId::monospace(15.0), "⎿ \u{a0}Updated ⧉ \u{1f916}"));
             });
         });
         assert_eq!(
