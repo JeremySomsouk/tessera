@@ -1,6 +1,7 @@
 mod choices;
 mod directories;
 mod discovery;
+mod fonts;
 mod integration;
 mod model;
 mod search;

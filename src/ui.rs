@@ -231,6 +231,8 @@ struct Saved {
     created_directories: Vec<CreatedDirectory>,
     #[serde(default)]
     specifications: Vec<crate::specs::Specification>,
+    #[serde(default = "default_sidebar_width")]
+    sidebar_width: f32,
     workspaces: Vec<Workspace>,
     sessions: Vec<Session>,
     #[serde(default = "default_font")]
@@ -248,6 +250,7 @@ impl Default for Saved {
         Self {
             created_directories: Vec::new(),
             specifications: Vec::new(),
+            sidebar_width: default_sidebar_width(),
             workspaces: Vec::new(),
             sessions: Vec::new(),
             font_size: default_font(),
@@ -257,6 +260,10 @@ impl Default for Saved {
         }
     }
 }
+fn default_sidebar_width() -> f32 {
+    216.0
+}
+
 fn default_clickable_choices() -> bool {
     true
 }
@@ -429,7 +436,7 @@ impl App {
             Ok(updater) => app.updater = updater,
             Err(error) => app.updater_error = Some(format!("Updates unavailable: {error}")),
         }
-        configure_terminal_fonts(&cc.egui_ctx);
+        configure_terminal_fonts_with(&cc.egui_ctx, crate::fonts::automatic_terminal_fonts());
         configure_appearance(&cc.egui_ctx, app.saved.light);
         app.start_fresh_workspace(&cc.egui_ctx);
         app
@@ -1060,6 +1067,24 @@ impl App {
             }
         }
     }
+    fn cleanup_disconnected_sessions(&mut self) {
+        let previous = self.saved.sessions.len();
+        self.saved
+            .sessions
+            .retain(|session| session.state != SessionState::Disconnected);
+        if self.saved.sessions.len() != previous {
+            if !self
+                .saved
+                .sessions
+                .iter()
+                .any(|session| self.selected.as_deref() == Some(session.key().as_str()))
+            {
+                self.selected = None;
+            }
+            self.dirty = true;
+        }
+    }
+
     fn overview(&mut self, ui: &mut egui::Ui) {
         let narrow = ui.available_width() < 760.0;
         ui.add_space(8.0);
@@ -1088,6 +1113,17 @@ impl App {
             });
         });
         ui.add_space(8.0);
+        let disconnected = self
+            .saved
+            .sessions
+            .iter()
+            .filter(|session| session.state == SessionState::Disconnected)
+            .count();
+        if disconnected > 0 && ui.button(format!("Clear disconnected sessions ({disconnected})"))
+            .on_hover_text("Remove disconnected session history. Terminals and working directories are kept.")
+            .clicked() {
+            self.cleanup_disconnected_sessions();
+        }
         ui.horizontal_wrapped(|ui| {
             let attention = self
                 .saved
@@ -1572,7 +1608,9 @@ impl App {
                     }
                 }
                 ui.horizontal(|ui| {
-                    ui.set_min_height(24.0);
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    ui.spacing_mut().interact_size.y = 28.0;
+                    ui.set_min_height(28.0);
                     if native_controls {
                         ui.add_space(64.0);
                     }
@@ -1619,7 +1657,7 @@ impl App {
                     {
                         let title = workspace.task.title.clone();
                         let directory = workspace.task.directory.clone();
-                        let controls_width = if wide { 150.0 } else { 0.0 };
+                        let controls_width = if wide { 208.0 } else { 0.0 };
                         let title_width = (ui.available_width() - 210.0 - controls_width).max(40.0);
                         ui.allocate_ui_with_layout(
                             Vec2::new(title_width, 24.0),
@@ -1645,35 +1683,45 @@ impl App {
                                 }
                             },
                         );
-                        if wide {
-                            if ui
-                                .small_button(if self.maximized {
-                                    "Restore"
-                                } else {
-                                    "Maximize"
-                                })
-                                .on_hover_text(shortcut("Maximize / restore pane", "Shift+Enter"))
-                                .clicked()
-                            {
-                                self.maximized = !self.maximized;
-                            }
-                            ui.menu_button("Split", |ui| self.split_actions(ui, ctx));
-                        }
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
-                            .button("+ Workspace")
+                            .add_sized([96.0, 28.0], egui::Button::new("+ Workspace"))
                             .on_hover_text("Create a workspace in a directory")
                             .clicked()
                         {
                             self.open_commands(CommandPage::Create);
                         }
                         if ui
-                            .button("Commands")
+                            .add_sized([96.0, 28.0], egui::Button::new("Commands"))
                             .on_hover_text(shortcut("Search workspaces and commands", "Shift+P"))
                             .clicked()
                         {
                             self.open_commands(CommandPage::Commands);
+                        }
+                        if wide
+                            && !self.overview
+                            && !self.specifications_view
+                            && !self.saved.workspaces.is_empty()
+                        {
+                            egui::containers::menu::MenuButton::from_button(
+                                egui::Button::new("Split").min_size(Vec2::new(96.0, 28.0)),
+                            )
+                            .ui(ui, |ui| self.split_actions(ui, ctx));
+                            if ui
+                                .add_sized(
+                                    [96.0, 28.0],
+                                    egui::Button::new(if self.maximized {
+                                        "Restore"
+                                    } else {
+                                        "Maximize"
+                                    }),
+                                )
+                                .on_hover_text(shortcut("Maximize / restore pane", "Shift+Enter"))
+                                .clicked()
+                            {
+                                self.maximized = !self.maximized;
+                            }
                         }
                     });
                 });
@@ -1689,6 +1737,49 @@ impl App {
                         });
                 }
             });
+    }
+
+    fn workspace_sidebar(
+        &mut self,
+        ctx: &egui::Context,
+        pane_action: &mut Option<(Uuid, &'static str)>,
+    ) {
+        let sidebar = egui::SidePanel::left("workspace-rail")
+            .default_width(self.saved.sidebar_width)
+            .width_range(160.0..=ctx.content_rect().width() * 0.45)
+            .resizable(true)
+            .frame(
+                egui::Frame::new()
+                    .fill(ctx.style().visuals.panel_fill)
+                    .inner_margin(egui::Margin::symmetric(12, 16)),
+            )
+            .show(ctx, |ui| {
+                section_label(ui, "WORKSPACES");
+                ui.add_space(10.0);
+                ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+                    if ui
+                        .add_sized([ui.available_width(), 32.0], egui::Button::new("Settings"))
+                        .clicked()
+                    {
+                        self.open_commands(CommandPage::Settings);
+                    }
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(10.0);
+                    ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt("workspace-rail-list")
+                            .show(ui, |ui| {
+                                self.workspace_navigation(ui, true, pane_action);
+                            });
+                    });
+                });
+            });
+        let width = sidebar.response.rect.width();
+        if (self.saved.sidebar_width - width).abs() > 0.5 {
+            self.saved.sidebar_width = width;
+            self.dirty = true;
+        }
     }
 
     fn workspace_actions(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -2132,6 +2223,11 @@ impl App {
                 self.dirty = true;
             }
         });
+        if let Some(label) =
+            ctx.data(|data| data.get_temp::<String>(egui::Id::new("terminal-font-label")))
+        {
+            ui.label(format!("Font: {label}"));
+        }
         ui.add_space(16.0);
         section_label(ui, "TERMINAL BEHAVIOR");
         ui.add_space(8.0);
@@ -2345,6 +2441,26 @@ impl App {
             });
             ui.separator();
             let Some(index) = self.saved.specifications.iter().position(|s| Some(s.id) == self.selected_spec) else { ui.label("Create or select a specification."); return; };
+            let mut delete = false;
+            ui.menu_button("Delete specification", |ui| {
+                ui.label("Delete this specification and its revision history?");
+                ui.small("Working directory and agent terminals will be kept.");
+                ui.horizontal(|ui| {
+                    if ui.button("Confirm deletion").clicked() {
+                        delete = true;
+                        ui.close();
+                    }
+                    if ui.button("Cancel").clicked() {
+                        ui.close();
+                    }
+                });
+            });
+            if delete {
+                self.saved.specifications.remove(index);
+                self.selected_spec = None;
+                self.dirty = true;
+                return;
+            }
             let spec = &mut self.saved.specifications[index];
             ui.label("Title");
             self.dirty |= ui.text_edit_singleline(&mut spec.draft.title).changed();
@@ -2477,36 +2593,7 @@ impl App {
         let wide = ctx.content_rect().width() >= 900.0;
         self.chrome(ctx, wide, &mut pane_action);
         if wide {
-            egui::SidePanel::left("workspace-rail")
-                .exact_width(216.0)
-                .resizable(false)
-                .frame(
-                    egui::Frame::new()
-                        .fill(ctx.style().visuals.panel_fill)
-                        .inner_margin(egui::Margin::symmetric(12, 16)),
-                )
-                .show(ctx, |ui| {
-                    section_label(ui, "WORKSPACES");
-                    ui.add_space(10.0);
-                    ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-                        if ui
-                            .add_sized([ui.available_width(), 32.0], egui::Button::new("Settings"))
-                            .clicked()
-                        {
-                            self.open_commands(CommandPage::Settings);
-                        }
-                        ui.add_space(8.0);
-                        ui.separator();
-                        ui.add_space(10.0);
-                        ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
-                            egui::ScrollArea::vertical()
-                                .id_salt("workspace-rail-list")
-                                .show(ui, |ui| {
-                                    self.workspace_navigation(ui, true, &mut pane_action);
-                                });
-                        });
-                    });
-                });
+            self.workspace_sidebar(ctx, &mut pane_action);
         }
         if let Some((id, action)) = pane_action {
             if action == "Stop terminal" {
@@ -2914,8 +3001,40 @@ fn command_row(
     response
 }
 
+#[cfg(test)]
 fn configure_terminal_fonts(ctx: &egui::Context) {
+    configure_terminal_fonts_with(ctx, crate::fonts::AutomaticFonts::default());
+}
+
+fn configure_terminal_fonts_with(ctx: &egui::Context, detected: crate::fonts::AutomaticFonts) {
     let mut fonts = egui::FontDefinitions::default();
+    let mut label = "Automatic (bundled monospace)".to_owned();
+    if let Some(primary) = detected.primary {
+        label = format!("Automatic ({})", primary.name);
+        let mut data = egui::FontData::from_owned(primary.data);
+        data.index = primary.index;
+        fonts
+            .font_data
+            .insert("DetectedTerminal".into(), std::sync::Arc::new(data));
+        fonts
+            .families
+            .entry(egui::FontFamily::Monospace)
+            .or_default()
+            .insert(0, "DetectedTerminal".into());
+    }
+    if let Some(icons) = detected.icons {
+        let mut data = egui::FontData::from_owned(icons.data);
+        data.index = icons.index;
+        fonts
+            .font_data
+            .insert("DetectedIcons".into(), std::sync::Arc::new(data));
+        fonts
+            .families
+            .entry(egui::FontFamily::Monospace)
+            .or_default()
+            .push("DetectedIcons".into());
+    }
+    ctx.data_mut(|data| data.insert_temp(egui::Id::new("terminal-font-label"), label));
     const SYMBOLS: &str = "NotoSansSymbols2";
     fonts.font_data.insert(
         SYMBOLS.into(),
@@ -2923,12 +3042,18 @@ fn configure_terminal_fonts(ctx: &egui::Context) {
             "../assets/fonts/NotoSansSymbols2-Regular.ttf"
         ))),
     );
-    // Keep Hack's text and cell metrics, using this only for missing symbols.
+    const EMOJI: &str = "NotoEmoji";
+    fonts.font_data.insert(
+        EMOJI.into(),
+        std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
+            "../assets/fonts/NotoEmoji.ttf"
+        ))),
+    );
     fonts
         .families
         .entry(egui::FontFamily::Monospace)
         .or_default()
-        .push(SYMBOLS.into());
+        .extend([SYMBOLS.into(), EMOJI.into()]);
     ctx.set_fonts(fonts);
 }
 
@@ -3250,7 +3375,9 @@ fn terminal_view(
     let grid_rect = rect.shrink(8.0);
     let cols = ((grid_rect.width() / cell.x).floor() as usize).clamp(2, 500);
     let rows = ((grid_rect.height() / cell.y).floor() as usize).clamp(1, 200);
-    terminal.resize(Size { cols, rows });
+    if !ui.is_sizing_pass() && !ui.ctx().will_discard() {
+        terminal.resize(Size { cols, rows });
+    }
     ui.painter()
         .rect_filled(rect, 6.0, Color32::from_rgb(24, 27, 34));
     if focused {
@@ -4187,7 +4314,17 @@ mod render_tests {
         configure_terminal_fonts(&ctx);
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             ctx.fonts_mut(|fonts| {
-                for symbol in ['➜', '✗', '✘', '✓', '✔'] {
+                for symbol in [
+                    '➜',
+                    '✗',
+                    '✘',
+                    '✓',
+                    '✔',
+                    '\u{1f916}',
+                    '\u{1f4b0}',
+                    '\u{1f4ca}',
+                    '\u{1f4c1}',
+                ] {
                     assert!(
                         fonts.has_glyph(&font, symbol),
                         "missing prompt symbol {symbol}"
@@ -4200,6 +4337,49 @@ mod render_tests {
                 );
             });
         });
+    }
+
+    #[test]
+    fn automatic_font_precedes_bundled_fallbacks() {
+        let ctx = egui::Context::default();
+        let defaults = egui::FontDefinitions::default();
+        let primary =
+            defaults.font_data[&defaults.families[&egui::FontFamily::Monospace][0]].clone();
+        configure_terminal_fonts_with(
+            &ctx,
+            crate::fonts::AutomaticFonts {
+                primary: Some(crate::fonts::LoadedFont {
+                    name: "Profile font".into(),
+                    data: primary.font.to_vec(),
+                    index: primary.index,
+                }),
+                icons: Some(crate::fonts::LoadedFont {
+                    name: "Icon fallback".into(),
+                    data: include_bytes!("../assets/fonts/NotoSansSymbols2-Regular.ttf").to_vec(),
+                    index: 0,
+                }),
+            },
+        );
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            ctx.fonts_mut(|fonts| {
+                let chain = &fonts.definitions().families[&egui::FontFamily::Monospace];
+                assert_eq!(chain[0], "DetectedTerminal");
+                let icons = chain
+                    .iter()
+                    .position(|name| name == "DetectedIcons")
+                    .unwrap();
+                let bundled = chain
+                    .iter()
+                    .position(|name| name == "NotoSansSymbols2")
+                    .unwrap();
+                assert!(icons < bundled);
+                assert!(fonts.has_glyphs(&FontId::monospace(15.0), "Text \u{1f916}"));
+            });
+        });
+        assert_eq!(
+            ctx.data(|data| data.get_temp::<String>(egui::Id::new("terminal-font-label"))),
+            Some("Automatic (Profile font)".into())
+        );
     }
 
     #[test]
@@ -4492,6 +4672,62 @@ mod render_tests {
     }
 
     #[test]
+    fn workspace_sidebar_drag_resizes_and_persists_width() {
+        let ctx = egui::Context::default();
+        let mut app = fixture(1);
+        let render = |app: &mut App, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1180.0, 760.0))),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.workspace_sidebar(ctx, &mut None),
+            )
+        };
+        render(&mut app, vec![]);
+        let initial = app.saved.sidebar_width;
+        let edge = Pos2::new(initial, 200.0);
+        render(
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(edge),
+                egui::Event::PointerButton {
+                    pos: edge,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Modifiers::NONE,
+                },
+            ],
+        );
+        let target = edge + Vec2::new(90.0, 0.0);
+        render(&mut app, vec![egui::Event::PointerMoved(target)]);
+        render(
+            &mut app,
+            vec![egui::Event::PointerButton {
+                pos: target,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Modifiers::NONE,
+            }],
+        );
+        assert!(app.saved.sidebar_width > initial + 60.0);
+        assert!(app.dirty);
+        let saved: Saved =
+            serde_json::from_slice(&serde_json::to_vec(&app.saved).unwrap()).unwrap();
+        assert_eq!(saved.sidebar_width, app.saved.sidebar_width);
+        let fresh = egui::Context::default();
+        let _ = fresh.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1180.0, 760.0))),
+                ..Default::default()
+            },
+            |ctx| app.workspace_sidebar(ctx, &mut None),
+        );
+        assert_eq!(saved.sidebar_width, app.saved.sidebar_width);
+    }
+
+    #[test]
     fn chrome_navigation_remains_clickable_and_fits_narrow_windows() {
         for width in [640.0, 900.0, 1180.0] {
             let ctx = egui::Context::default();
@@ -4562,6 +4798,41 @@ mod render_tests {
                 !ctx.style().visuals.dark_mode,
                 "chrome theme leaked into content"
             );
+        }
+    }
+
+    #[test]
+    fn chrome_controls_have_matching_text_size_and_spacing() {
+        let ctx = egui::Context::default();
+        let mut app = fixture(1);
+        app.overview = false;
+        let out = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1180.0, 760.0))),
+                ..Default::default()
+            },
+            |ctx| app.chrome(ctx, true, &mut None),
+        );
+        let controls: Vec<_> = ["Maximize", "Split", "Commands", "+ Workspace"]
+            .iter()
+            .map(|label| {
+                out.shapes
+                    .iter()
+                    .find_map(|shape| match &shape.shape {
+                        egui::epaint::Shape::Text(text) if text.galley.text() == *label => {
+                            Some((text.pos + text.galley.size() / 2.0, text.galley.size().y))
+                        }
+                        _ => None,
+                    })
+                    .unwrap()
+            })
+            .collect();
+        for (center, height) in &controls {
+            assert!((center.y - controls[0].0.y).abs() < 1.0);
+            assert!((height - controls[0].1).abs() < 1.0);
+        }
+        for pair in controls.windows(2) {
+            assert!(((pair[1].0.x - pair[0].0.x).abs() - 104.0).abs() < 1.0);
         }
     }
 
@@ -4790,6 +5061,122 @@ mod render_tests {
         app.error.clear();
         app.drain();
         assert!(app.error.is_empty(), "dismissed error must not reappear");
+    }
+
+    #[test]
+    fn cleanup_disconnected_sessions_preserves_other_states_and_workspaces() {
+        let mut app = fixture(1);
+        app.saved.sessions.clear();
+        for state in [
+            SessionState::Disconnected,
+            SessionState::Running,
+            SessionState::Idle,
+            SessionState::Permission,
+            SessionState::Input,
+            SessionState::Unknown,
+            SessionState::Ended,
+        ] {
+            for agent in [crate::model::Agent::Claude, crate::model::Agent::Codex] {
+                let mut session = Session::new(Uuid::new_v4(), "cleanup".into());
+                session.state = state;
+                session.agent = agent;
+                app.saved.sessions.push(session);
+            }
+        }
+        app.selected = Some(app.saved.sessions[0].key());
+        app.dirty = false;
+        app.cleanup_disconnected_sessions();
+        assert_eq!(app.saved.sessions.len(), 12);
+        assert!(
+            app.saved
+                .sessions
+                .iter()
+                .all(|session| session.state != SessionState::Disconnected)
+        );
+        assert!(app.selected.is_none());
+        assert!(app.dirty);
+        assert_eq!(app.saved.workspaces.len(), 1);
+        app.selected = Some(app.saved.sessions[0].key());
+        app.dirty = false;
+        app.cleanup_disconnected_sessions();
+        assert!(app.selected.is_some());
+        assert!(!app.dirty);
+    }
+
+    #[test]
+    fn specification_deletion_requires_confirmation_and_preserves_workspaces() {
+        let ctx = egui::Context::default();
+        let mut app = fixture(1);
+        let directory = tempfile::tempdir().unwrap();
+        let spec = crate::specs::Specification::new(directory.path().display().to_string());
+        app.selected_spec = Some(spec.id);
+        app.saved.specifications.push(spec);
+        app.dirty = false;
+        let render = |app: &mut App, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 900.0))),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| app.specifications(ui));
+                },
+            )
+        };
+        let position = |out: &egui::FullOutput, label: &str| {
+            out.shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::epaint::Shape::Text(text) if text.galley.text() == label => {
+                        Some(text.pos + text.galley.size() / 2.0)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("Missing control: {label}"))
+        };
+        let click = |app: &mut App, pos| {
+            render(
+                app,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+            render(
+                app,
+                vec![egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            )
+        };
+        let out = render(&mut app, vec![]);
+        click(&mut app, position(&out, "Delete specification"));
+        let out = render(&mut app, vec![]);
+        assert_eq!(app.saved.specifications.len(), 1);
+        assert!(!app.dirty);
+        click(&mut app, position(&out, "Cancel"));
+        assert_eq!(app.saved.specifications.len(), 1);
+        let out = render(&mut app, vec![]);
+        click(&mut app, position(&out, "Delete specification"));
+        let out = render(&mut app, vec![]);
+        click(&mut app, position(&out, "Confirm deletion"));
+        assert!(app.saved.specifications.is_empty());
+        assert!(app.selected_spec.is_none());
+        assert!(app.dirty);
+        assert_eq!(app.saved.workspaces.len(), 1);
+        assert!(directory.path().is_dir());
+        let restored: Saved =
+            serde_json::from_slice(&serde_json::to_vec(&app.saved).unwrap()).unwrap();
+        assert!(restored.specifications.is_empty());
     }
 
     #[test]
@@ -6459,6 +6846,117 @@ mod render_tests {
         assert_eq!(app.saved.workspaces.len(), 2);
         assert_eq!(app.panes.len(), 2);
         assert!(app.panes.contains_key(&original));
+    }
+
+    #[test]
+    fn split_terminal_sizes_settle_after_creation_and_removal() {
+        let ctx = egui::Context::default();
+        let mut app = fixture(1);
+        app.overview = false;
+        app.saved.workspaces[0].task.directory = std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        start_fixture_terminal(&mut app, &ctx);
+        let original = app.saved.workspaces[0].focus;
+        let frame = |app: &mut App| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1180.0, 760.0))),
+                    ..Default::default()
+                },
+                |ctx| app.draw(ctx),
+            );
+        };
+        let dimensions = |app: &App, pane| {
+            let size = app.panes[&pane].terminal.size;
+            (size.cols, size.rows)
+        };
+        frame(&mut app);
+        frame(&mut app);
+        let full = dimensions(&app, original);
+        for vertical in [true, false] {
+            app.saved.workspaces[0].focus = original;
+            app.split(&ctx, vertical);
+            let split = app.saved.workspaces[0].focus;
+            frame(&mut app);
+            frame(&mut app);
+            let first = dimensions(&app, original);
+            let second = dimensions(&app, split);
+            assert!(if vertical {
+                first.0 < full.0
+            } else {
+                first.1 < full.1
+            });
+            assert!(first.0 > 2 && first.1 > 1 && second.0 > 2 && second.1 > 1);
+            for _ in 0..10 {
+                frame(&mut app);
+                assert_eq!(dimensions(&app, original), first);
+                assert_eq!(dimensions(&app, split), second);
+            }
+            app.stop_terminal(split);
+            frame(&mut app);
+            frame(&mut app);
+            for _ in 0..10 {
+                frame(&mut app);
+                assert_eq!(dimensions(&app, original), full);
+            }
+        }
+    }
+
+    #[test]
+    fn discarded_layout_pass_does_not_resize_the_shell() {
+        use alacritty_terminal::grid::Dimensions;
+        let ctx = egui::Context::default();
+        let mut terminal = Terminal::spawn_test(
+            Uuid::new_v4(),
+            &std::env::current_dir().unwrap(),
+            std::path::Path::new(""),
+            ctx.clone(),
+        )
+        .unwrap();
+        let mut search = TerminalSearch::default();
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 200.0))),
+                ..Default::default()
+            },
+            |ctx| {
+                if ctx.current_pass_index() == 0 {
+                    ctx.request_discard("workspace layout changed after closing a tab");
+                    assert!(ctx.will_discard());
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        terminal_view(ui, &mut terminal, &mut search, true, 15.0, false)
+                    });
+                } else {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        ui.scope_builder(egui::UiBuilder::new().sizing_pass(), |ui| {
+                            assert!(ui.is_sizing_pass());
+                            terminal_view(ui, &mut terminal, &mut search, true, 15.0, false)
+                        });
+                    });
+                }
+            },
+        );
+        terminal
+            .input(b"printf 'LAYOUT_BARRIER\\n'\n".to_vec())
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let term = terminal.term.lock().unwrap();
+            let text: String = term.grid().display_iter().map(|cell| cell.cell.c).collect();
+            if text.contains("LAYOUT_BARRIER") {
+                assert_eq!(term.columns(), 100);
+                assert_eq!(term.screen_lines(), 30);
+                break;
+            }
+            drop(term);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "shell did not process barrier input"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]
