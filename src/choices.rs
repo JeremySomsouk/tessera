@@ -1,4 +1,4 @@
-//! Conservative keyboard compatibility for Codex's request_user_input prompt.
+//! Conservative keyboard compatibility for visible agent choice prompts.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Choice {
     pub row: usize,
@@ -13,6 +13,10 @@ pub struct Prompt {
 }
 impl Prompt {
     pub fn parse(lines: &[String]) -> Option<Self> {
+        Self::parse_codex(lines).or_else(|| Self::parse_claude(lines))
+    }
+
+    fn parse_codex(lines: &[String]) -> Option<Self> {
         let header = lines.iter().rposition(|line| {
             let line = line.trim();
             line.starts_with("Question ") && line.contains('/') && line.ends_with(" unanswered)")
@@ -27,13 +31,49 @@ impl Prompt {
                     && line.contains("esc to interrupt"))
                 .then_some(row)
             })?;
+        Self::parse_choices(lines, header + 1, footer, '›')
+    }
+
+    fn parse_claude(lines: &[String]) -> Option<Self> {
+        let footer = lines.iter().rposition(|line| {
+            let text = line.to_lowercase();
+            text.contains("enter to select")
+                && (text.contains("to navigate") || text.contains("tab/arrow keys"))
+                && text.contains("esc to cancel")
+        })?;
+        let start = lines[..footer].iter().rposition(|line| {
+            line.trim_start()
+                .trim_start_matches(['❯', '>'])
+                .trim_start()
+                .starts_with("1. ")
+        })?;
+        let marker = if lines[start..footer]
+            .iter()
+            .any(|line| line.trim_start().starts_with('❯'))
+        {
+            '❯'
+        } else {
+            '>'
+        };
+        let prompt = Self::parse_choices(lines, start, footer, marker)?;
+        let selected = prompt
+            .choices
+            .iter()
+            .find(|choice| choice.number == prompt.selected)?;
+        if lines[selected.row].contains("Type something") {
+            return None;
+        }
+        Some(prompt)
+    }
+
+    fn parse_choices(lines: &[String], start: usize, footer: usize, marker: char) -> Option<Self> {
         let mut choices = Vec::new();
         let mut selected = None;
-        for (row, line) in lines.iter().enumerate().take(footer).skip(header + 1) {
+        for (row, line) in lines.iter().enumerate().take(footer).skip(start) {
             let trimmed = line.trim_start();
-            let marked = trimmed.starts_with('›');
+            let marked = trimmed.starts_with(marker);
             let text = if marked {
-                trimmed.strip_prefix('›')?.trim_start()
+                trimmed.strip_prefix(marker)?.trim_start()
             } else {
                 trimmed
             };
@@ -96,6 +136,55 @@ mod tests {
                 number: 2
             }
         );
+    }
+    fn claude_fixture() -> Vec<String> {
+        [
+            "Which approach should we use?",
+            "❯ 1. First",
+            "     Description of first choice",
+            "  2. Second",
+            "  3. Type something.",
+            "  4. Chat about this",
+            "Enter to select · ↑/↓ to navigate · Esc to cancel",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect()
+    }
+    #[test]
+    fn recognizes_claude_numbered_choices_and_footer_variants() {
+        let mut lines = claude_fixture();
+        let prompt = Prompt::parse(&lines).unwrap();
+        assert_eq!(prompt.selected, 1);
+        assert_eq!(prompt.choices[1].row, 3);
+        assert_eq!(prompt.choices.len(), 4);
+        lines[6] = "Enter to select · Tab/Arrow keys to navigate · Esc to cancel".into();
+        assert!(Prompt::parse(&lines).is_some());
+        lines[1] = "> 1. First".into();
+        assert!(Prompt::parse(&lines).is_some());
+        lines[0] = "Do you want to proceed?".into();
+        lines[1] = "  1. Yes".into();
+        lines[3] = "❯ 2. No".into();
+        assert_eq!(Prompt::parse(&lines).unwrap().selected, 2);
+    }
+    #[test]
+    fn rejects_claude_output_and_text_entry() {
+        let mut lines = claude_fixture();
+        lines[6] = "Enter to submit · Esc to cancel".into();
+        assert!(Prompt::parse(&lines).is_none());
+        lines = claude_fixture();
+        lines[1] = "  1. First".into();
+        assert!(Prompt::parse(&lines).is_none());
+        lines = claude_fixture();
+        lines[3] = "❯ 2. Second".into();
+        assert!(Prompt::parse(&lines).is_none());
+        lines = claude_fixture();
+        lines[3] = "  5. Second".into();
+        assert!(Prompt::parse(&lines).is_none());
+        lines = claude_fixture();
+        lines[1] = "  1. First".into();
+        lines[4] = "❯ 3. Type something.".into();
+        assert!(Prompt::parse(&lines).is_none());
     }
     #[test]
     fn rejects_lists_notes_and_ambiguous_selection() {
