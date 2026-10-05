@@ -1,6 +1,6 @@
 use crate::{
     integration::{Endpoint, now},
-    model::{Session, SessionState, Task, TaskState},
+    model::{Session, SessionState, Task, TaskState, WorkDisposition, WorkItem, WorkStage},
     search::TerminalSearch,
     selection::{SelectionAction, key_action},
     terminal::{Size, Terminal, color},
@@ -228,6 +228,10 @@ struct Workspace {
 #[derive(Clone, Serialize, Deserialize)]
 struct Saved {
     #[serde(default)]
+    work_items: Vec<WorkItem>,
+    #[serde(default)]
+    work_version: u8,
+    #[serde(default)]
     created_directories: Vec<CreatedDirectory>,
     #[serde(default)]
     specifications: Vec<crate::specs::Specification>,
@@ -248,6 +252,8 @@ struct Saved {
 impl Default for Saved {
     fn default() -> Self {
         Self {
+            work_items: Vec::new(),
+            work_version: 0,
             created_directories: Vec::new(),
             specifications: Vec::new(),
             sidebar_width: default_sidebar_width(),
@@ -258,6 +264,116 @@ impl Default for Saved {
             skip_stop_confirmation: false,
             clickable_codex_choices: default_clickable_choices(),
         }
+    }
+}
+impl Saved {
+    fn work_is_history(&self, work: &WorkItem) -> bool {
+        if work.disposition != WorkDisposition::Active {
+            return true;
+        }
+        if work.keep_active {
+            return false;
+        }
+        let linked: Vec<_> = self
+            .sessions
+            .iter()
+            .filter(|s| s.work_id == Some(work.id))
+            .collect();
+        work.specification.is_none()
+            && (work.had_sessions || !linked.is_empty())
+            && linked
+                .iter()
+                .all(|s| matches!(s.state, SessionState::Ended | SessionState::Disconnected))
+    }
+    fn ensure_work(&mut self) -> bool {
+        let mut changed = false;
+        for spec in &self.specifications {
+            if !self
+                .work_items
+                .iter()
+                .any(|w| w.specification == Some(spec.id))
+            {
+                let mut w = WorkItem::new(spec.draft.title.clone(), spec.draft.directory.clone());
+                w.id = spec.id;
+                w.specification = Some(spec.id);
+                w.stage = match spec.status {
+                    0 => WorkStage::Define,
+                    1 => WorkStage::Plan,
+                    _ => WorkStage::Build,
+                };
+                w.panes = spec.launches.iter().map(|l| l.pane).collect();
+                self.work_items.push(w);
+                changed = true;
+            }
+        }
+        if self.work_version == 0 {
+            for workspace in &self.workspaces {
+                let mut panes = Vec::new();
+                workspace.layout.ids(&mut panes);
+                panes.retain(|pane| !self.work_items.iter().any(|w| w.panes.contains(pane)));
+                if panes.is_empty() {
+                    continue;
+                }
+                let mut w = WorkItem::new(
+                    workspace.task.title.clone(),
+                    workspace.task.directory.clone(),
+                );
+                w.id = workspace.task.id;
+                w.stage = if workspace.task.state == TaskState::ReviewRequested {
+                    WorkStage::Review
+                } else {
+                    WorkStage::Build
+                };
+                if workspace.task.state == TaskState::Accepted {
+                    w.disposition = WorkDisposition::Completed;
+                }
+                w.panes = panes;
+                if !self.work_items.iter().any(|existing| existing.id == w.id) {
+                    self.work_items.push(w);
+                }
+            }
+            self.work_version = 1;
+            changed = true;
+        }
+        for session in &mut self.sessions {
+            if session
+                .work_id
+                .is_some_and(|id| self.work_items.iter().any(|w| w.id == id))
+            {
+                continue;
+            }
+            if let Some(w) = self
+                .work_items
+                .iter()
+                .find(|w| w.panes.contains(&session.pane))
+            {
+                session.work_id = Some(w.id);
+            } else {
+                let context = self
+                    .workspaces
+                    .iter()
+                    .find(|w| layout_contains(&w.layout, session.pane));
+                let (title, directory) = context
+                    .map(|w| (w.task.title.clone(), w.task.directory.clone()))
+                    .unwrap_or_else(|| {
+                        (format!("{} session", session.agent.label()), String::new())
+                    });
+                if self.work_items.len() >= 256 {
+                    continue;
+                }
+                let w = WorkItem::new(title, directory);
+                session.work_id = Some(w.id);
+                self.work_items.push(w);
+            }
+            changed = true;
+        }
+        for work in &mut self.work_items {
+            if !work.had_sessions && self.sessions.iter().any(|s| s.work_id == Some(work.id)) {
+                work.had_sessions = true;
+                changed = true;
+            }
+        }
+        changed
     }
 }
 fn default_sidebar_width() -> f32 {
@@ -315,6 +431,7 @@ pub struct App {
     overview: bool,
     specifications_view: bool,
     selected_spec: Option<Uuid>,
+    selected_work: Option<Uuid>,
     spec_codex: bool,
     selected: Option<String>,
     endpoint: Option<Endpoint>,
@@ -339,7 +456,13 @@ pub struct App {
     category: u8,
     overview_inspector: bool,
 }
+fn state_override(value: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    value.map(PathBuf::from).filter(|p| p.is_absolute())
+}
 fn state_path() -> PathBuf {
+    if let Some(path) = state_override(std::env::var_os("TESSERA_STATE_PATH")) {
+        return path;
+    }
     let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
     if cfg!(target_os = "macos") {
         home.join("Library/Application Support/Tessera/workspace.json")
@@ -403,6 +526,7 @@ impl App {
             overview: false,
             specifications_view: false,
             selected_spec: None,
+            selected_work: None,
             spec_codex: false,
             selected: None,
             error: load_error,
@@ -699,6 +823,7 @@ impl App {
         }
     }
     fn start_fresh_workspace(&mut self, ctx: &egui::Context) {
+        self.sync_work();
         // Saved pane IDs refer to processes that stopped when the app exited.
         self.saved.workspaces.clear();
         for session in &mut self.saved.sessions {
@@ -711,6 +836,33 @@ impl App {
         self.specifications_view = false;
         self.dirty = true;
         self.add_workspace_in(ctx, self.new_directory.clone());
+    }
+    fn sync_work(&mut self) -> bool {
+        let legacy = self.saved.work_version == 0;
+        let existing: Vec<_> = self.saved.work_items.iter().map(|w| w.id).collect();
+        let changed = self.saved.ensure_work();
+        if legacy {
+            return changed;
+        }
+        for work in self
+            .saved
+            .work_items
+            .iter_mut()
+            .filter(|w| w.specification.is_none() && !existing.contains(&w.id))
+        {
+            if let Some(directory) = self
+                .saved
+                .sessions
+                .iter()
+                .find(|s| s.work_id == Some(work.id))
+                .and_then(|s| self.panes.get(&s.pane))
+                .and_then(|p| p.terminal.current_directory().ok())
+                .and_then(|path| path.into_os_string().into_string().ok())
+            {
+                work.directory = directory;
+            }
+        }
+        changed
     }
     fn drain(&mut self) {
         if let Some(discovery) = &mut self.discovery {
@@ -761,13 +913,24 @@ impl App {
                     })
                     .unwrap_or_else(|| {
                         if self.saved.sessions.len() >= 256 {
-                            self.saved.sessions.remove(0);
+                            let oldest = self.saved.sessions.iter().position(|s| {
+                                matches!(s.state, SessionState::Ended | SessionState::Disconnected)
+                            });
+                            if let Some(index) = oldest {
+                                self.saved.sessions.remove(index);
+                            } else {
+                                return usize::MAX;
+                            }
                         }
                         let mut session = Session::new(e.pane, e.session_id.clone());
                         session.agent = e.agent;
                         self.saved.sessions.push(session);
                         self.saved.sessions.len() - 1
                     });
+                if idx == usize::MAX {
+                    self.error = "Session limit (256) reached. Close or clear historical sessions before tracking more.".into();
+                    continue;
+                }
                 if self.saved.sessions[idx].observed_process.take().is_some() {
                     let old_key = self.saved.sessions[idx].key();
                     self.saved.sessions[idx].session_id = e.session_id.clone();
@@ -777,6 +940,10 @@ impl App {
                 }
                 self.dirty |= self.saved.sessions[idx].apply(e, now());
             }
+        }
+        self.dirty |= self.sync_work();
+        if self.saved.sessions.iter().any(|s| s.work_id.is_none()) {
+            self.error = "Work limit (256) reached. Existing work is kept; attach ungrouped sessions to existing work.".into();
         }
         let exited: Vec<_> = self
             .panes
@@ -796,7 +963,7 @@ impl App {
                         self.dirty = true;
                         if code != 0 {
                             self.error = format!(
-                                "{} exited with code {code}. Output is retained in its terminal; check installation, PATH and authentication, then retry from Specs.",
+                                "{} exited with code {code}. Output is retained in its terminal; check installation, PATH and authentication, then retry from the work specification.",
                                 launch.agent
                             );
                             if spec.status == 2
@@ -943,7 +1110,19 @@ impl App {
             return;
         }
         if ctx.input_mut(|i| i.consume_key(command | Modifiers::SHIFT, Key::S)) {
-            self.specifications_view = !self.specifications_view;
+            if self.specifications_view {
+                self.specifications_view = false;
+                self.overview = true;
+            } else {
+                self.selected_spec = self
+                    .saved
+                    .work_items
+                    .iter()
+                    .find(|w| Some(w.id) == self.selected_work)
+                    .and_then(|w| w.specification);
+                self.specifications_view = self.selected_spec.is_some();
+                self.overview = true;
+            }
         }
         if ctx.input_mut(|i| i.consume_key(command | Modifiers::SHIFT, Key::O)) {
             self.overview = if self.specifications_view {
@@ -1068,6 +1247,7 @@ impl App {
         }
     }
     fn cleanup_disconnected_sessions(&mut self) {
+        self.sync_work();
         let previous = self.saved.sessions.len();
         self.saved
             .sessions
@@ -1086,353 +1266,399 @@ impl App {
     }
 
     fn overview(&mut self, ui: &mut egui::Ui) {
-        let narrow = ui.available_width() < 760.0;
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            ui.heading("Session overview");
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if narrow && !self.saved.sessions.is_empty() {
-                    if ui
-                        .selectable_label(self.overview_inspector, "Activity")
-                        .clicked()
-                    {
-                        self.overview_inspector = true;
-                    }
-                    if ui
-                        .selectable_label(!self.overview_inspector, "Sessions")
-                        .clicked()
-                    {
-                        self.overview_inspector = false;
-                    }
-                }
-                ui.label(
-                    RichText::new(format!("{} recorded", self.saved.sessions.len()))
-                        .small()
-                        .color(ui.visuals().weak_text_color()),
-                );
+        let keyboard_was_claimed = ui.ctx().wants_keyboard_input()
+            || ui.ctx().memory(|m| {
+                m.had_focus_last_frame(egui::Id::new("work-filter"))
+                    || self.selected_work.is_some_and(|id| {
+                        m.had_focus_last_frame(egui::Id::new(("work-title", id)))
+                            || m.had_focus_last_frame(egui::Id::new(("work-directory", id)))
+                    })
             });
-        });
-        ui.add_space(8.0);
-        let disconnected = self
-            .saved
-            .sessions
-            .iter()
-            .filter(|session| session.state == SessionState::Disconnected)
-            .count();
-        if disconnected > 0 && ui.button(format!("Clear disconnected sessions ({disconnected})"))
-            .on_hover_text("Remove disconnected session history. Terminals and working directories are kept.")
-            .clicked() {
-            self.cleanup_disconnected_sessions();
-        }
+        let popup_was_open = egui::Popup::is_any_open(ui.ctx());
+        self.dirty |= self.sync_work();
         ui.horizontal_wrapped(|ui| {
-            let attention = self
-                .saved
-                .sessions
-                .iter()
-                .filter(|s| s.state.attention())
-                .count();
-            let running = self
-                .saved
-                .sessions
-                .iter()
-                .filter(|s| s.state == SessionState::Running)
-                .count();
-            ui.label(
-                RichText::new(format!("{attention} need attention")).color(attention_color(ui)),
-            );
-            ui.separator();
-            ui.label(RichText::new(format!("{running} running")).color(accent(ui)));
-        });
-        ui.add_space(16.0);
-        if self.saved.sessions.is_empty() {
-            egui::ScrollArea::vertical()
-                .id_salt("overview-empty")
-                .max_height(ui.available_height())
-                .show(ui, |ui| {
-                    ui.add_space(12.0);
-                    ui.heading("Connect your first agent");
-                    ui.label(
-                        "Install lifecycle hooks, then start Claude Code or Codex in a terminal.",
-                    );
-                    ui.add_space(14.0);
-                    section_label(ui, "CLAUDE CODE");
-                    ui.monospace("tessera install-hooks");
-                    ui.add_space(8.0);
-                    section_label(ui, "CODEX");
-                    ui.monospace("tessera install-codex-hooks");
-                    ui.small("Review and trust the hooks with /hooks in Codex.");
-                    ui.monospace("codex --no-daemon");
-                    ui.small("Start in this pane without the shared background server.");
-                    ui.add_space(16.0);
-                    if primary_button(ui, "Open terminal").clicked() {
-                        self.overview = false;
-                        self.specifications_view = false;
-                    }
-                });
-            return;
-        }
-        ui.horizontal_wrapped(|ui| {
-            for (category, label) in [
-                (0, "All"),
-                (1, "Needs you"),
-                (2, "Running"),
-                (3, "Review"),
-                (4, "Accepted"),
-                (5, "Disconnected"),
-            ] {
-                if ui
-                    .selectable_label(self.category == category, label)
-                    .clicked()
-                {
-                    self.category = category;
+            ui.heading("Work");
+            if ui.button("New work").clicked() {
+                if self.saved.work_items.len() >= 256 { self.error = "Work limit (256) reached. Existing work is kept.".into(); }
+                else {
+                    let mut w = WorkItem::new("Untitled work".into(), self.new_directory.clone());
+                    w.stage = WorkStage::Define;
+                    self.overview_inspector = true;
+                    self.selected_work = Some(w.id);
+                    self.saved.work_items.push(w);
+                    self.category = 1;
+                    self.dirty = true;
                 }
             }
+            for (value, label) in [(0, "Attention"), (1, "Active"), (2, "History")] {
+                ui.selectable_value(&mut self.category, value, label);
+            }
+            if self.category == 2 { ui.menu_button("Clear disconnected sessions", |ui| {
+                ui.label("Clear disconnected session diagnostics? Work items and specifications are kept.");
+                if ui.button("Clear sessions").clicked() { self.cleanup_disconnected_sessions(); ui.close(); }
+            }); }
         });
-        ui.add_space(12.0);
-        let visible: Vec<usize> = self
+        ui.small(
+            "Stages are explicit. Hooks report activity, not verification or delivery evidence.",
+        );
+        ui.horizontal(|ui| {
+            ui.label("Find work");
+            ui.add(egui::TextEdit::singleline(&mut self.filter).id(egui::Id::new("work-filter")));
+        });
+        let mut items: Vec<_> = self
             .saved
-            .sessions
+            .work_items
             .iter()
-            .enumerate()
-            .filter_map(|(index, s)| {
-                let task = self
-                    .saved
-                    .workspaces
-                    .iter()
-                    .find(|w| layout_contains(&w.layout, s.pane))
-                    .map(|w| w.task.state);
-                let show = match self.category {
-                    1 => s.state.attention(),
-                    2 => s.state == SessionState::Running,
-                    3 => task == Some(TaskState::ReviewRequested),
-                    4 => task == Some(TaskState::Accepted),
-                    5 => s.state == SessionState::Disconnected,
-                    _ => true,
+            .filter(|w| {
+                let history = self.saved.work_is_history(w);
+                let category = match self.category {
+                    0 => !history && w.attention(&self.saved.sessions) < 3,
+                    1 => !history,
+                    _ => history,
                 };
-                show.then_some(index)
+                category
+                    && (w.title.to_lowercase().contains(&self.filter.to_lowercase())
+                        || w.directory
+                            .to_lowercase()
+                            .contains(&self.filter.to_lowercase()))
             })
+            .cloned()
             .collect();
-        // A hidden selection must not display context from another filter.
-        if !visible.iter().any(|index| {
-            self.selected.as_deref() == Some(self.saved.sessions[*index].key().as_str())
-        }) {
-            self.selected = visible
-                .first()
-                .map(|index| self.saved.sessions[*index].key());
+        items.sort_by_key(|w| {
+            (
+                w.attention(&self.saved.sessions),
+                w.title.to_lowercase(),
+                w.id,
+            )
+        });
+        if items.is_empty() {
+            self.overview_inspector = false;
         }
-        let list_width = if narrow {
-            ui.available_width()
-        } else {
-            ui.available_width() * 0.52
-        };
-        let list_height = ui.available_height();
-        let mut open = None;
-        if narrow && self.overview_inspector && self.selected.is_some() {
-            self.inspector(ui);
-        } else {
-            ui.horizontal_top(|ui| {
-                ui.allocate_ui_with_layout(
-                    Vec2::new(list_width, list_height),
-                    egui::Layout::top_down(egui::Align::Min),
-                    |ui| {
-                        if visible.is_empty() {
-                            ui.add_space(18.0);
-                            ui.label("No sessions in this view");
-                            ui.small("New lifecycle events will appear here.");
-                        }
-                        egui::ScrollArea::vertical()
-                            .id_salt("sessions")
-                            .max_height(list_height)
-                            .auto_shrink([false, false])
-                            .show_rows(ui, 100.0, visible.len(), |ui, range| {
-                                for index in &visible[range] {
-                                    let s = &self.saved.sessions[*index];
-                                    let workspace = self
-                                        .saved
-                                        .workspaces
-                                        .iter()
-                                        .find(|w| layout_contains(&w.layout, s.pane));
-                                    let title = workspace
-                                        .map_or("Closed workspace", |w| w.task.title.as_str());
-                                    let directory = workspace
-                                        .map_or("Retained session history", |w| {
-                                            w.task.directory.as_str()
-                                        });
-                                    let selected =
-                                        self.selected.as_deref() == Some(s.key().as_str());
-                                    let tint = if s.state.attention() {
-                                        attention_color(ui)
-                                    } else if s.state == SessionState::Running {
-                                        accent(ui)
-                                    } else {
-                                        ui.visuals().weak_text_color()
-                                    };
-                                    let frame = egui::Frame::new()
-                                        .fill(if selected {
-                                            ui.visuals().selection.bg_fill
-                                        } else {
-                                            ui.visuals().panel_fill
-                                        })
-                                        .inner_margin(12.0)
-                                        .corner_radius(4);
-                                    let response = frame
-                                        .show(ui, |ui| {
-                                            ui.set_width((list_width - 30.0).max(80.0));
-                                            ui.set_min_height(76.0);
-                                            ui.spacing_mut().item_spacing.y = 3.0;
-                                            ui.spacing_mut().interact_size.y = 20.0;
-                                            ui.horizontal(|ui| {
-                                                ui.add(
-                                                    egui::Label::new(
-                                                        RichText::new(title).strong().size(15.0),
-                                                    )
-                                                    .truncate(),
-                                                );
-                                                ui.with_layout(
-                                                    egui::Layout::right_to_left(
-                                                        egui::Align::Center,
-                                                    ),
-                                                    |ui| {
-                                                        ui.label(
-                                                            RichText::new(s.agent.label())
-                                                                .size(11.0)
-                                                                .color(
-                                                                    ui.visuals().weak_text_color(),
-                                                                ),
-                                                        );
-                                                    },
-                                                );
-                                            });
-                                            ui.add(
-                                                egui::Label::new(
-                                                    RichText::new(directory)
-                                                        .small()
-                                                        .color(ui.visuals().weak_text_color()),
-                                                )
-                                                .truncate(),
-                                            );
-                                            ui.horizontal(|ui| {
-                                                ui.label(
-                                                    RichText::new(s.state.label())
-                                                        .size(12.0)
-                                                        .color(tint),
-                                                );
-                                                ui.label(
-                                                    RichText::new(relative_time(
-                                                        now().saturating_sub(s.updated),
-                                                    ))
-                                                    .small()
-                                                    .color(ui.visuals().weak_text_color()),
-                                                );
-                                            });
-                                            let detail = s
-                                                .history
-                                                .back()
-                                                .map(|a| {
-                                                    if a.detail.is_empty() {
-                                                        a.kind.clone()
-                                                    } else {
-                                                        format!("{} · {}", a.kind, a.detail)
-                                                    }
-                                                })
-                                                .unwrap_or_else(|| if s.observed_process.is_some() {
-                                                    "Agent detected · waiting for lifecycle hooks".into()
-                                                } else {
-                                                    "Waiting for activity".into()
-                                                });
-                                            ui.add(
-                                                egui::Label::new(RichText::new(detail).small())
-                                                    .truncate(),
-                                            );
-                                        })
-                                        .response;
-                                    let response = ui.interact(
-                                        response.rect,
-                                        ui.id().with(s.key()),
-                                        Sense::click(),
-                                    );
-                                    response.widget_info(|| {
-                                        egui::WidgetInfo::selected(
-                                            egui::WidgetType::SelectableLabel,
-                                            true,
-                                            selected,
-                                            title,
-                                        )
-                                    });
-                                    if selected {
-                                        ui.painter().line_segment(
-                                            [
-                                                response.rect.left_top() + Vec2::new(0.0, 6.0),
-                                                response.rect.left_bottom() - Vec2::new(0.0, 6.0),
-                                            ],
-                                            Stroke::new(2.0_f32, accent(ui)),
-                                        );
-                                    }
-                                    if response.clicked() {
-                                        self.selected = Some(s.key());
-                                        if narrow {
-                                            self.overview_inspector = true;
-                                        }
-                                    }
-                                    if response.double_clicked() {
-                                        open = Some(s.key());
-                                    }
-                                }
-                            });
-                    },
-                );
-                if !narrow {
-                    ui.add_space(10.0);
-                    ui.separator();
-                    ui.add_space(10.0);
-                    ui.allocate_ui_with_layout(
-                        Vec2::new(ui.available_width(), ui.available_height()),
-                        egui::Layout::top_down(egui::Align::Min),
-                        |ui| {
-                            self.inspector(ui);
-                        },
-                    );
-                }
-            });
+        if self.selected_work.is_none() {
+            self.selected_work = self
+                .selected
+                .as_ref()
+                .and_then(|key| self.saved.sessions.iter().find(|s| s.key() == *key))
+                .and_then(|s| s.work_id);
         }
-        if let Some(id) = open {
-            self.focus_session(&id);
+        if !items.iter().any(|w| Some(w.id) == self.selected_work) {
+            self.selected_work = items.first().map(|w| w.id);
+            self.selected = None;
         }
-        if !self.palette
+        if !keyboard_was_claimed
+            && !popup_was_open
+            && !ui.ctx().wants_keyboard_input()
+            && !self.palette
             && self.rename.is_none()
             && self.closing.is_none()
-            && !ui.ctx().wants_keyboard_input()
+            && !egui::Popup::is_any_open(ui.ctx())
+            && ui.ctx().memory(|m| m.top_modal_layer().is_none())
         {
-            if ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
-                self.overview = false;
-                self.specifications_view = false;
-            }
-            let ids: Vec<_> = visible
-                .iter()
-                .map(|index| self.saved.sessions[*index].key())
-                .collect();
-            if !ids.is_empty() {
-                let n = self
-                    .selected
-                    .as_ref()
-                    .and_then(|id| ids.iter().position(|i| i == id))
+            let next = ui.input_mut(|i| {
+                if i.consume_key(Modifiers::NONE, Key::ArrowDown) {
+                    Some(1isize)
+                } else if i.consume_key(Modifiers::NONE, Key::ArrowUp) {
+                    Some(-1)
+                } else {
+                    None
+                }
+            });
+            if let Some(delta) = next
+                && !items.is_empty()
+            {
+                let current = items
+                    .iter()
+                    .position(|w| Some(w.id) == self.selected_work)
                     .unwrap_or(0);
-                if ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowDown)) {
-                    self.selected = Some(ids[(n + 1) % ids.len()].clone());
-                }
-                if ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowUp)) {
-                    self.selected = Some(ids[(n + ids.len() - 1) % ids.len()].clone());
-                }
-                if ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter)) {
-                    self.focus_session(&ids[n]);
-                }
-                if ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+                self.selected_work = Some(
+                    items[(current as isize + delta).clamp(0, items.len() as isize - 1) as usize]
+                        .id,
+                );
+                self.selected = None;
+            }
+            if ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter))
+                && let Some(id) = self.selected_work
+            {
+                self.work_action(id);
+            }
+            if ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+                if ui.available_width() < 760.0 && self.overview_inspector {
+                    self.overview_inspector = false;
+                } else {
                     self.overview = false;
                     self.specifications_view = false;
                 }
             }
         }
+        if ui.available_width() >= 760.0 {
+            ui.columns(2, |columns| {
+                self.work_list(&mut columns[0], &items);
+                egui::ScrollArea::vertical()
+                    .id_salt("work-detail")
+                    .show(&mut columns[1], |ui| self.work_detail(ui));
+            });
+        } else if self.overview_inspector {
+            if ui.button("Back to work list").clicked() {
+                self.overview_inspector = false;
+            }
+            egui::ScrollArea::vertical()
+                .id_salt("work-detail")
+                .show(ui, |ui| self.work_detail(ui));
+        } else {
+            self.work_list(ui, &items);
+        }
     }
+
+    fn work_action(&mut self, id: Uuid) {
+        self.selected_work = Some(id);
+        self.overview_inspector = true;
+        let session = self
+            .saved
+            .sessions
+            .iter()
+            .filter(|s| s.work_id == Some(id))
+            .min_by_key(|s| {
+                let unread = s
+                    .history
+                    .iter()
+                    .any(|a| a.kind == "Stop" && a.sequence > s.seen_sequence);
+                (
+                    if s.state.attention() {
+                        0
+                    } else if unread {
+                        1
+                    } else {
+                        2
+                    },
+                    std::cmp::Reverse(s.updated),
+                )
+            })
+            .map(Session::key);
+        self.selected = session.clone();
+        if let Some(key) = session
+            && let Some(index) = self.saved.sessions.iter().position(|s| s.key() == key)
+            && self.panes.contains_key(&self.saved.sessions[index].pane)
+        {
+            self.saved.sessions[index].seen = now();
+            self.saved.sessions[index].seen_sequence = self.saved.sessions[index].last_sequence;
+            self.dirty = true;
+            self.focus_session(&key);
+        }
+    }
+
+    fn work_list(&mut self, ui: &mut egui::Ui, items: &[WorkItem]) {
+        if items.is_empty() {
+            ui.label("No work in this view");
+        }
+        egui::ScrollArea::vertical()
+            .id_salt("work-list")
+            .auto_shrink([false, false])
+            .show_rows(ui, 96.0, items.len(), |ui, range| {
+                for work in &items[range] {
+                    let sessions: Vec<_> = self
+                        .saved
+                        .sessions
+                        .iter()
+                        .filter(|s| s.work_id == Some(work.id))
+                        .collect();
+                    let action = match work.attention(&self.saved.sessions) {
+                        0 => "Inspect CLI request",
+                        1 => "Inspect response",
+                        _ => work.stage.action(),
+                    };
+                    let at = sessions
+                        .iter()
+                        .map(|s| s.updated)
+                        .filter(|at| *at > 0)
+                        .max();
+                    let count = sessions.len();
+                    ui.allocate_ui(Vec2::new(ui.available_width(), 92.0), |ui| {
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add(
+                                    egui::Button::selectable(
+                                        self.selected_work == Some(work.id),
+                                        RichText::new(&work.title).strong(),
+                                    )
+                                    .truncate(),
+                                )
+                                .clicked()
+                            {
+                                self.selected_work = Some(work.id);
+                                self.selected = None;
+                                self.overview_inspector = true;
+                            }
+                        });
+                        ui.label(format!(
+                            "{} · {count} {}",
+                            work.stage.label(),
+                            if count == 1 { "session" } else { "sessions" }
+                        ));
+                        ui.horizontal(|ui| {
+                            if ui.button(action).clicked() {
+                                self.work_action(work.id);
+                            }
+                            if let Some(at) = at {
+                                ui.small(format!(
+                                    "Observed {}",
+                                    relative_time(now().saturating_sub(at))
+                                ));
+                            }
+                        });
+                        ui.separator();
+                    });
+                }
+            });
+    }
+
+    fn work_detail(&mut self, ui: &mut egui::Ui) {
+        let Some(index) = self
+            .saved
+            .work_items
+            .iter()
+            .position(|w| Some(w.id) == self.selected_work)
+        else {
+            return;
+        };
+        ui.separator();
+        section_label(ui, "WORK CONTEXT");
+        if self.saved.work_is_history(&self.saved.work_items[index])
+            && self.saved.work_items[index].disposition == WorkDisposition::Active
+        {
+            ui.small("No linked live session. Choose Active to reopen this work, or attach a live session.");
+        }
+        let work = &mut self.saved.work_items[index];
+        ui.label("Title");
+        let title_changed = ui
+            .add(
+                egui::TextEdit::singleline(&mut work.title)
+                    .id(egui::Id::new(("work-title", work.id))),
+            )
+            .changed();
+        ui.label("Working directory");
+        let directory_changed = ui
+            .add(
+                egui::TextEdit::singleline(&mut work.directory)
+                    .id(egui::Id::new(("work-directory", work.id))),
+            )
+            .changed();
+        self.dirty |= title_changed || directory_changed;
+        if let Some(spec) = self
+            .saved
+            .specifications
+            .iter_mut()
+            .find(|s| Some(s.id) == work.specification)
+        {
+            if title_changed {
+                spec.draft.title.clone_from(&work.title);
+            }
+            if directory_changed {
+                spec.draft.directory.clone_from(&work.directory);
+            }
+        }
+        ui.horizontal_wrapped(|ui| {
+            for stage in WorkStage::ALL {
+                if ui
+                    .selectable_label(work.stage == stage, stage.label())
+                    .clicked()
+                {
+                    work.stage = stage;
+                    self.dirty = true;
+                }
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            for (value, label) in [
+                (WorkDisposition::Active, "Active"),
+                (WorkDisposition::Completed, "Completed"),
+                (WorkDisposition::Archived, "Archived"),
+            ] {
+                if ui
+                    .selectable_label(work.disposition == value, label)
+                    .clicked()
+                {
+                    work.set_disposition(value);
+                    self.dirty = true;
+                }
+            }
+        });
+        let work_id = work.id;
+        let title = work.title.clone();
+        let directory = work.directory.clone();
+        if let Some(id) = work.specification {
+            if ui.button("Open specification and revisions").clicked() {
+                self.selected_spec = Some(id);
+                self.specifications_view = true;
+            }
+        } else if ui.button("Add specification").clicked() {
+            let mut spec = crate::specs::Specification::new(directory);
+            spec.draft.title = title;
+            work.specification = Some(spec.id);
+            self.selected_spec = Some(spec.id);
+            self.saved.specifications.push(spec);
+            self.specifications_view = true;
+            self.dirty = true;
+        }
+        ui.add_space(10.0);
+        section_label(ui, "LINKED SESSIONS");
+        let sessions: Vec<_> = self
+            .saved
+            .sessions
+            .iter()
+            .filter(|s| s.work_id == Some(work_id))
+            .cloned()
+            .collect();
+        if sessions.is_empty() {
+            ui.small("Start an agent in Terminal, then attach its session here.");
+        }
+        for session in sessions {
+            if ui
+                .selectable_label(
+                    self.selected.as_deref() == Some(session.key().as_str()),
+                    format!(
+                        "{} · {} · {}",
+                        session.agent.label(),
+                        session.state.label(),
+                        session.session_id
+                    ),
+                )
+                .clicked()
+            {
+                self.selected = Some(session.key());
+            }
+        }
+        ui.menu_button("Attach a session to this work", |ui| {
+            let choices: Vec<_> = self
+                .saved
+                .sessions
+                .iter()
+                .filter(|s| s.work_id != Some(work_id))
+                .map(|s| (s.key(), format!("{} · {}", s.agent.label(), s.session_id)))
+                .collect();
+            if choices.is_empty() {
+                ui.label("No other sessions");
+            }
+            for (key, label) in choices {
+                if ui.button(label).clicked() {
+                    if let Some(session) = self.saved.sessions.iter_mut().find(|s| s.key() == key) {
+                        session.work_id = Some(work_id);
+                    }
+                    self.selected = Some(key);
+                    self.dirty = true;
+                    ui.close();
+                }
+            }
+        });
+        if self.selected.as_ref().is_some_and(|key| {
+            self.saved
+                .sessions
+                .iter()
+                .any(|s| s.key() == *key && s.work_id == Some(work_id))
+        }) {
+            self.inspector(ui);
+        }
+    }
+
     fn inspector(&mut self, ui: &mut egui::Ui) {
         let Some(id) = self.selected.clone() else {
             ui.label(
@@ -1447,12 +1673,8 @@ impl App {
         let session = &self.saved.sessions[index];
         let pane = session.pane;
         let live = self.panes.contains_key(&pane);
-        let wi = self
-            .saved
-            .workspaces
-            .iter()
-            .position(|w| layout_contains(&w.layout, pane));
         let mut open = false;
+        let mut inspected = false;
         let linked_spec = self.saved.specifications.iter().find_map(|spec| {
             spec.launches
                 .iter()
@@ -1476,6 +1698,8 @@ impl App {
                         },
                     ));
                 });
+                if session.updated > 0 { ui.small(format!("Last observed {}", relative_time(now().saturating_sub(session.updated)))); }
+                ui.small(if session.state == SessionState::Unknown { "Limited tracking: process/session observed; turn activity unknown." } else { "Hook observations only. Approval and output remain in the CLI." });
                 ui.add_space(8.0);
                 open = ui
                     .add_enabled_ui(live, |ui| primary_button(ui, "Open live terminal"))
@@ -1491,34 +1715,7 @@ impl App {
                 }
                 if !live {
                     ui.small("Terminal closed · history retained");
-                }
-                if let Some(wi) = wi {
-                    ui.add_space(18.0);
-                    section_label(ui, "TASK");
-                    let w = &mut self.saved.workspaces[wi];
-                    let label = ui.label("Title");
-                    if ui
-                        .add(
-                            egui::TextEdit::singleline(&mut w.task.title)
-                                .desired_width(f32::INFINITY),
-                        )
-                        .labelled_by(label.id)
-                        .changed()
-                    {
-                        self.dirty = true;
-                    }
-                    ui.horizontal_wrapped(|ui| {
-                        for (state, label) in [
-                            (TaskState::Implementing, "Implementing"),
-                            (TaskState::ReviewRequested, "Request review"),
-                            (TaskState::Accepted, "Accept task"),
-                        ] {
-                            if ui.selectable_label(w.task.state == state, label).clicked() {
-                                w.task.state = state;
-                                self.dirty = true;
-                            }
-                        }
-                    });
+                    inspected = ui.button("Mark response inspected").clicked();
                 }
                 ui.add_space(18.0);
                 let unread = session
@@ -1526,7 +1723,7 @@ impl App {
                     .iter()
                     .filter(|a| a.sequence > session.seen_sequence)
                     .count();
-                section_label(ui, &format!("ACTIVITY · {unread} NEW"));
+                egui::CollapsingHeader::new(format!("Diagnostics · {unread} new events")).show(ui, |ui| {
                 ui.add_space(8.0);
                 for a in session.history.iter().rev() {
                     ui.horizontal(|ui| {
@@ -1552,13 +1749,16 @@ impl App {
                     ui.separator();
                     ui.add_space(5.0);
                 }
-                ui.small("Review and acceptance are explicit task actions.");
+                });
+                ui.small("Stage and completion are explicit work actions. Hooks do not prove checks passed.");
             });
-        if open {
+        if open || inspected {
             self.saved.sessions[index].seen = now();
             self.saved.sessions[index].seen_sequence = self.saved.sessions[index].last_sequence;
             self.dirty = true;
-            self.focus_session(&id);
+            if open {
+                self.focus_session(&id);
+            }
         }
     }
 }
@@ -1626,26 +1826,22 @@ impl App {
                         self.overview = false;
                         self.specifications_view = false;
                     }
-                    if ui
-                        .selectable_label(self.specifications_view, "Specs")
-                        .clicked()
-                    {
-                        self.specifications_view = true;
-                    }
                     let attention = self
                         .saved
-                        .sessions
+                        .work_items
                         .iter()
-                        .filter(|s| s.state.attention())
+                        .filter(|w| {
+                            !self.saved.work_is_history(w) && w.attention(&self.saved.sessions) < 3
+                        })
                         .count();
                     let overview = if attention > 0 {
-                        format!("Overview · {attention}")
+                        format!("Work · {attention}")
                     } else {
-                        "Overview".into()
+                        "Work".into()
                     };
                     if ui
-                        .selectable_label(self.overview && !self.specifications_view, overview)
-                        .on_hover_text(shortcut("Overview", "Shift+O"))
+                        .selectable_label(self.overview || self.specifications_view, overview)
+                        .on_hover_text(shortcut("Work", "Shift+O"))
                         .clicked()
                     {
                         self.overview = true;
@@ -2294,7 +2490,7 @@ impl App {
                 ("Side-by-side split", "D"),
                 ("Stacked split", "Shift+D"),
                 ("Focus pane in direction", "← / → / ↑ / ↓"),
-                ("Overview", "Shift+O"),
+                ("Work", "Shift+O"),
                 ("Commands", "Shift+P"),
                 ("Rename workspace", "Shift+R"),
                 ("Find", "F"),
@@ -2407,6 +2603,16 @@ impl App {
             exit_code: None,
         });
         spec.status = 2;
+        self.sync_work();
+        if let Some(work) = self
+            .saved
+            .work_items
+            .iter_mut()
+            .find(|w| w.specification == Some(self.saved.specifications[index].id))
+            && !work.panes.contains(&pane)
+        {
+            work.panes.push(pane);
+        }
         self.overview = false;
         self.specifications_view = false;
         self.dirty = true;
@@ -2416,8 +2622,18 @@ impl App {
 
     fn specifications(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.heading("Specifications");
-            if ui.button("+ Specification").clicked() {
+            if ui.button("Back to work").clicked() {
+                self.specifications_view = false;
+                self.overview = true;
+            }
+            ui.heading("Specification");
+            if ui
+                .add_enabled(
+                    self.saved.work_items.len() < 256,
+                    egui::Button::new("+ Specification"),
+                )
+                .clicked()
+            {
                 let directory = self
                     .saved
                     .workspaces
@@ -2426,20 +2642,14 @@ impl App {
                     .unwrap_or_else(|| self.new_directory.clone());
                 let spec = crate::specs::Specification::new(directory);
                 self.selected_spec = Some(spec.id);
+                let id = spec.id;
                 self.saved.specifications.push(spec);
+                self.sync_work();
+                self.selected_work = Some(id);
                 self.dirty = true;
             }
         });
         egui::ScrollArea::vertical().id_salt("spec-board").show(ui, |ui| {
-            ui.columns(3, |columns| {
-                for (status, label) in ["Draft", "Ready", "In progress"].iter().enumerate() {
-                    columns[status].strong(*label);
-                    for spec in self.saved.specifications.iter().filter(|s| s.status == status) {
-                        if columns[status].selectable_label(self.selected_spec == Some(spec.id), &spec.draft.title).clicked() { self.selected_spec = Some(spec.id); }
-                    }
-                }
-            });
-            ui.separator();
             let Some(index) = self.saved.specifications.iter().position(|s| Some(s.id) == self.selected_spec) else { ui.label("Create or select a specification."); return; };
             let mut delete = false;
             ui.menu_button("Delete specification", |ui| {
@@ -2456,7 +2666,8 @@ impl App {
                 });
             });
             if delete {
-                self.saved.specifications.remove(index);
+                let removed = self.saved.specifications.remove(index);
+                for work in &mut self.saved.work_items { if work.specification == Some(removed.id) { work.specification = None; } }
                 self.selected_spec = None;
                 self.dirty = true;
                 return;
@@ -2471,11 +2682,6 @@ impl App {
                 ui.small("A leading / points to the filesystem root, not your home directory.");
                 if ui.button(format!("Use {alternative}")).clicked() { spec.draft.directory = alternative; self.dirty = true; self.error.clear(); }
             }
-            ui.horizontal(|ui| {
-                for (status, label) in ["Draft", "Ready", "In progress"].iter().enumerate() {
-                    if ui.selectable_label(spec.status == status, *label).clicked() { spec.status = status; self.dirty = true; }
-                }
-            });
             ui.label("Specification · Markdown");
             self.dirty |= ui.add(egui::TextEdit::multiline(&mut spec.draft.markdown).desired_width(f32::INFINITY).desired_rows(10).code_editor()).changed();
             if ui.button("Save revision").clicked() {
@@ -2545,7 +2751,7 @@ impl App {
             }
             ui.separator();
             ui.horizontal(|ui| { ui.strong("Launch context preview"); ui.selectable_value(&mut self.spec_codex, false, "Claude"); ui.selectable_value(&mut self.spec_codex, true, "Codex"); });
-            ui.label("The current draft is saved as an immutable revision. The agent starts in a new terminal after you confirm Launch agent.");
+            ui.label("Launch implementation saves an immutable revision and starts a new terminal. This always requests implementation; the work stage stays unchanged.");
             let directory = crate::directories::resolve(&spec.draft.directory);
             let mut launch_draft = spec.draft.clone();
             if let Ok(path) = &directory { launch_draft.directory = path.to_string_lossy().into_owned(); }
@@ -2558,7 +2764,7 @@ impl App {
                 Ok(path) => { ui.small(format!("Agent working directory: {}", path.display())); },
                 Err(error) => { ui.colored_label(ui.visuals().error_fg_color, error.to_string()); }
             }
-            let launch = ui.add_enabled(command.is_ok() && !spec.draft.markdown.trim().is_empty() && !spec.draft.title.trim().is_empty() && directory.is_ok(), egui::Button::new("Launch agent")).clicked();
+            let launch = ui.add_enabled(command.is_ok() && !spec.draft.markdown.trim().is_empty() && !spec.draft.title.trim().is_empty() && directory.is_ok(), egui::Button::new("Launch implementation")).clicked();
             let mut open_pane = None;
             for launch in spec.launches.iter().rev() {
                 ui.horizontal(|ui| {
@@ -2572,8 +2778,25 @@ impl App {
                 self.specifications_view = false;
             }
         });
+        if let Some(spec) = self
+            .saved
+            .specifications
+            .iter()
+            .find(|s| Some(s.id) == self.selected_spec)
+            && let Some(work) = self
+                .saved
+                .work_items
+                .iter_mut()
+                .find(|w| w.specification == Some(spec.id))
+            && (work.title != spec.draft.title || work.directory != spec.draft.directory)
+        {
+            work.title.clone_from(&spec.draft.title);
+            work.directory.clone_from(&spec.draft.directory);
+            self.dirty = true;
+        }
     }
     fn draw(&mut self, ctx: &egui::Context) {
+        self.dirty |= self.sync_work();
         self.drain();
         if self.discovery.is_some() && !self.panes.is_empty() {
             ctx.request_repaint_after(Duration::from_secs(2));
@@ -2624,7 +2847,7 @@ impl App {
                 ui.horizontal_wrapped(|ui| {
                     if self.error.is_empty() {
                         let label = if self.overview {
-                            format!("{} recorded sessions", self.saved.sessions.len())
+                            format!("{} work items", self.saved.work_items.len())
                         } else if self.maximized {
                             "Focused pane · maximized".into()
                         } else {
@@ -2810,7 +3033,7 @@ impl CommandAction {
         match self {
             Self::Workspace(_) => "Workspace",
             Self::Create => "New workspace",
-            Self::Overview => "Toggle Overview",
+            Self::Overview => "Toggle Work",
             Self::Split => "Split side by side",
             Self::Stack => "Split stacked",
             Self::Maximize => "Maximize / restore pane",
@@ -2822,7 +3045,7 @@ impl CommandAction {
         match self {
             Self::Workspace(_) => "",
             Self::Create => "Choose a directory and an optional name",
-            Self::Overview => "Inspect agent sessions and activity",
+            Self::Overview => "Inspect work and next actions",
             Self::Split | Self::Stack => "Open another shell in the current directory",
             Self::Maximize => "Focus on one terminal",
             Self::Rename => "Change the current workspace name",
@@ -4160,6 +4383,219 @@ fn encode_key(key: Key, m: Modifiers, mode: TermMode) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
     #[test]
+    fn work_migration_preserves_empty_workspaces_specs_and_provider_identity() {
+        let pane = Uuid::new_v4();
+        let empty = Uuid::new_v4();
+        let mut saved = Saved::default();
+        let mut spec = crate::specs::Specification::new("/tmp/repo".into());
+        spec.draft.title = "Scope".into();
+        spec.draft.markdown = "Keep revision".into();
+        spec.status = 1;
+        spec.save_revision().unwrap();
+        spec.begin_proposal().unwrap();
+        spec.launches.push(crate::specs::Launch {
+            pane,
+            revision: 1,
+            agent: "Codex".into(),
+            exit_code: None,
+        });
+        let id = spec.id;
+        saved.specifications.push(spec);
+        let task = Task {
+            id: empty,
+            title: "Named review".into(),
+            directory: "/tmp/empty".into(),
+            state: TaskState::ReviewRequested,
+        };
+        saved.workspaces.push(Workspace {
+            task,
+            layout: Layout::Pane(Uuid::new_v4()),
+            focus: Uuid::new_v4(),
+        });
+        let claude = Session::new(pane, "shared".into());
+        let mut codex = claude.clone();
+        codex.agent = crate::model::Agent::Codex;
+        saved.sessions = vec![claude, codex];
+        let mut legacy = serde_json::to_value(&saved).unwrap();
+        legacy.as_object_mut().unwrap().remove("work_items");
+        legacy.as_object_mut().unwrap().remove("work_version");
+        for session in legacy["sessions"].as_array_mut().unwrap() {
+            session.as_object_mut().unwrap().remove("work_id");
+        }
+        let mut migrated: Saved = serde_json::from_value(legacy).unwrap();
+        assert!(migrated.ensure_work());
+        assert_eq!(migrated.work_items.len(), 2);
+        assert!(migrated.sessions.iter().all(|s| s.work_id == Some(id)));
+        assert_ne!(migrated.sessions[0].key(), migrated.sessions[1].key());
+        assert_eq!(
+            migrated
+                .work_items
+                .iter()
+                .find(|w| w.id == empty)
+                .unwrap()
+                .stage,
+            WorkStage::Review
+        );
+        assert_eq!(migrated.specifications[0].revisions.len(), 1);
+        assert!(migrated.specifications[0].proposal.is_some());
+        migrated.workspaces.clear();
+        let mut restored: Saved =
+            serde_json::from_slice(&serde_json::to_vec(&migrated).unwrap()).unwrap();
+        assert!(!restored.ensure_work());
+        let context = restored.work_items.iter().find(|w| w.id == empty).unwrap();
+        assert_eq!(context.title, "Named review");
+        assert_eq!(context.directory, "/tmp/empty");
+    }
+
+    #[test]
+    fn ordinary_sessions_have_independent_stages_and_manual_links_survive_refresh() {
+        let mut saved = Saved {
+            work_version: 1,
+            ..Default::default()
+        };
+        let pane = Uuid::new_v4();
+        saved.sessions = vec![
+            Session::new(pane, "one".into()),
+            Session::new(pane, "two".into()),
+        ];
+        saved.ensure_work();
+        let one = saved.sessions[0].work_id.unwrap();
+        let two = saved.sessions[1].work_id.unwrap();
+        assert_ne!(one, two);
+        saved
+            .work_items
+            .iter_mut()
+            .find(|w| w.id == one)
+            .unwrap()
+            .stage = WorkStage::Review;
+        assert_eq!(
+            saved.work_items.iter().find(|w| w.id == two).unwrap().stage,
+            WorkStage::Build
+        );
+        saved.sessions[1].work_id = Some(one);
+        assert!(!saved.ensure_work());
+        assert_eq!(saved.sessions[1].work_id, Some(one));
+        saved.sessions.clear();
+        saved.ensure_work();
+        assert_eq!(saved.work_items.len(), 2);
+    }
+
+    #[test]
+    fn attention_and_history_do_not_progress_or_accept_work() {
+        let mut saved = Saved {
+            work_version: 1,
+            ..Default::default()
+        };
+        let w = WorkItem::new("Work".into(), "/tmp".into());
+        let id = w.id;
+        let pane = Uuid::new_v4();
+        let mut session = Session::new(pane, "one".into());
+        session.work_id = Some(id);
+        session.apply(
+            crate::model::HookEvent {
+                id: Uuid::new_v4(),
+                pane,
+                sequence: 1,
+                session_id: "one".into(),
+                agent: crate::model::Agent::Claude,
+                hook_event_name: "Stop".into(),
+                detail: String::new(),
+            },
+            10,
+        );
+        saved.sessions.push(session);
+        saved.work_items.push(w);
+        assert_eq!(saved.work_items[0].attention(&saved.sessions), 1);
+        assert_eq!(saved.work_items[0].stage, WorkStage::Build);
+        assert_eq!(saved.work_items[0].disposition, WorkDisposition::Active);
+        saved.sessions[0].seen_sequence = 1;
+        assert_eq!(saved.work_items[0].attention(&saved.sessions), 3);
+        saved.sessions[0].state = SessionState::Permission;
+        assert_eq!(saved.work_items[0].attention(&saved.sessions), 0);
+        saved.sessions[0].state = SessionState::Disconnected;
+        assert!(saved.work_is_history(&saved.work_items[0]));
+        saved.work_items[0].specification = Some(Uuid::new_v4());
+        assert!(!saved.work_is_history(&saved.work_items[0]));
+        saved.work_items[0].stage = WorkStage::Verify;
+        assert_eq!(saved.work_items[0].attention(&saved.sessions), 2);
+        saved.work_items[0].specification = None;
+        saved.ensure_work();
+        saved.sessions.clear();
+        assert!(saved.work_is_history(&saved.work_items[0]));
+        assert_eq!(saved.work_items[0].stage, WorkStage::Verify);
+    }
+
+    #[test]
+    fn work_capacity_keeps_linked_records_and_legacy_overflow() {
+        let mut saved = Saved {
+            work_version: 1,
+            ..Default::default()
+        };
+        saved.work_items = (0..256)
+            .map(|n| WorkItem::new(format!("{n}"), "/tmp".into()))
+            .collect();
+        saved
+            .sessions
+            .push(Session::new(Uuid::new_v4(), "new".into()));
+        saved.ensure_work();
+        assert_eq!(saved.work_items.len(), 256);
+        assert!(saved.sessions[0].work_id.is_none());
+        let oldest = saved.work_items[0].id;
+        saved.work_items[0].disposition = WorkDisposition::Archived;
+        saved.ensure_work();
+        assert_eq!(saved.work_items.len(), 256);
+        assert_eq!(saved.work_items[0].id, oldest);
+        assert_eq!(saved.work_items[0].title, "0");
+        assert!(saved.sessions[0].work_id.is_none());
+    }
+
+    #[test]
+    fn explicit_reopen_survives_disconnection_restart_and_diagnostics_cleanup() {
+        let mut saved = Saved {
+            work_version: 1,
+            ..Default::default()
+        };
+        let mut work = WorkItem::new("Verify paused work".into(), "/tmp".into());
+        work.stage = WorkStage::Verify;
+        work.had_sessions = true;
+        let id = work.id;
+        saved.work_items.push(work);
+        let mut session = Session::new(Uuid::new_v4(), "old".into());
+        session.work_id = Some(id);
+        session.state = SessionState::Disconnected;
+        saved.sessions.push(session);
+        assert!(saved.work_is_history(&saved.work_items[0]));
+        saved.work_items[0].set_disposition(WorkDisposition::Active);
+        assert!(!saved.work_is_history(&saved.work_items[0]));
+        let mut restored: Saved =
+            serde_json::from_slice(&serde_json::to_vec(&saved).unwrap()).unwrap();
+        restored.sessions.clear();
+        restored.ensure_work();
+        assert!(!restored.work_is_history(&restored.work_items[0]));
+        assert_eq!(restored.work_items[0].attention(&restored.sessions), 2);
+        restored.work_items[0].set_disposition(WorkDisposition::Archived);
+        assert!(restored.work_is_history(&restored.work_items[0]));
+        assert!(!restored.work_items[0].keep_active);
+        let mut legacy = serde_json::to_value(&restored).unwrap();
+        legacy["work_items"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("keep_active");
+        let restored: Saved = serde_json::from_value(legacy).unwrap();
+        assert!(!restored.work_items[0].keep_active);
+    }
+
+    #[test]
+    fn state_override_only_accepts_absolute_paths() {
+        assert!(state_override(None).is_none());
+        assert!(state_override(Some("relative.json".into())).is_none());
+        assert_eq!(
+            state_override(Some("/tmp/tessera-test.json".into())),
+            Some(PathBuf::from("/tmp/tessera-test.json"))
+        );
+    }
+
+    #[test]
     fn legacy_saved_state_loads_without_specifications() {
         let saved: Saved = serde_json::from_str(r#"{"workspaces":[],"sessions":[]}"#).unwrap();
         assert!(saved.specifications.is_empty());
@@ -4588,6 +5024,7 @@ mod render_tests {
             overview: true,
             specifications_view: false,
             selected_spec: None,
+            selected_work: None,
             spec_codex: false,
             selected,
             endpoint: None,
@@ -4628,6 +5065,97 @@ mod render_tests {
         )
         .unwrap();
     }
+    #[test]
+    fn ordinary_hook_work_uses_live_directory_and_preserves_later_manual_edits() {
+        let ctx = egui::Context::default();
+        let directory = tempfile::tempdir().unwrap();
+        let nested = directory.path().join("nested project");
+        std::fs::create_dir(&nested).unwrap();
+        let nested = nested.canonicalize().unwrap();
+        let mut app = fixture(0);
+        app.saved.work_version = 1;
+        app.new_directory = directory.path().display().to_string();
+        assert!(app.add_workspace(&ctx));
+        let pane = app.saved.workspaces[0].focus;
+        app.panes[&pane]
+            .terminal
+            .input(format!("cd -- '{}'\r", nested.display()).into_bytes())
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !app.panes[&pane]
+            .terminal
+            .current_directory()
+            .is_ok_and(|path| path == nested)
+        {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let (sender, receiver) = sync_channel(1);
+        app.endpoint = Some(Endpoint {
+            path: directory.path().join("unused.sock"),
+            receiver,
+        });
+        sender
+            .send(HookEvent {
+                id: Uuid::new_v4(),
+                pane,
+                sequence: 1,
+                session_id: "cwd-session".into(),
+                agent: crate::model::Agent::Claude,
+                hook_event_name: "SessionStart".into(),
+                detail: String::new(),
+            })
+            .unwrap();
+        app.drain();
+        assert_eq!(app.saved.work_items.len(), 1);
+        assert_eq!(PathBuf::from(&app.saved.work_items[0].directory), nested);
+        app.selected_work = Some(app.saved.work_items[0].id);
+        let render = |app: &mut App, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(640.0, 700.0))),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| app.work_detail(ui));
+                },
+            )
+        };
+        let out = render(&mut app, vec![]);
+        let pos = out
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text) if text.galley.text() == "Add specification" => {
+                    Some(text.pos + Vec2::new(4.0, 4.0))
+                }
+                _ => None,
+            })
+            .unwrap();
+        for pressed in [true, false] {
+            render(
+                &mut app,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        assert_eq!(
+            PathBuf::from(&app.saved.specifications[0].draft.directory),
+            nested
+        );
+        app.saved.work_items[0].directory = "/manual/directory".into();
+        app.drain();
+        assert_eq!(app.saved.work_items[0].directory, "/manual/directory");
+    }
+
     #[test]
     fn first_hook_upgrades_discovered_session_and_preserves_selection() {
         let ctx = egui::Context::default();
@@ -4778,7 +5306,7 @@ mod render_tests {
                 .shapes
                 .iter()
                 .find_map(|shape| match &shape.shape {
-                    egui::epaint::Shape::Text(text) if text.galley.text() == "Specs" => {
+                    egui::epaint::Shape::Text(text) if text.galley.text().starts_with("Work") => {
                         Some(text.pos + Vec2::new(5.0, 5.0))
                     }
                     _ => None,
@@ -4819,7 +5347,8 @@ mod render_tests {
                         .contains(&egui::ViewportCommand::StartDrag)
                 }));
             }
-            assert!(app.specifications_view);
+            assert!(app.overview);
+            assert!(!app.specifications_view);
             assert!(
                 !ctx.style().visuals.dark_mode,
                 "chrome theme leaked into content"
@@ -5407,6 +5936,7 @@ mod render_tests {
             ("dark", 1180.0, 760.0, false),
             ("light", 1180.0, 760.0, true),
             ("narrow", 640.0, 700.0, false),
+            ("narrow-detail", 640.0, 700.0, false),
             ("terminal-light", 1180.0, 760.0, true),
             ("terminal-dark", 640.0, 700.0, false),
             ("terminal-wide", 1180.0, 760.0, false),
@@ -5420,6 +5950,19 @@ mod render_tests {
             configure_appearance(&ctx, light);
             let mut app = fixture(6);
             let directory = tempfile::tempdir().unwrap();
+            if matches!(
+                name,
+                "dark" | "light" | "narrow" | "narrow-detail" | "overview-short"
+            ) {
+                app.saved.ensure_work();
+                for (index, work) in app.saved.work_items.iter_mut().enumerate() {
+                    work.set_disposition(WorkDisposition::Active);
+                    work.stage = WorkStage::ALL[index];
+                }
+                app.selected_work = Some(app.saved.work_items[2].id);
+                app.selected = Some(app.saved.sessions[2].key());
+                app.overview_inspector = name == "narrow-detail";
+            }
             if name.starts_with("specs-") {
                 let mut spec = crate::specs::Specification::new(
                     directory.path().to_string_lossy().into_owned(),
@@ -7486,9 +8029,162 @@ mod render_tests {
     }
 
     #[test]
+    fn work_escape_returns_to_terminal_after_narrow_detail_and_preserves_editor_focus() {
+        for (width, detail) in [(1180.0, true), (640.0, true), (640.0, false)] {
+            let ctx = egui::Context::default();
+            let mut app = fixture(1);
+            app.saved.ensure_work();
+            app.category = 1;
+            app.overview_inspector = detail;
+            let render = |app: &mut App, events| {
+                ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(width, 500.0))),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| app.overview(ui));
+                    },
+                )
+            };
+            render(&mut app, vec![]);
+            render(
+                &mut app,
+                vec![key_event(Key::Escape, Some(Key::Escape), Modifiers::NONE)],
+            );
+            if width < 760.0 && detail {
+                assert!(app.overview);
+                assert!(!app.overview_inspector);
+                render(
+                    &mut app,
+                    vec![egui::Event::Key {
+                        key: Key::Escape,
+                        physical_key: Some(Key::Escape),
+                        pressed: false,
+                        repeat: false,
+                        modifiers: Modifiers::NONE,
+                    }],
+                );
+                render(
+                    &mut app,
+                    vec![key_event(Key::Escape, Some(Key::Escape), Modifiers::NONE)],
+                );
+            }
+            assert!(!app.overview);
+            assert!(!app.specifications_view);
+        }
+        let ctx = egui::Context::default();
+        let mut app = fixture(1);
+        app.category = 1;
+        let render = |app: &mut App, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1180.0, 500.0))),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| app.overview(ui));
+                },
+            )
+        };
+        render(&mut app, vec![]);
+        ctx.memory_mut(|m| m.request_focus(egui::Id::new("work-filter")));
+        render(&mut app, vec![egui::Event::Text("Tessera".into())]);
+        assert_eq!(app.filter, "Tessera");
+        assert!(
+            ctx.wants_keyboard_input(),
+            "filter should have keyboard focus"
+        );
+        render(
+            &mut app,
+            vec![key_event(Key::Escape, Some(Key::Escape), Modifiers::NONE)],
+        );
+        assert!(app.overview);
+        assert_eq!(app.filter, "Tessera");
+        ctx.memory_mut(|m| m.surrender_focus(egui::Id::new("work-filter")));
+        app.rename = Some(WorkspaceRename {
+            workspace: app.saved.workspaces[0].task.id,
+            title: "Rename".into(),
+            focus: false,
+        });
+        render(
+            &mut app,
+            vec![key_event(Key::Escape, Some(Key::Escape), Modifiers::NONE)],
+        );
+        assert!(app.overview);
+    }
+
+    #[test]
+    fn work_action_targets_current_request_and_marks_only_opened_session() {
+        let ctx = egui::Context::default();
+        let mut app = fixture(1);
+        start_fixture_terminal(&mut app, &ctx);
+        app.saved.ensure_work();
+        let work = app.saved.sessions[0].work_id.unwrap();
+        app.saved.sessions[0].state = SessionState::Idle;
+        app.saved.sessions[0].seen_sequence = 0;
+        let mut current = Session::new(app.saved.sessions[0].pane, "current-request".into());
+        current.work_id = Some(work);
+        current.state = SessionState::Permission;
+        current.last_sequence = 9;
+        let key = current.key();
+        app.saved.sessions.push(current);
+        app.work_action(work);
+        assert_eq!(app.selected.as_deref(), Some(key.as_str()));
+        assert_eq!(app.saved.sessions[0].seen_sequence, 0);
+        assert_eq!(app.saved.sessions[1].seen_sequence, 9);
+        assert!(!app.overview);
+        assert_eq!(app.saved.work_items[0].stage, WorkStage::Build);
+        assert_eq!(app.saved.work_items[0].disposition, WorkDisposition::Active);
+        app.panes.clear();
+        app.saved.sessions[1].seen_sequence = 0;
+        app.work_action(work);
+        assert_eq!(app.saved.sessions[1].seen_sequence, 0);
+    }
+
+    #[test]
+    fn work_details_stay_visible_with_hundred_rows_and_narrow_navigation() {
+        for width in [640.0, 1180.0] {
+            let ctx = egui::Context::default();
+            let mut app = fixture(100);
+            app.saved.ensure_work();
+            app.category = 1;
+            app.selected_work = Some(app.saved.work_items[99].id);
+            app.overview_inspector = width < 760.0;
+            let out = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(width, 500.0))),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| app.overview(ui));
+                },
+            );
+            assert!(out.shapes.iter().any(|shape| matches!(&shape.shape, egui::epaint::Shape::Text(text) if text.galley.text() == "WORK CONTEXT")));
+            assert!(out.shapes.iter().filter(|shape| matches!(&shape.shape, egui::epaint::Shape::Text(text) if text.galley.text().contains("sessions"))).count() < 15);
+            if let Ok(directory) = std::env::var("TESSERA_RENDER_DIR") {
+                let path = PathBuf::from(directory);
+                std::fs::create_dir_all(&path).unwrap();
+                export(
+                    &ctx,
+                    out,
+                    &path.join(if width < 760.0 {
+                        "work-narrow.json"
+                    } else {
+                        "work-wide.json"
+                    }),
+                );
+            }
+        }
+    }
+
+    #[test]
     fn compact_overview_activity_and_filtered_selection_remain_accessible() {
         let ctx = egui::Context::default();
         let mut app = fixture(3);
+        app.category = 2;
         let frame = |app: &mut App| {
             ctx.run(
                 egui::RawInput {
@@ -7504,15 +8200,15 @@ mod render_tests {
         app.overview_inspector = true;
         let out = frame(&mut app);
         assert!(out.shapes.iter().any(|shape| matches!(&shape.shape,
-            egui::epaint::Shape::Text(text) if text.galley.text() == "SESSION CONTEXT")));
-        app.category = 2;
+            egui::epaint::Shape::Text(text) if text.galley.text() == "WORK CONTEXT")));
+        app.category = 1;
         let out = frame(&mut app);
         assert!(
             app.selected.is_none(),
             "empty filter must not retain unrelated session context"
         );
         assert!(out.shapes.iter().any(|shape| matches!(&shape.shape,
-            egui::epaint::Shape::Text(text) if text.galley.text() == "No sessions in this view")));
+            egui::epaint::Shape::Text(text) if text.galley.text() == "No work in this view")));
     }
     #[test]
     fn overview_hundred_session_workload() {

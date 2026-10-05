@@ -11,7 +11,7 @@
 - [ ] Validate on Intel and Apple Silicon Macs with real Claude and Codex sessions (native acceptance gate).
 - [ ] Validate CI artifacts on Apple Silicon and finish native terminal smoke checklist.
 
-## Next: terminal and Overview polish
+## Next: terminal and Work polish
 - [x] Discover local agents before hooks arrive, with explicit untracked state and in-place hook upgrades.
 - [x] Pane-local literal terminal search, scrollback navigation and keyboard controls.
 - [x] Keyboard selection/copy mode with scrollback navigation and input isolation.
@@ -20,7 +20,8 @@
 - [ ] Mouse wheel/motion/keypad/function-key coverage, IME preedit and accessibility.
 - [ ] Saved layout recipes, pane moves, workspace close/archive, layout undo.
 - [ ] Durable host process, detach/move/stop choices, reconnect protocol and multiple windows.
-- [ ] Better per-task session grouping, branch/worktree metadata, bookmark/excerpt inspector.
+- [x] Durable work context, session grouping, explicit developer stages and an attention queue.
+- [ ] Branch/worktree metadata, bookmark/excerpt inspector and verification receipts.
 - [ ] Explicit unknown/stale tracking freshness and optional remote helper.
 - [ ] Native performance instrumentation on Intel 16 GB and Apple Silicon.
 

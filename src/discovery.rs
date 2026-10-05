@@ -132,7 +132,14 @@ pub fn reconcile(sessions: &mut Vec<Session>, found: &[(Uuid, u32, Agent)], now:
             continue;
         }
         if sessions.len() >= 256 {
-            sessions.remove(0);
+            if let Some(index) = sessions
+                .iter()
+                .position(|s| matches!(s.state, SessionState::Ended | SessionState::Disconnected))
+            {
+                sessions.remove(index);
+            } else {
+                continue;
+            }
         }
         let mut session = Session::new(pane, format!("process-{pid}-{now}"));
         session.agent = agent;

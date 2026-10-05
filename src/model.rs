@@ -67,6 +67,8 @@ pub struct Session {
     pub pane: Uuid,
     pub session_id: String,
     #[serde(default)]
+    pub work_id: Option<Uuid>,
+    #[serde(default)]
     pub observed_process: Option<u32>,
     #[serde(default)]
     pub agent: Agent,
@@ -86,6 +88,7 @@ impl Session {
             pane,
             session_id,
             observed_process: None,
+            work_id: None,
             agent: Agent::Claude,
             state: SessionState::Unknown,
             last_sequence: 0,
@@ -117,8 +120,10 @@ impl Session {
             self.recent.pop_front();
         }
         self.state = match e.hook_event_name.as_str() {
-            "SessionStart" | "UserPromptSubmit" | "PreToolUse" | "PostToolUse"
-            | "PostToolUseFailure" => SessionState::Running,
+            "SessionStart" => SessionState::Unknown,
+            "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "PostToolUseFailure" => {
+                SessionState::Running
+            }
             "PermissionRequest" => SessionState::Permission,
             "Notification" if e.detail.starts_with("permission_prompt") => SessionState::Permission,
             "Notification" if e.detail.starts_with("idle_prompt") => SessionState::Input,
@@ -154,6 +159,107 @@ pub struct Task {
     pub directory: String,
     pub state: TaskState,
 }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WorkStage {
+    Define,
+    Plan,
+    #[default]
+    Build,
+    Verify,
+    Review,
+    Deliver,
+}
+impl WorkStage {
+    pub const ALL: [Self; 6] = [
+        Self::Define,
+        Self::Plan,
+        Self::Build,
+        Self::Verify,
+        Self::Review,
+        Self::Deliver,
+    ];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Define => "Define",
+            Self::Plan => "Plan",
+            Self::Build => "Build",
+            Self::Verify => "Verify",
+            Self::Review => "Review",
+            Self::Deliver => "Deliver",
+        }
+    }
+    pub fn action(self) -> &'static str {
+        match self {
+            Self::Define => "Clarify scope",
+            Self::Plan => "Inspect plan",
+            Self::Build => "Inspect progress",
+            Self::Verify => "Verify changes",
+            Self::Review => "Review changes",
+            Self::Deliver => "Prepare delivery",
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WorkDisposition {
+    #[default]
+    Active,
+    Completed,
+    Archived,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorkItem {
+    pub id: Uuid,
+    pub title: String,
+    pub directory: String,
+    pub stage: WorkStage,
+    #[serde(default)]
+    pub disposition: WorkDisposition,
+    pub specification: Option<Uuid>,
+    #[serde(default)]
+    pub had_sessions: bool,
+    #[serde(default)]
+    pub keep_active: bool,
+    #[serde(default)]
+    pub panes: Vec<Uuid>,
+}
+impl WorkItem {
+    pub fn new(title: String, directory: String) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            title,
+            directory,
+            stage: WorkStage::Build,
+            disposition: WorkDisposition::Active,
+            specification: None,
+            had_sessions: false,
+            keep_active: false,
+            panes: Vec::new(),
+        }
+    }
+    pub fn set_disposition(&mut self, disposition: WorkDisposition) {
+        self.disposition = disposition;
+        self.keep_active = disposition == WorkDisposition::Active;
+    }
+    pub fn attention(&self, sessions: &[Session]) -> u8 {
+        let linked = || sessions.iter().filter(|s| s.work_id == Some(self.id));
+        if linked().any(|s| s.state.attention()) {
+            0
+        } else if linked().any(|s| {
+            s.history
+                .iter()
+                .any(|a| a.kind == "Stop" && a.sequence > s.seen_sequence)
+        }) {
+            1
+        } else if matches!(
+            self.stage,
+            WorkStage::Verify | WorkStage::Review | WorkStage::Deliver
+        ) {
+            2
+        } else {
+            3
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,7 +283,7 @@ mod tests {
         assert_ne!(claude.key(), codex.key());
         assert!(!codex.apply(event(p, 1, "Stop"), 1));
         for (seq, name, expected) in [
-            (1, "SessionStart", SessionState::Running),
+            (1, "SessionStart", SessionState::Unknown),
             (2, "PermissionRequest", SessionState::Permission),
             (3, "PostToolUse", SessionState::Running),
             (4, "Stop", SessionState::Idle),
