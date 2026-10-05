@@ -6,7 +6,7 @@ A native terminal workspace for supervising Claude Code and Codex sessions.
 
 Run your usual shell in resizable panes. Switch to **Overview** to see what is running, what needs attention, and what is ready to review. Return to the same live terminal when you need to act.
 
-**0.5.2** improves terminal selection and rendering, and lets Specs launch agents in new workspaces. [Release notes](docs/releases/0.5.2.md)
+**0.5.3** enables clickable Claude Code and Codex choices by default and combines macOS window controls with a compact dark navigation bar. [Release notes](docs/releases/0.5.3.md)
 
 ## Install
 
