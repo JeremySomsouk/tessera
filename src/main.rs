@@ -1,4 +1,5 @@
 mod choices;
+mod directories;
 mod discovery;
 mod integration;
 mod model;

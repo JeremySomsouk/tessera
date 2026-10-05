@@ -2,7 +2,7 @@ use alacritty_terminal::{
     Term,
     event::EventListener,
     grid::{Dimensions, Scroll},
-    index::{Boundary, Side},
+    index::{Boundary, Direction, Point, Side},
     selection::{Selection, SelectionType},
     term::TermMode,
     vi_mode::ViMotion,
@@ -61,6 +61,25 @@ fn start_selection<T: EventListener>(term: &mut Term<T>) {
         selection.include_all();
         term.selection = Some(selection);
     }
+}
+
+pub fn select_word<T: EventListener>(term: &mut Term<T>, point: Point) {
+    let point = term.expand_wide(point, Direction::Left);
+    if " \t".contains(term.grid()[point].c) {
+        let mut selection = Selection::new(SelectionType::Simple, point, Side::Left);
+        selection.include_all();
+        term.selection = Some(selection);
+        return;
+    }
+    let start = term
+        .inline_search_left(point, " \t")
+        .map_or_else(|edge| edge, |space| space.add(term, Boundary::Grid, 1));
+    let end = term
+        .inline_search_right(point, " \t")
+        .map_or_else(|edge| edge, |space| space.sub(term, Boundary::Grid, 1));
+    let mut selection = Selection::new(SelectionType::Simple, start, Side::Left);
+    selection.update(end, Side::Right);
+    term.selection = Some(selection);
 }
 
 /// Called by the existing terminal control worker, preserving ordering with input/resize.
@@ -123,6 +142,29 @@ mod tests {
         let mut parser: Processor = Processor::new();
         parser.advance(&mut term, text.as_bytes());
         term
+    }
+
+    #[test]
+    fn word_selection_respects_whitespace_wraps_and_wide_cells() {
+        use alacritty_terminal::index::{Column, Line};
+        for (text, point, expected) in [
+            ("one two", Point::new(Line(0), Column(3)), " "),
+            ("界word end", Point::new(Line(0), Column(1)), "界word"),
+            (
+                "1234567界e\u{301}word end",
+                Point::new(Line(1), Column(1)),
+                "1234567界e\u{301}word",
+            ),
+            ("one\r\ntwo", Point::new(Line(1), Column(1)), "two"),
+        ] {
+            let mut term = terminal(text);
+            select_word(&mut term, point);
+            assert_eq!(
+                term.selection_to_string().as_deref(),
+                Some(expected),
+                "{text:?} at {point:?}"
+            );
+        }
     }
 
     #[test]
