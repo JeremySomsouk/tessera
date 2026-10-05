@@ -228,6 +228,8 @@ struct Workspace {
 #[derive(Default, Clone, Serialize, Deserialize)]
 struct Saved {
     #[serde(default)]
+    created_directories: Vec<CreatedDirectory>,
+    #[serde(default)]
     specifications: Vec<crate::specs::Specification>,
     workspaces: Vec<Workspace>,
     sessions: Vec<Session>,
@@ -239,6 +241,12 @@ struct Saved {
     skip_stop_confirmation: bool,
     #[serde(default)]
     clickable_codex_choices: bool,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct CreatedDirectory {
+    path: String,
+    created_at: u64,
 }
 fn accent(ui: &egui::Ui) -> Color32 {
     if ui.visuals().dark_mode {
@@ -380,8 +388,7 @@ impl App {
             save_error,
             dirty: false,
             last_save: 0,
-            new_directory: std::env::current_dir()
-                .unwrap_or_default()
+            new_directory: crate::directories::default_directory()
                 .to_string_lossy()
                 .into(),
             new_workspace_name: String::new(),
@@ -488,18 +495,17 @@ impl App {
             self.error = "Workspace limit (32) reached".into();
             return false;
         }
-        let directory = self.new_directory.trim();
-        if directory.is_empty() {
-            self.error = "Enter a working directory".into();
+        let directory = match self.prepare_directory(&self.new_directory.clone()) {
+            Ok(directory) => directory,
+            Err(error) => {
+                self.error = error.to_string();
+                return false;
+            }
+        };
+        if !self.add_workspace_in(ctx, directory.clone()) {
             return false;
         }
-        if let Err(error) = std::fs::create_dir_all(directory) {
-            self.error = format!("Cannot create working directory {directory}: {error}");
-            return false;
-        }
-        if !self.add_workspace_in(ctx, directory.to_owned()) {
-            return false;
-        }
+        self.new_directory = directory;
         let name = self.new_workspace_name.trim();
         if !name.is_empty() {
             self.saved.workspaces[self.active].task.title = name.to_owned();
@@ -1690,12 +1696,22 @@ impl App {
                     .id(egui::Id::new("workspace-directory"))
                     .desired_width(f32::INFINITY)
                     .font(egui::TextStyle::Monospace)
-                    .hint_text("/path/to/project"),
+                    .hint_text("~/my-project or an absolute path"),
             )
             .labelled_by(label.id);
         if self.command_focus {
             directory.request_focus();
             self.command_focus = false;
+        }
+        if let Some(alternative) = crate::directories::root_alternative(&self.new_directory) {
+            ui.small("A leading / points to the filesystem root, not your home directory.");
+            if ui.button(format!("Use {alternative}")).clicked() {
+                self.new_directory = alternative;
+                self.error.clear();
+            }
+        }
+        if let Ok(path) = crate::directories::resolve(&self.new_directory) {
+            ui.small(format!("Workspace directory: {}", path.display()));
         }
         ui.add_space(10.0);
         let label = ui.label("Name (optional)");
@@ -1707,7 +1723,7 @@ impl App {
         )
         .labelled_by(label.id);
         ui.label(
-            RichText::new("Missing directories will be created. Name only changes the label.")
+            RichText::new("Missing directories will be created. ~/ means your home directory. Name only changes the label.")
                 .small()
                 .color(ui.visuals().weak_text_color()),
         );
@@ -2002,6 +2018,106 @@ impl App {
             }
         });
     }
+    fn prepare_directory(&mut self, input: &str) -> anyhow::Result<String> {
+        let (directory, created) = crate::directories::prepare(input)?;
+        if created {
+            let path = std::fs::canonicalize(&directory)?
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("Working directory is not valid UTF-8"))?
+                .to_owned();
+            if !self
+                .saved
+                .created_directories
+                .iter()
+                .any(|entry| entry.path == path)
+            {
+                self.saved.created_directories.push(CreatedDirectory {
+                    path,
+                    created_at: now(),
+                });
+            }
+            self.dirty = true;
+        }
+        Ok(directory)
+    }
+
+    fn launch_specification(
+        &mut self,
+        ctx: &egui::Context,
+        index: usize,
+        command: &str,
+    ) -> anyhow::Result<()> {
+        let spec = &self.saved.specifications[index];
+        anyhow::ensure!(
+            self.saved.workspaces.len() < 32 && self.panes.len() < 32,
+            "Workspace/pane limit (32) reached"
+        );
+        let mut draft = spec.draft.clone();
+        anyhow::ensure!(
+            !draft.title.trim().is_empty() && !draft.markdown.trim().is_empty(),
+            "A title and specification are required"
+        );
+        draft.directory = crate::directories::resolve(&draft.directory)?
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("Working directory is not valid UTF-8"))?
+            .to_owned();
+        anyhow::ensure!(
+            spec.launches.len() < 256
+                && (spec.revisions.last() == Some(&draft) || spec.revisions.len() < 256),
+            "Specification revision/launch limit (256) reached"
+        );
+        let directory = self.prepare_directory(&draft.directory)?;
+        let pane = Uuid::new_v4();
+        let socket = self
+            .endpoint
+            .as_ref()
+            .map(|e| e.path.as_path())
+            .unwrap_or_else(|| std::path::Path::new(""));
+        let terminal = Terminal::spawn_agent(
+            pane,
+            std::path::Path::new(&directory),
+            socket,
+            ctx.clone(),
+            command,
+        )
+        .map_err(|error| anyhow::anyhow!("Cannot launch agent: {error}"))?;
+        self.panes.insert(
+            pane,
+            Pane {
+                terminal,
+                search: TerminalSearch::default(),
+            },
+        );
+        self.saved.workspaces.push(Workspace {
+            task: Task {
+                id: Uuid::new_v4(),
+                title: draft.title.clone(),
+                directory,
+                state: TaskState::Implementing,
+            },
+            layout: Layout::Pane(pane),
+            focus: pane,
+        });
+        self.active = self.saved.workspaces.len() - 1;
+        let spec = &mut self.saved.specifications[index];
+        spec.draft = draft;
+        let revision = spec
+            .save_revision()
+            .expect("revision capacity checked before launch");
+        spec.launches.push(crate::specs::Launch {
+            pane,
+            revision,
+            agent: if self.spec_codex { "Codex" } else { "Claude" }.into(),
+            exit_code: None,
+        });
+        spec.status = 2;
+        self.overview = false;
+        self.specifications_view = false;
+        self.dirty = true;
+        self.error.clear();
+        Ok(())
+    }
+
     fn specifications(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.heading("Specifications");
@@ -2032,8 +2148,13 @@ impl App {
             let spec = &mut self.saved.specifications[index];
             ui.label("Title");
             self.dirty |= ui.text_edit_singleline(&mut spec.draft.title).changed();
-            ui.label("Working directory (must exist)");
+            ui.label("Working directory");
             self.dirty |= ui.text_edit_singleline(&mut spec.draft.directory).changed();
+            ui.small("Missing directories are created when you launch. ~/ means your home directory.");
+            if let Some(alternative) = crate::directories::root_alternative(&spec.draft.directory) {
+                ui.small("A leading / points to the filesystem root, not your home directory.");
+                if ui.button(format!("Use {alternative}")).clicked() { spec.draft.directory = alternative; self.dirty = true; self.error.clear(); }
+            }
             ui.horizontal(|ui| {
                 for (status, label) in ["Draft", "Ready", "In progress"].iter().enumerate() {
                     if ui.selectable_label(spec.status == status, *label).clicked() { spec.status = status; self.dirty = true; }
@@ -2109,13 +2230,19 @@ impl App {
             ui.separator();
             ui.horizontal(|ui| { ui.strong("Launch context preview"); ui.selectable_value(&mut self.spec_codex, false, "Claude"); ui.selectable_value(&mut self.spec_codex, true, "Codex"); });
             ui.label("The current draft is saved as an immutable revision. The agent starts in a new terminal after you confirm Launch agent.");
-            let next = spec.revisions.last().filter(|r| r.title == spec.draft.title && r.markdown == spec.draft.markdown && r.directory == spec.draft.directory).map_or(spec.revisions.len() + 1, |_| spec.revisions.len());
-            let command = crate::specs::command(&spec.draft, next, self.spec_codex);
+            let directory = crate::directories::resolve(&spec.draft.directory);
+            let mut launch_draft = spec.draft.clone();
+            if let Ok(path) = &directory { launch_draft.directory = path.to_string_lossy().into_owned(); }
+            let next = spec.revisions.last().filter(|r| **r == launch_draft).map_or(spec.revisions.len() + 1, |_| spec.revisions.len());
+            let command = crate::specs::command(&launch_draft, next, self.spec_codex);
             match &command { Ok(command) => { egui::ScrollArea::vertical().id_salt("launch-preview").max_height(100.0).show(ui, |ui| { ui.label(egui::RichText::new(command).monospace()); }); }, Err(e) => { ui.label(e.to_string()); } }
             if spec.draft.title.trim().is_empty() { ui.colored_label(ui.visuals().error_fg_color, "Enter a specification title."); }
             if spec.draft.markdown.trim().is_empty() { ui.colored_label(ui.visuals().error_fg_color, "Write the specification before launching."); }
-            if !std::path::Path::new(&spec.draft.directory).is_dir() { ui.colored_label(ui.visuals().error_fg_color, "Choose an existing working directory."); }
-            let launch = ui.add_enabled(command.is_ok() && !spec.draft.markdown.trim().is_empty() && !spec.draft.title.trim().is_empty() && std::path::Path::new(&spec.draft.directory).is_dir(), egui::Button::new("Launch agent")).clicked();
+            match &directory {
+                Ok(path) => { ui.small(format!("Agent working directory: {}", path.display())); },
+                Err(error) => { ui.colored_label(ui.visuals().error_fg_color, error.to_string()); }
+            }
+            let launch = ui.add_enabled(command.is_ok() && !spec.draft.markdown.trim().is_empty() && !spec.draft.title.trim().is_empty() && directory.is_ok(), egui::Button::new("Launch agent")).clicked();
             let mut open_pane = None;
             for launch in spec.launches.iter().rev() {
                 ui.horizontal(|ui| {
@@ -2123,32 +2250,7 @@ impl App {
                     if ui.add_enabled(self.panes.contains_key(&launch.pane), egui::Button::new("Open terminal")).clicked() { open_pane = Some(launch.pane); }
                 });
             }
-            if launch {
-                if spec.revisions.len() >= 256 || spec.launches.len() >= 256 { self.error = "Specification revision/launch limit (256) reached".into(); return; }
-                let directory = spec.draft.directory.clone();
-                let title = spec.draft.title.clone();
-                if self.saved.workspaces.len() >= 32 || self.panes.len() >= 32 {
-                    self.error = "Workspace/pane limit (32) reached".into();
-                } else {
-                    let pane = Uuid::new_v4();
-                    let socket = self.endpoint.as_ref().map(|e| e.path.as_path()).unwrap_or_else(|| std::path::Path::new(""));
-                    match Terminal::spawn_agent(pane, std::path::Path::new(&directory), socket, ui.ctx().clone(), command.as_ref().unwrap()) {
-                        Ok(terminal) => {
-                            self.panes.insert(pane, Pane { terminal, search: TerminalSearch::default() });
-                            self.saved.workspaces.push(Workspace { task: Task { id: Uuid::new_v4(), title, directory, state: TaskState::Implementing }, layout: Layout::Pane(pane), focus: pane });
-                            self.active = self.saved.workspaces.len() - 1;
-                            let spec = &mut self.saved.specifications[index];
-                            let revision = spec.save_revision().expect("revision capacity checked before launch");
-                            spec.launches.push(crate::specs::Launch { pane, revision, agent: if self.spec_codex { "Codex" } else { "Claude" }.into(), exit_code: None });
-                            spec.status = 2;
-                            self.overview = false;
-                self.specifications_view = false;
-                            self.dirty = true;
-                        }
-                        Err(e) => self.error = format!("Cannot launch agent: {e}"),
-                    }
-                }
-            }
+            if launch && let Err(error) = self.launch_specification(ui.ctx(), index, command.as_ref().unwrap()) { self.error = error.to_string(); }
             if let Some(pane) = open_pane && let Some(index) = self.saved.workspaces.iter().position(|w| layout_contains(&w.layout, pane)) {
                 self.active = index; self.saved.workspaces[index].focus = pane; self.overview = false;
                 self.specifications_view = false;
@@ -2352,11 +2454,12 @@ impl App {
                     let directory = w.task.directory.clone();
                     ui.horizontal(|ui| {
                         ui.add_sized(
-                            [(ui.available_width() - 220.0).max(80.0), 30.0],
+                            [(ui.available_width() - 220.0).max(80.0), 22.0],
                             egui::Label::new(RichText::new(title).strong().size(16.0))
                                 .truncate()
                                 .halign(egui::Align::Min),
-                        );
+                        )
+                        .on_hover_text(directory);
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui
                                 .small_button(if self.maximized {
@@ -2381,16 +2484,7 @@ impl App {
                             });
                         });
                     });
-                    ui.add(
-                        egui::Label::new(
-                            RichText::new(directory)
-                                .monospace()
-                                .small()
-                                .color(ui.visuals().weak_text_color()),
-                        )
-                        .truncate(),
-                    );
-                    ui.add_space(10.0);
+                    ui.add_space(4.0);
                 }
                 let Some(w) = self.saved.workspaces.get_mut(self.active) else {
                     ui.vertical_centered(|ui| {
@@ -3015,6 +3109,16 @@ fn paint_cursor(
     }
 }
 
+#[derive(Clone)]
+struct TerminalPaintCache {
+    origin: Pos2,
+    font_size: f32,
+    shapes: Vec<egui::epaint::Shape>,
+    cursor: Vec<egui::epaint::Shape>,
+    copying: bool,
+    selected: Option<String>,
+}
+
 fn terminal_view(
     ui: &mut egui::Ui,
     terminal: &mut Terminal,
@@ -3131,7 +3235,9 @@ fn terminal_view(
             {
                 s.update(point, Side::Right);
             }
-            if response.clicked_by(egui::PointerButton::Primary) {
+            if response.double_clicked_by(egui::PointerButton::Primary) {
+                crate::selection::select_word(&mut *term, point);
+            } else if response.clicked_by(egui::PointerButton::Primary) {
                 term.selection = None;
             }
         }
@@ -3162,6 +3268,11 @@ fn terminal_view(
         }
         let content = term.renderable_content();
         let painter = ui.painter().with_clip_rect(grid_rect);
+        let paint_start = ui.ctx().graphics(|graphics| {
+            graphics
+                .get(painter.layer_id())
+                .map_or(0, |list| list.all_entries().len())
+        });
         for indexed in content.display_iter {
             let row = indexed.point.line.0 + content.display_offset as i32;
             if row < 0 || row >= rows as i32 {
@@ -3214,6 +3325,11 @@ fn terminal_view(
                 );
             }
         }
+        let cursor_start = ui.ctx().graphics(|graphics| {
+            graphics
+                .get(painter.layer_id())
+                .map_or(paint_start, |list| list.all_entries().len())
+        });
         if focused
             && !searching
             && ((copying && mode.contains(TermMode::VI))
@@ -3258,7 +3374,45 @@ fn terminal_view(
             }
         }
         selected = term.selection_to_string();
+        let (shapes, cursor) = ui.ctx().graphics(|graphics| {
+            let entries = graphics.get(painter.layer_id()).unwrap().all_entries();
+            let shapes = entries
+                .skip(paint_start)
+                .map(|entry| entry.shape.clone())
+                .collect::<Vec<_>>();
+            let mut shapes = shapes;
+            let cursor = shapes.split_off(cursor_start - paint_start);
+            (shapes, cursor)
+        });
+        ui.ctx().data_mut(|data| {
+            data.insert_temp(
+                response.id.with("paint_cache"),
+                TerminalPaintCache {
+                    origin: grid_rect.min,
+                    font_size,
+                    shapes,
+                    cursor,
+                    copying,
+                    selected: selected.clone(),
+                },
+            )
+        });
     } else {
+        if let Some(mut cache) = ui
+            .ctx()
+            .data(|data| data.get_temp::<TerminalPaintCache>(response.id.with("paint_cache")))
+            && cache.font_size == font_size
+        {
+            if focused && !searching && cache.copying == copying {
+                cache.shapes.extend(cache.cursor);
+            }
+            let translation = grid_rect.min - cache.origin;
+            for shape in &mut cache.shapes {
+                shape.translate(translation);
+            }
+            ui.painter().with_clip_rect(grid_rect).extend(cache.shapes);
+            selected = cache.selected;
+        }
         ui.ctx().request_repaint_after(Duration::from_millis(16));
     }
     let reporting =
@@ -3771,6 +3925,7 @@ mod tests {
     fn legacy_saved_state_loads_without_specifications() {
         let saved: Saved = serde_json::from_str(r#"{"workspaces":[],"sessions":[]}"#).unwrap();
         assert!(saved.specifications.is_empty());
+        assert!(saved.created_directories.is_empty());
     }
     #[test]
     fn saved_appearance_survives_first_frame_and_system_theme_changes() {
@@ -4370,10 +4525,117 @@ mod render_tests {
         }
     }
     #[test]
-    fn specification_invalid_directory_explains_disabled_launch() {
+    fn created_directory_registry_persists_without_claiming_existing_folders() {
+        let ctx = egui::Context::default();
+        let root = tempfile::tempdir().unwrap();
+        let existing = root.path().join("existing");
+        std::fs::create_dir(&existing).unwrap();
+        let folder = root.path().join("new project");
+        let mut app = fixture(0);
+        app.prepare_directory(existing.to_str().unwrap()).unwrap();
+        assert!(app.saved.created_directories.is_empty());
+        app.prepare_directory(folder.to_str().unwrap()).unwrap();
+        app.prepare_directory(folder.to_str().unwrap()).unwrap();
+        assert_eq!(app.saved.created_directories.len(), 1);
+        assert_eq!(
+            PathBuf::from(&app.saved.created_directories[0].path),
+            folder.canonicalize().unwrap()
+        );
+        assert!(app.saved.created_directories[0].created_at > 0);
+        app.saved = serde_json::from_slice(&serde_json::to_vec(&app.saved).unwrap()).unwrap();
+        app.new_directory = existing.to_string_lossy().into_owned();
+        app.start_fresh_workspace(&ctx);
+        assert_eq!(app.saved.created_directories.len(), 1);
+        assert!(folder.is_dir());
+    }
+
+    #[test]
+    fn specification_launch_creates_directory_and_starts_in_it() {
+        let ctx = egui::Context::default();
+        let root = tempfile::tempdir().unwrap();
+        let folder = root.path().join("new project/nested");
+        let output = root.path().join("agent-directory");
+        let mut app = fixture(0);
+        let mut spec = crate::specs::Specification::new(format!(" {} ", folder.display()));
+        spec.draft.markdown = "Create a project".into();
+        app.saved.specifications.push(spec);
+        app.launch_specification(
+            &ctx,
+            0,
+            &format!("printf '%s' \"$PWD\" > '{}'", output.display()),
+        )
+        .unwrap();
+        assert!(folder.is_dir());
+        assert_eq!(app.saved.created_directories.len(), 1);
+        assert_eq!(
+            app.saved.workspaces[0].task.directory,
+            folder.to_str().unwrap()
+        );
+        let spec = &app.saved.specifications[0];
+        assert_eq!(spec.status, 2);
+        assert_eq!(spec.revisions.len(), 1);
+        assert_eq!(spec.revisions[0].directory, folder.to_str().unwrap());
+        assert_eq!(spec.launches[0].revision, 1);
+        let pane = spec.launches[0].pane;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !app.panes[&pane].terminal.has_exited() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fixture agent did not exit"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let actual = PathBuf::from(std::fs::read_to_string(output).unwrap());
+        assert_eq!(
+            actual.canonicalize().unwrap(),
+            folder.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn specification_directory_failure_preserves_draft_and_limits_prevent_creation() {
+        let ctx = egui::Context::default();
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("file");
+        std::fs::write(&file, "keep").unwrap();
+        let mut app = fixture(0);
+        let mut spec =
+            crate::specs::Specification::new(file.join("child").to_string_lossy().into_owned());
+        spec.draft.markdown = "Scope".into();
+        let original = spec.draft.clone();
+        app.saved.specifications.push(spec);
+        let error = app.launch_specification(&ctx, 0, "true").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Cannot create working directory")
+        );
+        assert!(app.panes.is_empty());
+        assert!(app.saved.workspaces.is_empty());
+        assert_eq!(
+            app.saved.specifications[0].draft.directory,
+            original.directory
+        );
+        assert!(app.saved.specifications[0].revisions.is_empty());
+        assert!(app.saved.specifications[0].launches.is_empty());
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "keep");
+        let folder = root.path().join("over limit");
+        app.saved.specifications[0].draft.directory = folder.to_string_lossy().into_owned();
+        app.saved.workspaces = fixture(32).saved.workspaces;
+        assert!(
+            app.launch_specification(&ctx, 0, "true")
+                .unwrap_err()
+                .to_string()
+                .contains("limit")
+        );
+        assert!(!folder.exists());
+    }
+
+    #[test]
+    fn specification_empty_directory_explains_disabled_launch() {
         let ctx = egui::Context::default();
         let mut app = fixture(0);
-        let mut spec = crate::specs::Specification::new("/tessera/nonexistent/path".into());
+        let mut spec = crate::specs::Specification::new(" ".into());
         spec.draft.markdown = "Scope".into();
         app.selected_spec = Some(spec.id);
         app.saved.specifications.push(spec);
@@ -4386,7 +4648,7 @@ mod render_tests {
                 egui::CentralPanel::default().show(ctx, |ui| app.specifications(ui));
             },
         );
-        assert!(out.shapes.iter().any(|shape| matches!(&shape.shape, egui::epaint::Shape::Text(text) if text.galley.text().contains("Choose an existing working directory"))));
+        assert!(out.shapes.iter().any(|shape| matches!(&shape.shape, egui::epaint::Shape::Text(text) if text.galley.text().contains("Enter a working directory"))));
     }
 
     #[test]
@@ -5701,6 +5963,7 @@ mod render_tests {
         app.new_workspace_name = "  My workspace  ".into();
         assert!(app.add_workspace(&ctx));
         assert!(directory.is_dir());
+        assert_eq!(app.saved.created_directories.len(), 1);
         assert_eq!(app.saved.workspaces[0].task.title, "My workspace");
         assert_eq!(
             app.saved.workspaces[0].task.directory,
@@ -5873,6 +6136,143 @@ mod render_tests {
         assert_eq!(app.saved.workspaces.len(), 2);
         assert_eq!(app.panes.len(), 2);
         assert!(app.panes.contains_key(&original));
+    }
+
+    #[test]
+    fn terminal_content_stays_visible_while_parser_holds_grid() {
+        let ctx = egui::Context::default();
+        let mut terminal = Terminal::spawn_test(
+            Uuid::new_v4(),
+            &std::env::current_dir().unwrap(),
+            std::path::Path::new(""),
+            ctx.clone(),
+        )
+        .unwrap();
+        let mut search = TerminalSearch::default();
+        let mut frame = |terminal: &mut Terminal| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 480.0))),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        terminal_view(ui, terminal, &mut search, true, 15.0, false)
+                            .1
+                            .unwrap();
+                    });
+                },
+            )
+        };
+        frame(&mut terminal);
+        std::thread::sleep(Duration::from_millis(30));
+        {
+            let mut term = terminal.term.lock().unwrap();
+            let mut parser: alacritty_terminal::vte::ansi::Processor = Default::default();
+            parser.advance(&mut *term, b"\x1b[2J\x1b[Hstable-output");
+        }
+        let rendered = frame(&mut terminal);
+        let grid = terminal.term.clone();
+        let held = grid.lock().unwrap();
+        let busy = frame(&mut terminal);
+        let text = |out: &egui::FullOutput| {
+            out.shapes
+                .iter()
+                .filter_map(|s| {
+                    if let egui::epaint::Shape::Text(t) = &s.shape {
+                        Some(t.galley.text().to_owned())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<String>()
+        };
+        assert!(text(&rendered).contains("stable-output"));
+        assert!(
+            text(&busy).contains("stable-output"),
+            "busy parser erased terminal content"
+        );
+        drop(held);
+    }
+
+    #[test]
+    fn double_click_selects_complete_space_delimited_terminal_token() {
+        let ctx = egui::Context::default();
+        let mut terminal = Terminal::spawn_test(
+            Uuid::new_v4(),
+            &std::env::current_dir().unwrap(),
+            std::path::Path::new(""),
+            ctx.clone(),
+        )
+        .unwrap();
+        let mut search = TerminalSearch::default();
+        let mut pos = Pos2::ZERO;
+        let mut frame = |terminal: &mut Terminal, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 480.0))),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let font = FontId::monospace(15.0);
+                        let cell = ui.fonts_mut(|f| {
+                            Vec2::new(f.glyph_width(&font, 'M'), f.row_height(&font))
+                        });
+                        pos = ui.available_rect_before_wrap().shrink(8.0).min
+                            + Vec2::new(12.5 * cell.x, 0.5 * cell.y);
+                        terminal_view(ui, terminal, &mut search, true, 15.0, false)
+                            .1
+                            .unwrap();
+                    });
+                },
+            )
+        };
+        frame(&mut terminal, vec![]);
+        std::thread::sleep(Duration::from_millis(30));
+        {
+            let mut term = terminal.term.lock().unwrap();
+            let mut parser: alacritty_terminal::vte::ansi::Processor = Default::default();
+            parser.advance(
+                &mut *term,
+                b"\x1b[2J\x1b[Hprefix https://host/a(b):42?q=x suffix",
+            );
+        }
+        frame(&mut terminal, vec![]);
+        for pressed in [true, false, true, false] {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 480.0))),
+                    events: vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: Modifiers::NONE,
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        terminal_view(ui, &mut terminal, &mut search, true, 15.0, false)
+                            .1
+                            .unwrap();
+                    });
+                },
+            );
+        }
+        assert_eq!(
+            terminal
+                .term
+                .lock()
+                .unwrap()
+                .selection_to_string()
+                .as_deref(),
+            Some("https://host/a(b):42?q=x")
+        );
     }
 
     #[test]
