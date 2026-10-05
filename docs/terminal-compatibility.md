@@ -34,4 +34,4 @@ Typing, keyboard navigation, IME commits, and pasting return scrollback to the l
 
 Cursor regressions cover fragmented shape requests, visibility toggles, alternate-screen exit, resize, wide/combining text, opaque block contrast and clipping. A native Vim PTY check verifies Insert-mode beam and Normal-mode block requests with ttimeoutlen=50; interactive visual acceptance remains pending. Cursor blink requests are intentionally rendered steadily.
 
-Terminal fonts include an embedded Noto Sans Symbols 2 fallback for Unicode prompt symbols such as `✗`, `✘` and checkmarks. Ordinary text keeps the existing Hack font and terminal cell metrics. Custom Nerd Font private-use icons still require further font support.
+Terminal fonts use the detected terminal profile font and installed Nerd Font fallback when available. Bundled Noto Sans Symbols, Noto Sans Math, Noto Sans Symbols 2, and Noto Emoji cover technical symbols, mathematical symbols, prompt indicators, and monochrome emoji, including Claude Code’s `⎿` and `⧉`. Ordinary text retains the detected font or bundled Hack and its cell metrics. Private-use icons require a compatible installed icon font.

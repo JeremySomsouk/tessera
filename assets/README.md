@@ -20,6 +20,12 @@ Created with the built-in ImageGen tool, using the prior Mosaic icon as a brand 
 
 # Terminal symbol fallback
 
-`fonts/NotoSansSymbols2-Regular.ttf` is the unmodified Noto Sans Symbols 2 font from [Google Fonts](https://github.com/google/fonts/tree/main/ofl/notosanssymbols2), distributed under the SIL Open Font License in `fonts/OFL-NotoSansSymbols2.txt`. It is embedded as the last monospace fallback to render shell prompt symbols such as `✗` (U+2717), without replacing Hack for ordinary text. No system font installation or runtime download is required.
+Terminal text uses the detected terminal font, falling back to bundled Hack. Installed icon fonts precede the bundled Unicode fallbacks below. These embedded fonts require no system installation or runtime download and preserve ordinary text cell metrics.
 
-`fonts/NotoEmoji.ttf` is the unmodified Noto Emoji variable font from [Google Fonts](https://github.com/google/fonts/tree/main/ofl/notoemoji), distributed under the SIL Open Font License in `fonts/OFL-NotoEmoji.txt`. It is the last monospace fallback for emoji in terminal status lines. Glyphs use the terminal foreground color; ordinary text retains Hack and its cell metrics.
+`fonts/NotoSansSymbols.ttf` is the unmodified Noto Sans Symbols variable font from [Google Fonts](https://github.com/google/fonts/tree/main/ofl/notosanssymbols), distributed under the SIL Open Font License in `fonts/OFL-NotoSansSymbols.txt`. It covers technical symbols such as Claude Code's `⎿` (U+23BF).
+
+`fonts/NotoSansMath-Regular.ttf` is the unmodified Noto Sans Math font from [Google Fonts](https://github.com/google/fonts/tree/main/ofl/notosansmath), distributed under the SIL Open Font License in `fonts/OFL-NotoSansMath.txt`. It covers mathematical symbols such as Claude Code's `⧉` (U+29C9).
+
+`fonts/NotoSansSymbols2-Regular.ttf` is the unmodified Noto Sans Symbols 2 font from [Google Fonts](https://github.com/google/fonts/tree/main/ofl/notosanssymbols2), distributed under the SIL Open Font License in `fonts/OFL-NotoSansSymbols2.txt`. It follows the technical and mathematical fallbacks to render shell prompt symbols such as `✗` (U+2717).
+
+`fonts/NotoEmoji.ttf` is the unmodified Noto Emoji variable font from [Google Fonts](https://github.com/google/fonts/tree/main/ofl/notoemoji), distributed under the SIL Open Font License in `fonts/OFL-NotoEmoji.txt`. It is the last monospace fallback for emoji in terminal status lines. Glyphs use the terminal foreground color.
