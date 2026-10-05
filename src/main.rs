@@ -99,7 +99,7 @@ fn main() -> anyhow::Result<()> {
         None => eframe::run_native(
             "Tessera",
             eframe::NativeOptions {
-                viewport: eframe::egui::ViewportBuilder::default()
+                viewport: main_viewport()
                     .with_icon(eframe::icon_data::from_png_bytes(include_bytes!(
                         "../assets/app-icon-window.png"
                     ))?)
@@ -111,4 +111,14 @@ fn main() -> anyhow::Result<()> {
         )
         .map_err(|e| anyhow::anyhow!("{e}")),
     }
+}
+
+fn main_viewport() -> eframe::egui::ViewportBuilder {
+    let viewport = eframe::egui::ViewportBuilder::default();
+    #[cfg(target_os = "macos")]
+    let viewport = viewport
+        .with_fullsize_content_view(true)
+        .with_title_shown(false)
+        .with_titlebar_shown(false);
+    viewport
 }
