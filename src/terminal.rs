@@ -348,6 +348,7 @@ impl Terminal {
         let host_lifecycle = lifecycle.clone();
         let selection_ctx = ctx.clone();
         let host = std::thread::spawn(move || {
+            let mut pending = None;
             loop {
                 if host_stopping.load(Ordering::Acquire) {
                     let mut life = host_lifecycle.lock().unwrap();
@@ -356,7 +357,11 @@ impl Terminal {
                     life.exited = true;
                     break;
                 }
-                let result = match rx.recv_timeout(Duration::from_millis(250)) {
+                let command = pending
+                    .take()
+                    .map(Ok)
+                    .unwrap_or_else(|| rx.recv_timeout(Duration::from_millis(250)));
+                let result = match command {
                     Ok(Command::Input(bytes)) => writer.write_all(&bytes),
                     Ok(Command::UserInput(bytes)) => host_term
                         .lock()
@@ -394,13 +399,27 @@ impl Terminal {
                             term.scroll_display(Scroll::Delta(lines));
                             ctx.request_repaint();
                         }),
-                    Ok(Command::Resize(s)) => {
-                        if let Ok(mut t) = host_term.lock() {
-                            t.resize(s);
-                            host_revision.fetch_add(1, Ordering::Release);
-                            ctx.request_repaint();
+                    Ok(Command::Resize(mut s)) => {
+                        while let Ok(command) = rx.try_recv() {
+                            match command {
+                                Command::Resize(size) => s = size,
+                                command => {
+                                    pending = Some(command);
+                                    break;
+                                }
+                            }
                         }
-                        pair.master.resize(s.pty()).map_err(std::io::Error::other)
+                        host_term
+                            .lock()
+                            .map_err(|_| std::io::Error::other("terminal state unavailable"))
+                            .and_then(|mut term| {
+                                term.resize(s);
+                                let result =
+                                    pair.master.resize(s.pty()).map_err(std::io::Error::other);
+                                host_revision.fetch_add(1, Ordering::Release);
+                                ctx.request_repaint();
+                                result
+                            })
                     }
                     Ok(Command::Stop) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                         let mut life = host_lifecycle.lock().unwrap();
@@ -916,6 +935,61 @@ mod pty_tests {
                 std::thread::sleep(Duration::from_millis(10));
             }
         }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn zsh_prompt_remains_single_after_split_resize() {
+        let mut command = CommandBuilder::new("/bin/zsh");
+        command.args(["-f", "-i"]);
+        command.env_clear();
+        command.env("PATH", "/usr/bin:/bin");
+        command.env("HOME", std::env::temp_dir());
+        command.env("PS1", "%F{magenta}TESSERA_ZSH_PROMPT%f > ");
+        command.env("RPROMPT", "%F{cyan}<aws:tooling-sso>%f");
+        let mut terminal = Terminal::spawn_command(
+            Uuid::new_v4(),
+            &std::env::current_dir().unwrap(),
+            Path::new(""),
+            Context::default(),
+            command,
+        )
+        .unwrap();
+        let output = || {
+            terminal
+                .term
+                .lock()
+                .unwrap()
+                .grid()
+                .display_iter()
+                .map(|cell| cell.cell.c)
+                .collect::<String>()
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !{
+            let text = output();
+            text.contains("TESSERA_ZSH_PROMPT") && text.contains("<aws:tooling-sso>")
+        } {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        for _ in 0..100 {
+            terminal.resize(Size { cols: 50, rows: 30 });
+            terminal.resize(Size {
+                cols: 100,
+                rows: 30,
+            });
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        let term = terminal.term.lock().unwrap();
+        assert_eq!(term.columns(), 100);
+        assert_eq!(term.screen_lines(), 30);
+        let text = term
+            .grid()
+            .display_iter()
+            .map(|cell| cell.cell.c)
+            .collect::<String>();
+        assert_eq!(text.matches("TESSERA_ZSH_PROMPT").count(), 1);
     }
 
     #[test]
