@@ -13,6 +13,9 @@ eframe = { version = "0.33", default-features = false, features = ["default_font
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
+fontdb = "0.23"
+ttf-parser = "0.25"
+plist = "1"
 
 [dev-dependencies]
 tempfile = "3"

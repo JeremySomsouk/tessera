@@ -436,7 +436,7 @@ impl App {
             Ok(updater) => app.updater = updater,
             Err(error) => app.updater_error = Some(format!("Updates unavailable: {error}")),
         }
-        configure_terminal_fonts(&cc.egui_ctx);
+        configure_terminal_fonts_with(&cc.egui_ctx, crate::fonts::automatic_terminal_fonts());
         configure_appearance(&cc.egui_ctx, app.saved.light);
         app.start_fresh_workspace(&cc.egui_ctx);
         app
@@ -2223,6 +2223,11 @@ impl App {
                 self.dirty = true;
             }
         });
+        if let Some(label) =
+            ctx.data(|data| data.get_temp::<String>(egui::Id::new("terminal-font-label")))
+        {
+            ui.label(format!("Font: {label}"));
+        }
         ui.add_space(16.0);
         section_label(ui, "TERMINAL BEHAVIOR");
         ui.add_space(8.0);
@@ -2996,8 +3001,40 @@ fn command_row(
     response
 }
 
+#[cfg(test)]
 fn configure_terminal_fonts(ctx: &egui::Context) {
+    configure_terminal_fonts_with(ctx, crate::fonts::AutomaticFonts::default());
+}
+
+fn configure_terminal_fonts_with(ctx: &egui::Context, detected: crate::fonts::AutomaticFonts) {
     let mut fonts = egui::FontDefinitions::default();
+    let mut label = "Automatic (bundled monospace)".to_owned();
+    if let Some(primary) = detected.primary {
+        label = format!("Automatic ({})", primary.name);
+        let mut data = egui::FontData::from_owned(primary.data);
+        data.index = primary.index;
+        fonts
+            .font_data
+            .insert("DetectedTerminal".into(), std::sync::Arc::new(data));
+        fonts
+            .families
+            .entry(egui::FontFamily::Monospace)
+            .or_default()
+            .insert(0, "DetectedTerminal".into());
+    }
+    if let Some(icons) = detected.icons {
+        let mut data = egui::FontData::from_owned(icons.data);
+        data.index = icons.index;
+        fonts
+            .font_data
+            .insert("DetectedIcons".into(), std::sync::Arc::new(data));
+        fonts
+            .families
+            .entry(egui::FontFamily::Monospace)
+            .or_default()
+            .push("DetectedIcons".into());
+    }
+    ctx.data_mut(|data| data.insert_temp(egui::Id::new("terminal-font-label"), label));
     const SYMBOLS: &str = "NotoSansSymbols2";
     fonts.font_data.insert(
         SYMBOLS.into(),
@@ -3005,12 +3042,18 @@ fn configure_terminal_fonts(ctx: &egui::Context) {
             "../assets/fonts/NotoSansSymbols2-Regular.ttf"
         ))),
     );
-    // Keep Hack's text and cell metrics, using this only for missing symbols.
+    const EMOJI: &str = "NotoEmoji";
+    fonts.font_data.insert(
+        EMOJI.into(),
+        std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
+            "../assets/fonts/NotoEmoji.ttf"
+        ))),
+    );
     fonts
         .families
         .entry(egui::FontFamily::Monospace)
         .or_default()
-        .push(SYMBOLS.into());
+        .extend([SYMBOLS.into(), EMOJI.into()]);
     ctx.set_fonts(fonts);
 }
 
@@ -4271,7 +4314,17 @@ mod render_tests {
         configure_terminal_fonts(&ctx);
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             ctx.fonts_mut(|fonts| {
-                for symbol in ['➜', '✗', '✘', '✓', '✔'] {
+                for symbol in [
+                    '➜',
+                    '✗',
+                    '✘',
+                    '✓',
+                    '✔',
+                    '\u{1f916}',
+                    '\u{1f4b0}',
+                    '\u{1f4ca}',
+                    '\u{1f4c1}',
+                ] {
                     assert!(
                         fonts.has_glyph(&font, symbol),
                         "missing prompt symbol {symbol}"
@@ -4284,6 +4337,49 @@ mod render_tests {
                 );
             });
         });
+    }
+
+    #[test]
+    fn automatic_font_precedes_bundled_fallbacks() {
+        let ctx = egui::Context::default();
+        let defaults = egui::FontDefinitions::default();
+        let primary =
+            defaults.font_data[&defaults.families[&egui::FontFamily::Monospace][0]].clone();
+        configure_terminal_fonts_with(
+            &ctx,
+            crate::fonts::AutomaticFonts {
+                primary: Some(crate::fonts::LoadedFont {
+                    name: "Profile font".into(),
+                    data: primary.font.to_vec(),
+                    index: primary.index,
+                }),
+                icons: Some(crate::fonts::LoadedFont {
+                    name: "Icon fallback".into(),
+                    data: include_bytes!("../assets/fonts/NotoSansSymbols2-Regular.ttf").to_vec(),
+                    index: 0,
+                }),
+            },
+        );
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            ctx.fonts_mut(|fonts| {
+                let chain = &fonts.definitions().families[&egui::FontFamily::Monospace];
+                assert_eq!(chain[0], "DetectedTerminal");
+                let icons = chain
+                    .iter()
+                    .position(|name| name == "DetectedIcons")
+                    .unwrap();
+                let bundled = chain
+                    .iter()
+                    .position(|name| name == "NotoSansSymbols2")
+                    .unwrap();
+                assert!(icons < bundled);
+                assert!(fonts.has_glyphs(&FontId::monospace(15.0), "Text \u{1f916}"));
+            });
+        });
+        assert_eq!(
+            ctx.data(|data| data.get_temp::<String>(egui::Id::new("terminal-font-label"))),
+            Some("Automatic (Profile font)".into())
+        );
     }
 
     #[test]

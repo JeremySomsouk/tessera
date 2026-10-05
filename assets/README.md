@@ -21,3 +21,5 @@ Created with the built-in ImageGen tool, using the prior Mosaic icon as a brand 
 # Terminal symbol fallback
 
 `fonts/NotoSansSymbols2-Regular.ttf` is the unmodified Noto Sans Symbols 2 font from [Google Fonts](https://github.com/google/fonts/tree/main/ofl/notosanssymbols2), distributed under the SIL Open Font License in `fonts/OFL-NotoSansSymbols2.txt`. It is embedded as the last monospace fallback to render shell prompt symbols such as `✗` (U+2717), without replacing Hack for ordinary text. No system font installation or runtime download is required.
+
+`fonts/NotoEmoji.ttf` is the unmodified Noto Emoji variable font from [Google Fonts](https://github.com/google/fonts/tree/main/ofl/notoemoji), distributed under the SIL Open Font License in `fonts/OFL-NotoEmoji.txt`. It is the last monospace fallback for emoji in terminal status lines. Glyphs use the terminal foreground color; ordinary text retains Hack and its cell metrics.
