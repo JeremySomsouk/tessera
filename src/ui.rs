@@ -225,7 +225,7 @@ struct Workspace {
     layout: Layout,
     focus: Uuid,
 }
-#[derive(Default, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Saved {
     #[serde(default)]
     created_directories: Vec<CreatedDirectory>,
@@ -239,8 +239,26 @@ struct Saved {
     light: bool,
     #[serde(default)]
     skip_stop_confirmation: bool,
-    #[serde(default)]
+    #[serde(default = "default_clickable_choices")]
     clickable_codex_choices: bool,
+}
+
+impl Default for Saved {
+    fn default() -> Self {
+        Self {
+            created_directories: Vec::new(),
+            specifications: Vec::new(),
+            workspaces: Vec::new(),
+            sessions: Vec::new(),
+            font_size: default_font(),
+            light: false,
+            skip_stop_confirmation: false,
+            clickable_codex_choices: default_clickable_choices(),
+        }
+    }
+}
+fn default_clickable_choices() -> bool {
+    true
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -1517,6 +1535,188 @@ impl App {
         self.filter.clear();
     }
 
+    fn chrome(
+        &mut self,
+        ctx: &egui::Context,
+        wide: bool,
+        pane_action: &mut Option<(Uuid, &'static str)>,
+    ) {
+        egui::TopBottomPanel::top("chrome")
+            .frame(
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(24, 27, 31))
+                    .inner_margin(egui::Margin::symmetric(16, 8)),
+            )
+            .show(ctx, |ui| {
+                *ui.visuals_mut() = egui::Visuals::dark();
+                let native_controls = cfg!(target_os = "macos")
+                    && !ctx.input(|input| input.viewport().fullscreen.unwrap_or(false));
+                let mut drag_rect = ui.max_rect();
+                drag_rect.max.y = drag_rect.min.y + 24.0;
+                if native_controls {
+                    drag_rect.min.x += 64.0;
+                }
+                if cfg!(target_os = "macos") {
+                    let drag = ui.interact(
+                        drag_rect,
+                        ui.id().with("window-drag"),
+                        Sense::click_and_drag(),
+                    );
+                    if drag.drag_started() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                    }
+                    if drag.double_clicked() {
+                        let maximized =
+                            ctx.input(|input| input.viewport().maximized.unwrap_or(false));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+                    }
+                }
+                ui.horizontal(|ui| {
+                    ui.set_min_height(24.0);
+                    if native_controls {
+                        ui.add_space(64.0);
+                    }
+                    if wide {
+                        mosaic_mark(ui);
+                        ui.label(RichText::new("TESSERA").size(14.0).strong());
+                        ui.add_space(18.0);
+                    }
+                    if ui
+                        .selectable_label(!self.overview && !self.specifications_view, "Terminal")
+                        .clicked()
+                    {
+                        self.overview = false;
+                        self.specifications_view = false;
+                    }
+                    if ui
+                        .selectable_label(self.specifications_view, "Specs")
+                        .clicked()
+                    {
+                        self.specifications_view = true;
+                    }
+                    let attention = self
+                        .saved
+                        .sessions
+                        .iter()
+                        .filter(|s| s.state.attention())
+                        .count();
+                    let overview = if attention > 0 {
+                        format!("Overview · {attention}")
+                    } else {
+                        "Overview".into()
+                    };
+                    if ui
+                        .selectable_label(self.overview && !self.specifications_view, overview)
+                        .on_hover_text(shortcut("Overview", "Shift+O"))
+                        .clicked()
+                    {
+                        self.overview = true;
+                        self.specifications_view = false;
+                    }
+                    if !self.overview
+                        && !self.specifications_view
+                        && let Some(workspace) = self.saved.workspaces.get(self.active)
+                    {
+                        let title = workspace.task.title.clone();
+                        let directory = workspace.task.directory.clone();
+                        let controls_width = if wide { 150.0 } else { 0.0 };
+                        let title_width = (ui.available_width() - 210.0 - controls_width).max(40.0);
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(title_width, 24.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                if wide {
+                                    ui.add_sized(
+                                        [title_width, 24.0],
+                                        egui::Label::new(RichText::new(&title).strong()).truncate(),
+                                    )
+                                    .on_hover_text(format!("{title}\n{directory}"));
+                                } else {
+                                    egui::containers::menu::MenuButton::from_button(
+                                        egui::Button::new(RichText::new(&title).strong())
+                                            .truncate()
+                                            .min_size(Vec2::new(title_width, 24.0)),
+                                    )
+                                    .ui(ui, |ui| self.workspace_actions(ui, ctx))
+                                    .0
+                                    .on_hover_text(format!(
+                                        "{title}\n{directory}\nWorkspace actions"
+                                    ));
+                                }
+                            },
+                        );
+                        if wide {
+                            if ui
+                                .small_button(if self.maximized {
+                                    "Restore"
+                                } else {
+                                    "Maximize"
+                                })
+                                .on_hover_text(shortcut("Maximize / restore pane", "Shift+Enter"))
+                                .clicked()
+                            {
+                                self.maximized = !self.maximized;
+                            }
+                            ui.menu_button("Split", |ui| self.split_actions(ui, ctx));
+                        }
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .button("+ Workspace")
+                            .on_hover_text("Create a workspace in a directory")
+                            .clicked()
+                        {
+                            self.open_commands(CommandPage::Create);
+                        }
+                        if ui
+                            .button("Commands")
+                            .on_hover_text(shortcut("Search workspaces and commands", "Shift+P"))
+                            .clicked()
+                        {
+                            self.open_commands(CommandPage::Commands);
+                        }
+                    });
+                });
+                if !wide {
+                    ui.add_space(8.0);
+                    egui::ScrollArea::horizontal()
+                        .id_salt("workspace-tabs")
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                self.workspace_navigation(ui, false, pane_action);
+                            });
+                        });
+                }
+            });
+    }
+
+    fn workspace_actions(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if ui
+            .button(if self.maximized {
+                "Restore pane"
+            } else {
+                "Maximize pane"
+            })
+            .clicked()
+        {
+            self.maximized = !self.maximized;
+            ui.close();
+        }
+        self.split_actions(ui, ctx);
+    }
+
+    fn split_actions(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if ui.button(shortcut("Side by side", "D")).clicked() {
+            self.split(ctx, true);
+            ui.close();
+        }
+        if ui.button(shortcut("Stacked", "Shift+D")).clicked() {
+            self.split(ctx, false);
+            ui.close();
+        }
+    }
+
     fn workspace_navigation(
         &mut self,
         ui: &mut egui::Ui,
@@ -1946,7 +2146,7 @@ impl App {
         if ui
             .checkbox(
                 &mut self.saved.clickable_codex_choices,
-                "Clickable Codex questions",
+                "Clickable Claude Code and Codex choices",
             )
             .on_hover_text("Click an option to select it. Press Enter to submit.")
             .changed()
@@ -2275,78 +2475,7 @@ impl App {
         };
         let mut pane_action = None;
         let wide = ctx.content_rect().width() >= 900.0;
-        egui::TopBottomPanel::top("chrome")
-            .frame(
-                egui::Frame::new()
-                    .fill(ctx.style().visuals.panel_fill)
-                    .inner_margin(egui::Margin::symmetric(16, 10)),
-            )
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    mosaic_mark(ui);
-                    ui.label(RichText::new("TESSERA").size(14.0).strong());
-                    ui.add_space(18.0);
-                    if ui
-                        .selectable_label(!self.overview && !self.specifications_view, "Terminal")
-                        .clicked()
-                    {
-                        self.overview = false;
-                        self.specifications_view = false;
-                    }
-                    if ui
-                        .selectable_label(self.specifications_view, "Specs")
-                        .clicked()
-                    {
-                        self.specifications_view = true;
-                    }
-                    let attention = self
-                        .saved
-                        .sessions
-                        .iter()
-                        .filter(|s| s.state.attention())
-                        .count();
-                    let overview = if attention > 0 {
-                        format!("Overview · {attention}")
-                    } else {
-                        "Overview".into()
-                    };
-                    if ui
-                        .selectable_label(self.overview && !self.specifications_view, overview)
-                        .on_hover_text(shortcut("Overview", "Shift+O"))
-                        .clicked()
-                    {
-                        self.overview = true;
-                        self.specifications_view = false;
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .button("+ Workspace")
-                            .on_hover_text("Create a workspace in a directory")
-                            .clicked()
-                        {
-                            self.open_commands(CommandPage::Create);
-                        }
-                        if ui
-                            .button("Commands")
-                            .on_hover_text(shortcut("Search workspaces and commands", "Shift+P"))
-                            .clicked()
-                        {
-                            self.open_commands(CommandPage::Commands);
-                        }
-                    });
-                });
-                if !wide {
-                    ui.add_space(8.0);
-                    egui::ScrollArea::horizontal()
-                        .id_salt("workspace-tabs")
-                        .auto_shrink([false, true])
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                self.workspace_navigation(ui, false, &mut pane_action);
-                            });
-                        });
-                }
-            });
+        self.chrome(ctx, wide, &mut pane_action);
         if wide {
             egui::SidePanel::left("workspace-rail")
                 .exact_width(216.0)
@@ -2448,43 +2577,6 @@ impl App {
                 if self.overview {
                     self.overview(ui);
                     return;
-                }
-                if let Some(w) = self.saved.workspaces.get(self.active) {
-                    let title = w.task.title.clone();
-                    let directory = w.task.directory.clone();
-                    ui.horizontal(|ui| {
-                        ui.add_sized(
-                            [(ui.available_width() - 220.0).max(80.0), 22.0],
-                            egui::Label::new(RichText::new(title).strong().size(16.0))
-                                .truncate()
-                                .halign(egui::Align::Min),
-                        )
-                        .on_hover_text(directory);
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui
-                                .small_button(if self.maximized {
-                                    "Restore"
-                                } else {
-                                    "Maximize"
-                                })
-                                .on_hover_text(shortcut("Maximize / restore pane", "Shift+Enter"))
-                                .clicked()
-                            {
-                                self.maximized = !self.maximized;
-                            }
-                            ui.menu_button("Split", |ui| {
-                                if ui.button(shortcut("Side by side", "D")).clicked() {
-                                    self.split(ctx, true);
-                                    ui.close();
-                                }
-                                if ui.button(shortcut("Stacked", "Shift+D")).clicked() {
-                                    self.split(ctx, false);
-                                    ui.close();
-                                }
-                            });
-                        });
-                    });
-                    ui.add_space(4.0);
                 }
                 let Some(w) = self.saved.workspaces.get_mut(self.active) else {
                     ui.vertical_centered(|ui| {
@@ -4111,6 +4203,21 @@ mod render_tests {
     }
 
     #[test]
+    fn clickable_choices_default_on_and_preserve_saved_opt_out() {
+        assert!(Saved::default().clickable_codex_choices);
+        let mut value = serde_json::to_value(Saved::default()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("clickable_codex_choices");
+        let legacy: Saved = serde_json::from_value(value.clone()).unwrap();
+        assert!(legacy.clickable_codex_choices);
+        value["clickable_codex_choices"] = serde_json::json!(false);
+        let opted_out: Saved = serde_json::from_value(value).unwrap();
+        assert!(!opted_out.clickable_codex_choices);
+    }
+
+    #[test]
     fn startup_opens_one_fresh_terminal_and_preserves_preferences_and_history() {
         let ctx = egui::Context::default();
         let directory = tempfile::tempdir().unwrap();
@@ -4382,6 +4489,208 @@ mod render_tests {
         assert_eq!(app.saved.sessions.len(), 1);
         assert_eq!(app.saved.sessions[0].history.len(), 3);
         assert_eq!(app.selected, Some(app.saved.sessions[0].key()));
+    }
+
+    #[test]
+    fn chrome_navigation_remains_clickable_and_fits_narrow_windows() {
+        for width in [640.0, 900.0, 1180.0] {
+            let ctx = egui::Context::default();
+            configure_appearance(&ctx, true);
+            let mut app = fixture(1);
+            app.saved.workspaces[0].task.title =
+                "A long workspace name that must be truncated in the compact navigation bar".into();
+            app.overview = false;
+            app.saved.sessions[0].state = SessionState::Input;
+            let frame = |app: &mut App, events| {
+                ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(width, 400.0))),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| app.chrome(ctx, width >= 900.0, &mut None),
+                )
+            };
+            let out = frame(&mut app, vec![]);
+            let pos = out
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::epaint::Shape::Text(text) if text.galley.text() == "Specs" => {
+                        Some(text.pos + Vec2::new(5.0, 5.0))
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            for shape in &out.shapes {
+                if let egui::epaint::Shape::Text(text) = &shape.shape {
+                    assert!(
+                        text.pos.x + text.galley.size().x <= width,
+                        "{} clipped",
+                        text.galley.text()
+                    );
+                    if cfg!(target_os = "macos") {
+                        assert!(
+                            text.pos.x >= 80.0,
+                            "native controls overlap {}",
+                            text.galley.text()
+                        );
+                    }
+                }
+            }
+            for pressed in [true, false] {
+                let out = frame(
+                    &mut app,
+                    vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: Modifiers::NONE,
+                        },
+                    ],
+                );
+                assert!(!out.viewport_output.values().any(|viewport| {
+                    viewport
+                        .commands
+                        .contains(&egui::ViewportCommand::StartDrag)
+                }));
+            }
+            assert!(app.specifications_view);
+            assert!(
+                !ctx.style().visuals.dark_mode,
+                "chrome theme leaked into content"
+            );
+        }
+    }
+
+    #[test]
+    fn chrome_workspace_name_keeps_maximize_accessible() {
+        for width in [640.0, 1180.0] {
+            let ctx = egui::Context::default();
+            let mut app = fixture(1);
+            app.overview = false;
+            app.saved.workspaces[0].task.title = "My task".into();
+            let frame = |app: &mut App, events| {
+                ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(width, 400.0))),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| app.chrome(ctx, width >= 900.0, &mut None),
+                )
+            };
+            let text_pos = |out: &egui::FullOutput, label: &str| {
+                out.shapes
+                    .iter()
+                    .find_map(|shape| match &shape.shape {
+                        egui::epaint::Shape::Text(text) if text.galley.text() == label => {
+                            Some(text.pos + Vec2::new(5.0, 5.0))
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "missing {label}: {:?}",
+                            out.shapes
+                                .iter()
+                                .filter_map(|shape| match &shape.shape {
+                                    egui::epaint::Shape::Text(text) => Some(text.galley.text()),
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>()
+                        )
+                    })
+            };
+            let click = |app: &mut App, pos| {
+                let _ = frame(
+                    app,
+                    vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed: true,
+                            modifiers: Modifiers::NONE,
+                        },
+                    ],
+                );
+                frame(
+                    app,
+                    vec![egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: Modifiers::NONE,
+                    }],
+                )
+            };
+            let mut out = frame(&mut app, vec![]);
+            let name = text_pos(&out, "My task");
+            assert!(
+                name.y < 40.0,
+                "workspace name did not move into the top bar"
+            );
+            if width < 900.0 {
+                click(&mut app, name);
+                out = frame(&mut app, vec![]);
+            }
+            let action = text_pos(
+                &out,
+                if width < 900.0 {
+                    "Maximize pane"
+                } else {
+                    "Maximize"
+                },
+            );
+            click(&mut app, action);
+            assert!(app.maximized);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn chrome_background_starts_native_window_drag() {
+        let ctx = egui::Context::default();
+        let mut app = fixture(0);
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1180.0, 400.0))),
+                ..Default::default()
+            },
+            |ctx| app.chrome(ctx, true, &mut None),
+        );
+        let mut drag_sent = false;
+        for (pos, pressed) in [
+            (Pos2::new(700.0, 20.0), Some(true)),
+            (Pos2::new(730.0, 20.0), None),
+        ] {
+            let mut events = vec![egui::Event::PointerMoved(pos)];
+            if let Some(pressed) = pressed {
+                events.push(egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Modifiers::NONE,
+                });
+            }
+            let out = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1180.0, 400.0))),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.chrome(ctx, true, &mut None),
+            );
+            drag_sent |= out.viewport_output.values().any(|viewport| {
+                viewport
+                    .commands
+                    .contains(&egui::ViewportCommand::StartDrag)
+            });
+        }
+        assert!(drag_sent);
     }
 
     #[test]
@@ -5186,6 +5495,15 @@ mod render_tests {
 
     #[test]
     fn clicking_codex_choice_sends_arrow_without_submitting() {
+        choice_click_regression(false);
+    }
+
+    #[test]
+    fn clicking_claude_choice_sends_arrow_without_submitting() {
+        choice_click_regression(true);
+    }
+
+    fn choice_click_regression(claude: bool) {
         let ctx = egui::Context::default();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("choice-input");
@@ -5217,7 +5535,12 @@ mod render_tests {
                 });
             },
         );
-        terminal.input(format!("stty raw -echo; printf '\\033[?1049h\\033[2J\\033[HQuestion 1/1 (1 unanswered)\\r\\nChoose an option.\\r\\n › 1. First\\r\\n   2. Second\\r\\n\\r\\ntab to add notes | enter to submit answer | esc to interrupt'; dd bs=1 count=3 of='{}' 2>/dev/null; stty sane\r", path.display()).into_bytes()).unwrap();
+        let prompt = if claude {
+            "Which option?\\r\\nChoose an option.\\r\\n ❯ 1. First\\r\\n   2. Second\\r\\n\\r\\nEnter to select · ↑/↓ to navigate · Esc to cancel"
+        } else {
+            "Question 1/1 (1 unanswered)\\r\\nChoose an option.\\r\\n › 1. First\\r\\n   2. Second\\r\\n\\r\\ntab to add notes | enter to submit answer | esc to interrupt"
+        };
+        terminal.input(format!("stty raw -echo; printf '\\033[?1049h\\033[2J\\033[H{prompt}'; dd bs=1 count=3 of='{}' 2>/dev/null; stty sane\r", path.display()).into_bytes()).unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
         while !terminal.mode().contains(TermMode::ALT_SCREEN) {
             assert!(std::time::Instant::now() < deadline);
