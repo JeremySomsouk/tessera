@@ -168,7 +168,7 @@ fn kitty_font(path: &Path) -> Option<String> {
             let (key, value) = line.split_once(char::is_whitespace)?;
             (key == "font_family").then(|| value.trim().to_owned())
         })
-        .last()
+        .next_back()
         .filter(|name| !name.is_empty() && name != "auto")
 }
 
