@@ -3643,10 +3643,54 @@ fn terminal_view(
                 i.pointer.press_origin(),
             )
         });
+    let hovered_url = response
+        .hover_pos()
+        .filter(|pos| grid_rect.contains(*pos))
+        .and_then(|pos| {
+            let term = terminal.term.try_lock().ok()?;
+            let point = Point::new(
+                Line(
+                    ((pos.y - grid_rect.top()) / cell.y).floor() as i32
+                        - term.grid().display_offset() as i32,
+                ),
+                Column(((pos.x - grid_rect.left()) / cell.x).floor() as usize),
+            );
+            terminal_url_at(term.grid(), point)
+        });
+    let link_modifier = modifiers.command || modifiers.alt;
+    let link_clicked = response.clicked_by(egui::PointerButton::Primary);
+    let link_dragged = response.drag_started();
+    let mut open_link = None;
+    let link_gesture = ui.ctx().data_mut(|data| {
+        let target = data.get_temp_mut_or_default::<Option<String>>(response.id.with("link_press"));
+        if primary_pressed {
+            *target = hovered_url.clone().filter(|_| link_modifier);
+        }
+        let active = target.is_some();
+        if link_dragged {
+            *target = None;
+        }
+        if primary_released {
+            if link_clicked
+                && target.as_ref() == hovered_url.as_ref()
+                && let Some(url) = target.take()
+            {
+                open_link = Some(url);
+            }
+            *target = None;
+        } else if !primary_down {
+            *target = None;
+        }
+        active
+    });
+    if let Some(url) = open_link {
+        ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+    }
     let primary_reporting = ui.ctx().data_mut(|data| {
         let reporting = data.get_temp_mut_or_default::<bool>(response.id.with("primary_reporting"));
         if primary_pressed {
-            *reporting = !copying
+            *reporting = !link_gesture
+                && !copying
                 && !searching
                 && mode.intersects(TermMode::MOUSE_MODE)
                 && modifiers.alt
@@ -3664,7 +3708,10 @@ fn terminal_view(
     if let Ok(mut term) = terminal.term.try_lock() {
         search.invalidate(terminal.revision());
         mode = *term.mode();
-        if !primary_reporting && let Some(pos) = response.interact_pointer_pos() {
+        if !primary_reporting
+            && !link_gesture
+            && let Some(pos) = response.interact_pointer_pos()
+        {
             let display_offset = term.grid().display_offset() as i32;
             let point_at = |pos: Pos2| {
                 Point::new(
@@ -3936,7 +3983,7 @@ fn terminal_view(
             })
             .map(|choice| choice.number)
     });
-    if hovered_choice.is_some() {
+    if (link_modifier && hovered_url.is_some()) || hovered_choice.is_some() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     } else if response.hovered() && !primary_reporting {
         ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
@@ -4139,6 +4186,82 @@ fn terminal_view(
     }
     (clicked, result, new_tab)
 }
+fn terminal_url_at(
+    grid: &alacritty_terminal::grid::Grid<alacritty_terminal::term::cell::Cell>,
+    point: Point,
+) -> Option<String> {
+    use alacritty_terminal::grid::Dimensions;
+    let cols = grid.columns();
+    if point.column.0 >= cols
+        || point.line.0 < -(grid.history_size() as i32)
+        || point.line.0 >= grid.screen_lines() as i32
+    {
+        return None;
+    }
+    if let Some(link) = grid[point].hyperlink() {
+        let uri = link.uri();
+        return (uri.starts_with("https://") || uri.starts_with("http://")).then(|| uri.to_owned());
+    }
+    let mut first = point.line.0;
+    while first > -(grid.history_size() as i32)
+        && grid[Line(first - 1)][Column(cols - 1)]
+            .flags
+            .contains(Flags::WRAPLINE)
+    {
+        first -= 1;
+    }
+    let mut text = String::new();
+    let mut clicked = None;
+    let mut line = first;
+    loop {
+        for col in 0..cols {
+            let cell = &grid[Line(line)][Column(col)];
+            if Point::new(Line(line), Column(col)) == point {
+                clicked = Some(text.len());
+            }
+            if !cell
+                .flags
+                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+            {
+                text.push(cell.c);
+            }
+        }
+        if line + 1 >= grid.screen_lines() as i32
+            || !grid[Line(line)][Column(cols - 1)]
+                .flags
+                .contains(Flags::WRAPLINE)
+        {
+            break;
+        }
+        line += 1;
+    }
+    url_in_text(&text, clicked?)
+}
+
+fn url_in_text(text: &str, clicked: usize) -> Option<String> {
+    for (start, _) in text.match_indices("http") {
+        let tail = &text[start..];
+        if !tail.starts_with("https://") && !tail.starts_with("http://") {
+            continue;
+        }
+        let end = tail
+            .find(|c: char| c.is_whitespace() || matches!(c, '<' | '>' | '\"' | '\''))
+            .unwrap_or(tail.len());
+        let mut url = &tail[..end];
+        url = url.trim_end_matches(['.', ',', ';', ':', '!', '?']);
+        for (open, close) in [('(', ')'), ('[', ']'), ('{', '}')] {
+            while url.ends_with(close) && url.matches(close).count() > url.matches(open).count() {
+                url = &url[..url.len() - 1];
+            }
+        }
+        let authority = url.split_once("://")?.1;
+        if !authority.is_empty() && start <= clicked && clicked < start + url.len() {
+            return Some(url.to_owned());
+        }
+    }
+    None
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SelectionMenuAction {
     Copy,
@@ -4381,6 +4504,142 @@ fn encode_key(key: Key, m: Modifiers, mode: TermMode) -> Option<Vec<u8>> {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn printed_url_boundaries_preserve_balanced_punctuation() {
+        let text = "See (https://example.com/a_(b)), http://localhost:3000/test.";
+        assert_eq!(
+            url_in_text(text, 10).as_deref(),
+            Some("https://example.com/a_(b)")
+        );
+        assert_eq!(
+            url_in_text(text, 40).as_deref(),
+            Some("http://localhost:3000/test")
+        );
+        assert_eq!(url_in_text(text, 0), None);
+        assert_eq!(url_in_text("https://example.com.", 19), None);
+    }
+
+    #[test]
+    fn terminal_urls_span_wrapped_rows_and_hyperlink_labels() {
+        let ctx = egui::Context::default();
+        let dir = tempfile::tempdir().unwrap();
+        let mut terminal =
+            Terminal::spawn_test(Uuid::new_v4(), dir.path(), std::path::Path::new(""), ctx)
+                .unwrap();
+        terminal.resize(Size { cols: 12, rows: 6 });
+        let mut term = terminal.term.lock().unwrap();
+        term.resize(Size { cols: 12, rows: 6 });
+        let mut parser: alacritty_terminal::vte::ansi::Processor = Default::default();
+        parser.advance(
+            &mut *term,
+            b"\x1b[?1049h\x1b[2J\x1b[Hhttps://example.com/path",
+        );
+        assert_eq!(
+            terminal_url_at(term.grid(), Point::new(Line(1), Column(3))).as_deref(),
+            Some("https://example.com/path")
+        );
+        parser.advance(
+            &mut *term,
+            b"\x1b[3;1H\x1b]8;;https://example.org\x1b\\label\x1b]8;;\x1b\\",
+        );
+        assert_eq!(
+            terminal_url_at(term.grid(), Point::new(Line(2), Column(2))).as_deref(),
+            Some("https://example.org")
+        );
+        assert_eq!(
+            terminal_url_at(term.grid(), Point::new(Line(6), Column(0))),
+            None
+        );
+    }
+
+    #[test]
+    fn modifier_click_opens_terminal_url() {
+        for modifiers in [Modifiers::COMMAND, Modifiers::ALT] {
+            let ctx = egui::Context::default();
+            let dir = tempfile::tempdir().unwrap();
+            let mut terminal = Terminal::spawn_test(
+                Uuid::new_v4(),
+                dir.path(),
+                std::path::Path::new(""),
+                ctx.clone(),
+            )
+            .unwrap();
+            let mut search = TerminalSearch::default();
+            let mut pos = Pos2::ZERO;
+            let mut frame = |events| {
+                ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(640.0, 480.0))),
+                        events,
+                        modifiers,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            pos = ui.available_rect_before_wrap().shrink(8.0).min
+                                + Vec2::new(25.0, 5.0);
+                            terminal_view(ui, &mut terminal, &mut search, true, 15.0, true)
+                                .1
+                                .unwrap();
+                        });
+                    },
+                )
+            };
+            frame(vec![]);
+            drop(frame);
+            std::thread::sleep(Duration::from_millis(30));
+            {
+                let mut term = terminal.term.lock().unwrap();
+                let mut parser: alacritty_terminal::vte::ansi::Processor = Default::default();
+                parser.advance(
+                    &mut *term,
+                    b"\x1b[?1049h\x1b[?1000h\x1b[?1006h\x1b[2J\x1b[Hhttps://example.com",
+                );
+            }
+            let mut frame = |events| {
+                ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(640.0, 480.0))),
+                        events,
+                        modifiers,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            terminal_view(ui, &mut terminal, &mut search, true, 15.0, true)
+                                .1
+                                .unwrap();
+                        });
+                    },
+                )
+            };
+            frame(vec![egui::Event::PointerMoved(pos)]);
+            frame(vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers,
+                },
+            ]);
+            let output = frame(vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers,
+            }]);
+            assert!(
+                output
+                    .platform_output
+                    .commands
+                    .iter()
+                    .any(|command| matches!(command,
+                egui::OutputCommand::OpenUrl(url) if url.url == "https://example.com"))
+            );
+        }
+    }
+
     use super::*;
     #[test]
     fn work_migration_preserves_empty_workspaces_specs_and_provider_identity() {
