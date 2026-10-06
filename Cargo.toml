@@ -1,6 +1,6 @@
 [package]
 name = "tessera"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2024"
 license = "MIT"
 description = "A terminal workspace for durable work with Claude Code and Codex"
