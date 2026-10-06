@@ -25,18 +25,19 @@ impl Prompt {
             .iter()
             .enumerate()
             .skip(header + 1)
-            .find_map(|(row, line)| {
-                (line.contains("tab to add notes")
-                    && line.contains("enter to submit answer")
-                    && line.contains("esc to interrupt"))
+            .find_map(|(row, _)| {
+                let footer = footer_text(lines, row);
+                (footer.contains("tab to add notes")
+                    && footer.contains("enter to submit answer")
+                    && footer.contains("esc to interrupt"))
                 .then_some(row)
             })?;
         Self::parse_choices(lines, header + 1, footer, '›')
     }
 
     fn parse_claude(lines: &[String]) -> Option<Self> {
-        let footer = lines.iter().rposition(|line| {
-            let text = line.to_lowercase();
+        let footer = (0..lines.len()).rev().find(|&row| {
+            let text = footer_text(lines, row);
             text.contains("enter to select")
                 && (text.contains("to navigate") || text.contains("tab/arrow keys"))
                 && text.contains("esc to cancel")
@@ -104,6 +105,23 @@ impl Prompt {
             choices,
         })
     }
+}
+
+fn footer_text(lines: &[String], row: usize) -> String {
+    let first = lines[row].trim().to_lowercase();
+    if !["tab ", "enter ", "press ", "↑/↓"]
+        .iter()
+        .any(|prefix| first.starts_with(prefix))
+    {
+        return String::new();
+    }
+    lines[row..lines.len().min(row + 3)]
+        .iter()
+        .take_while(|line| !line.trim().is_empty())
+        .flat_map(|line| line.split_whitespace())
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 #[cfg(test)]
@@ -186,6 +204,35 @@ mod tests {
         lines[4] = "❯ 3. Type something.".into();
         assert!(Prompt::parse(&lines).is_none());
     }
+    #[test]
+    fn option_labels_with_keyboard_words_are_not_footer_rows() {
+        let mut lines = fixture();
+        lines[5] = "   3. Enter another answer".into();
+        assert_eq!(Prompt::parse(&lines).unwrap().choices.len(), 3);
+    }
+
+    #[test]
+    fn recognizes_codex_footer_across_terminal_rows() {
+        let mut lines = fixture();
+        lines.truncate(6);
+        lines.extend([
+            "tab to add notes | enter to submit answer |".into(),
+            "esc to interrupt".into(),
+        ]);
+        assert_eq!(Prompt::parse(&lines).unwrap().choices.len(), 3);
+    }
+
+    #[test]
+    fn recognizes_claude_footer_across_terminal_rows() {
+        let mut lines = claude_fixture();
+        lines.truncate(6);
+        lines.extend([
+            "Enter to select · Tab/Arrow keys".into(),
+            "to navigate · Esc to cancel".into(),
+        ]);
+        assert_eq!(Prompt::parse(&lines).unwrap().choices.len(), 4);
+    }
+
     #[test]
     fn rejects_lists_notes_and_ambiguous_selection() {
         let mut lines = fixture();

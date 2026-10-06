@@ -3753,7 +3753,6 @@ fn terminal_view(
             && !copying
             && !searching
             && terminal.alive.load(Ordering::Acquire)
-            && !mode.intersects(TermMode::MOUSE_MODE)
             && term.grid().display_offset() == 0
         {
             choice_revision = terminal.revision();
@@ -4013,6 +4012,7 @@ fn terminal_view(
         && terminal.revision() == choice_revision
     {
         let delta = target as i32 - prompt.selected as i32;
+        let mut input = Vec::new();
         if delta != 0 {
             let key = if delta > 0 {
                 Key::ArrowDown
@@ -4020,8 +4020,12 @@ fn terminal_view(
                 Key::ArrowUp
             };
             if let Some(bytes) = encode_key(key, Modifiers::NONE, mode) {
-                result = terminal.input_at_cursor(bytes.repeat(delta.unsigned_abs() as usize));
+                input.extend(bytes.repeat(delta.unsigned_abs() as usize));
             }
+        }
+        if let Some(enter) = encode_key(Key::Enter, Modifiers::NONE, mode) {
+            input.extend(enter);
+            result = terminal.input_at_cursor(input);
         }
     }
     let mut new_tab = None;
@@ -6709,16 +6713,33 @@ mod render_tests {
     }
 
     #[test]
-    fn clicking_codex_choice_sends_arrow_without_submitting() {
-        choice_click_regression(false);
+    fn clicking_codex_choice_selects_and_submits() {
+        choice_click_regression(false, false, false);
     }
 
     #[test]
-    fn clicking_claude_choice_sends_arrow_without_submitting() {
-        choice_click_regression(true);
+    fn clicking_claude_choice_selects_and_submits() {
+        choice_click_regression(true, false, false);
     }
 
-    fn choice_click_regression(claude: bool) {
+    #[test]
+    fn clicking_codex_choice_with_mouse_reporting_selects_and_submits() {
+        choice_click_regression(false, true, false);
+    }
+
+    #[test]
+    fn clicking_claude_choice_with_mouse_reporting_selects_and_submits() {
+        choice_click_regression(true, true, false);
+    }
+
+    #[test]
+    fn clicking_highlighted_agent_choice_submits_without_moving_selection() {
+        for claude in [false, true] {
+            choice_click_regression(claude, false, true);
+        }
+    }
+
+    fn choice_click_regression(claude: bool, reporting: bool, already_selected: bool) {
         let ctx = egui::Context::default();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("choice-input");
@@ -6743,7 +6764,10 @@ mod render_tests {
                     let cell =
                         ui.fonts_mut(|f| Vec2::new(f.glyph_width(&font, 'M'), f.row_height(&font)));
                     pos = ui.available_rect_before_wrap().shrink(8.0).min
-                        + Vec2::new(6.0 * cell.x, 3.5 * cell.y);
+                        + Vec2::new(
+                            6.0 * cell.x,
+                            (if already_selected { 2.5 } else { 3.5 }) * cell.y,
+                        );
                     terminal_view(ui, &mut terminal, &mut search, true, 15.0, true)
                         .1
                         .unwrap();
@@ -6755,7 +6779,14 @@ mod render_tests {
         } else {
             "Question 1/1 (1 unanswered)\\r\\nChoose an option.\\r\\n › 1. First\\r\\n   2. Second\\r\\n\\r\\ntab to add notes | enter to submit answer | esc to interrupt"
         };
-        terminal.input(format!("stty raw -echo; printf '\\033[?1049h\\033[2J\\033[H{prompt}'; dd bs=1 count=3 of='{}' 2>/dev/null; stty sane\r", path.display()).into_bytes()).unwrap();
+        let mouse = if reporting {
+            "\\033[?1000h\\033[?1006h"
+        } else {
+            ""
+        };
+        let expected: &[u8] = if already_selected { b"\r" } else { b"\x1b[B\r" };
+        let count = expected.len();
+        terminal.input(format!("stty raw -echo; printf '\\033[?1049h{mouse}\\033[2J\\033[H{prompt}'; dd bs=1 count={count} of='{}' 2>/dev/null; stty sane\r", path.display()).into_bytes()).unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
         while !terminal.mode().contains(TermMode::ALT_SCREEN) {
             assert!(std::time::Instant::now() < deadline);
@@ -6786,14 +6817,14 @@ mod render_tests {
             );
         }
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
-        while !std::fs::read(&path).is_ok_and(|bytes| bytes.len() == 3) {
+        while !std::fs::read(&path).is_ok_and(|bytes| bytes.len() == expected.len()) {
             assert!(
                 std::time::Instant::now() < deadline,
-                "click did not select through PTY"
+                "click did not select and submit through PTY"
             );
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(std::fs::read(path).unwrap(), b"\x1b[B");
+        assert_eq!(std::fs::read(path).unwrap(), expected);
     }
 
     #[test]
