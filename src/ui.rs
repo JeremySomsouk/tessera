@@ -2066,6 +2066,9 @@ impl App {
                     }
                 }
             });
+            if response.clicked_by(egui::PointerButton::Middle) {
+                *pane_action = Some((w.focus, "Stop terminal"));
+            }
             if response.clicked() {
                 self.active = index;
                 self.overview = false;
@@ -4126,13 +4129,7 @@ fn terminal_view(
                 pressed: true,
                 modifiers,
                 ..
-            } => {
-                if modifiers.command && (!modifiers.ctrl || cfg!(target_os = "macos")) {
-                    None
-                } else {
-                    encode_key(key, modifiers, mode)
-                }
-            }
+            } => encode_key(key, modifiers, mode),
             egui::Event::PointerButton {
                 pos,
                 button,
@@ -4410,6 +4407,10 @@ fn copy_input(terminal: &mut Terminal, events: Vec<egui::Event>) -> anyhow::Resu
 }
 
 fn encode_key(key: Key, m: Modifiers, mode: TermMode) -> Option<Vec<u8>> {
+    if m.mac_cmd || (m.command && (!m.ctrl || cfg!(target_os = "macos"))) {
+        return (key == Key::Enter && m.mac_cmd && !m.shift && !m.alt && !m.ctrl)
+            .then(|| vec![b'\n']);
+    }
     if m.ctrl {
         let c = match key {
             Key::A => 1,
@@ -4508,6 +4509,33 @@ fn encode_key(key: Key, m: Modifiers, mode: TermMode) -> Option<Vec<u8>> {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn command_enter_encodes_newline_and_preserves_other_shortcuts() {
+        for mode in [TermMode::NONE, TermMode::APP_CURSOR, TermMode::ALT_SCREEN] {
+            assert_eq!(
+                encode_key(Key::Enter, Modifiers::MAC_CMD, mode),
+                Some(vec![b'\n'])
+            );
+            assert_eq!(
+                encode_key(Key::Enter, Modifiers::NONE, mode),
+                Some(vec![b'\r'])
+            );
+            assert_eq!(
+                encode_key(Key::Enter, Modifiers::ALT, mode),
+                Some(b"\x1b\r".to_vec())
+            );
+            assert_eq!(encode_key(Key::J, Modifiers::CTRL, mode), Some(vec![b'\n']));
+            for modifiers in [
+                Modifiers::MAC_CMD | Modifiers::SHIFT,
+                Modifiers::MAC_CMD | Modifiers::ALT,
+                Modifiers::MAC_CMD | Modifiers::CTRL,
+            ] {
+                assert_eq!(encode_key(Key::Enter, modifiers, mode), None);
+            }
+            assert_eq!(encode_key(Key::C, Modifiers::MAC_CMD, mode), None);
+        }
+    }
+
     #[test]
     fn printed_url_boundaries_preserve_balanced_punctuation() {
         let text = "See (https://example.com/a_(b)), http://localhost:3000/test.";
@@ -7207,6 +7235,51 @@ mod render_tests {
     }
 
     #[test]
+    fn middle_click_workspace_tab_requests_stop_without_switching_workspace() {
+        for rail in [false, true] {
+            let ctx = egui::Context::default();
+            let mut app = fixture(2);
+            app.active = 1;
+            app.overview = false;
+            let pane = app.saved.workspaces[0].focus;
+            let mut action = None;
+            for events in [
+                vec![],
+                vec![
+                    egui::Event::PointerMoved(Pos2::new(40.0, 25.0)),
+                    egui::Event::PointerButton {
+                        pos: Pos2::new(40.0, 25.0),
+                        button: egui::PointerButton::Middle,
+                        pressed: true,
+                        modifiers: Modifiers::NONE,
+                    },
+                ],
+                vec![egui::Event::PointerButton {
+                    pos: Pos2::new(40.0, 25.0),
+                    button: egui::PointerButton::Middle,
+                    pressed: false,
+                    modifiers: Modifiers::NONE,
+                }],
+            ] {
+                let _ = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0))),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            app.workspace_navigation(ui, rail, &mut action);
+                        });
+                    },
+                );
+            }
+            assert_eq!(action, Some((pane, "Stop terminal")));
+            assert_eq!(app.active, 1);
+        }
+    }
+
+    #[test]
     fn command_w_requests_confirmation_and_saved_opt_out_closes_immediately() {
         let ctx = egui::Context::default();
         let mut app = fixture(1);
@@ -8015,6 +8088,62 @@ mod render_tests {
                 .min,
             Pos2::ZERO
         );
+    }
+
+    #[test]
+    fn command_enter_reaches_focused_terminal_as_newline() {
+        let ctx = egui::Context::default();
+        let mut app = fixture(1);
+        app.overview = false;
+        let pane = app.saved.workspaces[0].focus;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("input");
+        let terminal =
+            Terminal::spawn_test(pane, dir.path(), std::path::Path::new(""), ctx.clone()).unwrap();
+        terminal.input(format!("stty raw -echo; printf '\\033[?1049h'; dd bs=1 count=3 of='{}' 2>/dev/null; stty sane\r", path.display()).into_bytes()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !terminal.mode().contains(TermMode::ALT_SCREEN) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "raw input reader did not start"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        app.panes.insert(
+            pane,
+            Pane {
+                terminal,
+                search: TerminalSearch::default(),
+            },
+        );
+        for events in [
+            vec![],
+            vec![],
+            vec![key_event(Key::Enter, None, Modifiers::MAC_CMD)],
+            vec![
+                egui::Event::Text("x".into()),
+                key_event(Key::Enter, None, Modifiers::NONE),
+            ],
+        ] {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1180.0, 760.0))),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.draw(ctx),
+            );
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !std::fs::read(&path).is_ok_and(|bytes| bytes.len() == 3) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "terminal did not receive multiline input"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(std::fs::read(path).unwrap(), b"\nx\r");
+        assert!(!app.maximized);
     }
 
     #[test]

@@ -6,7 +6,7 @@ A native terminal workspace for supervising Claude Code and Codex sessions.
 
 Run your usual shell in resizable panes. Open **Work** to see which piece of work needs a decision, inspect its linked Claude Code or Codex sessions, and return to the same terminal to act.
 
-**0.6.2** makes recognized Claude Code and Codex answers select and submit with one click, including mouse-reporting sessions and wrapped keyboard-help footers. [Release notes](docs/releases/0.6.2.md)
+**0.7.0** adds Command+Enter for multiline Claude Code prompts on macOS and middle-click closing of terminal tabs. [Release notes](docs/releases/0.7.0.md)
 
 ## Install
 
@@ -61,6 +61,8 @@ On macOS, use Cmd below. On Linux, replace Cmd with Ctrl+Alt.
 | Workspace 1–9 | Cmd+1–9 |
 | Next session needing attention | Cmd+Shift+N |
 | Stop focused pane | Cmd+W |
+
+On macOS, Command+Enter sends a line feed (the same as Ctrl+J) to insert a newline in Claude Code without submitting. Plain Enter still submits. Middle-click a workspace tab to stop its focused terminal using the existing close-confirmation setting.
 
 Drag terminal text to select it; right-click for copy, paste, new-tab, or browser-search actions. Drop a saved file to paste its path. Neither action submits a command for you. [Full controls and keyboard reference](docs/usage.md)
 
