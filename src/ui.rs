@@ -4052,6 +4052,10 @@ fn terminal_view(
             }
             for (action, label) in [
                 (SelectionMenuAction::Copy, "Copy"),
+                (
+                    SelectionMenuAction::CopyWithoutIndentation,
+                    "Copy without indentation",
+                ),
                 (SelectionMenuAction::Paste, "Paste into this terminal"),
                 (SelectionMenuAction::NewTab, "Open in new terminal tab"),
                 (SelectionMenuAction::Search, "Search in browser"),
@@ -4079,6 +4083,9 @@ fn terminal_view(
         ui.ctx().data_mut(|data| data.remove::<String>(menu_id));
         match action {
             SelectionMenuAction::Copy => ui.ctx().copy_text(text),
+            SelectionMenuAction::CopyWithoutIndentation => ui
+                .ctx()
+                .copy_text(selection_copy_without_indentation(&text)),
             SelectionMenuAction::Paste => {
                 result = selection_paste_text(&text).and_then(|text| terminal.paste(&text));
                 response.request_focus();
@@ -4266,9 +4273,16 @@ fn url_in_text(text: &str, clicked: usize) -> Option<String> {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SelectionMenuAction {
     Copy,
+    CopyWithoutIndentation,
     Paste,
     NewTab,
     Search,
+}
+
+fn selection_copy_without_indentation(text: &str) -> String {
+    text.split_inclusive('\n')
+        .map(|line| line.trim_start_matches([' ', '\t']))
+        .collect()
 }
 
 fn selection_paste_text(text: &str) -> anyhow::Result<String> {
@@ -7028,6 +7042,7 @@ mod render_tests {
             };
             for label in [
                 "Copy",
+                "Copy without indentation",
                 "Paste into this terminal",
                 "Open in new terminal tab",
                 "Search in browser",
@@ -7086,6 +7101,17 @@ mod render_tests {
                 b"x".as_slice()
             }
         );
+    }
+
+    #[test]
+    fn clean_copy_removes_line_padding_preserving_content_and_breaks() {
+        assert_eq!(
+            selection_copy_without_indentation("partial text\n  next line  \n\t  café 界\n  \n"),
+            "partial text\nnext line  \ncafé 界\n\n"
+        );
+        assert_eq!(selection_copy_without_indentation("  value"), "value");
+        assert_eq!(selection_copy_without_indentation(""), "");
+        assert_eq!(selection_copy_without_indentation("  a\r\n  b"), "a\r\nb");
     }
 
     #[test]

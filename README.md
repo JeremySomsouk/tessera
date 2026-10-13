@@ -6,7 +6,7 @@ A native terminal workspace for supervising Claude Code and Codex sessions.
 
 Run your usual shell in resizable panes. Open **Work** to see which piece of work needs a decision, inspect its linked Claude Code or Codex sessions, and return to the same terminal to act.
 
-**0.7.0** adds Command+Enter for multiline Claude Code prompts on macOS and middle-click closing of terminal tabs. [Release notes](docs/releases/0.7.0.md)
+**0.7.1** adds “Copy without indentation” to the terminal selection menu for copying passages from Claude output without leading spaces. [Release notes](docs/releases/0.7.1.md)
 
 ## Install
 
