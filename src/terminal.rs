@@ -6,7 +6,7 @@ use alacritty_terminal::{
     term::{Config, TermMode},
     vte::ansi::{Color, CursorShape, CursorStyle, NamedColor, Processor, Rgb},
 };
-use anyhow::{Result, bail};
+use anyhow::{Context as _, Result, bail};
 use eframe::egui::{Color32, Context};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::{
@@ -58,7 +58,6 @@ fn process_directory(pid: u32) -> Result<PathBuf> {
 }
 #[cfg(target_os = "linux")]
 fn process_directory(pid: u32) -> Result<PathBuf> {
-    use anyhow::Context;
     std::fs::read_link(format!("/proc/{pid}/cwd")).context("cannot read shell working directory")
 }
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -151,6 +150,44 @@ struct ProcessLifecycle {
     exited: bool,
     exit_code: Option<u32>,
 }
+
+const CLAUDE_LAUNCH: &str = "if ! command -v claude >/dev/null 2>&1; then printf '%s\\n' 'Claude Code was not found in your login shell PATH. Make sure the claude command runs in your usual terminal, then retry.' >&2; exit 127; fi; exec claude";
+
+fn agent_script(directory: &Path, launch: &str) -> Result<String> {
+    let directory = std::path::absolute(directory)?;
+    let directory = directory
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("Working directory is not valid UTF-8"))?
+        .replace('\'', "'\\''");
+    // Reset login-file cwd changes using the same physical resolution as the PTY.
+    Ok(format!(
+        "cd -P -- '{directory}' || {{ printf '%s\\n' 'Cannot enter the selected folder. It may have moved or become inaccessible. Choose the folder again.' >&2; exit 1; }}; {launch}"
+    ))
+}
+
+fn agent_command(directory: &Path, launch: &str) -> Result<CommandBuilder> {
+    let preferred = std::env::var("SHELL").unwrap_or_else(|_| {
+        if cfg!(target_os = "macos") {
+            "/bin/zsh".into()
+        } else {
+            "/bin/sh".into()
+        }
+    });
+    let shell = if matches!(
+        Path::new(&preferred)
+            .file_name()
+            .and_then(|name| name.to_str()),
+        Some("sh" | "bash" | "zsh")
+    ) {
+        preferred.as_str()
+    } else {
+        "/bin/sh"
+    };
+    let mut command = CommandBuilder::new(shell);
+    command.args(["-lic", &agent_script(directory, launch)?]);
+    Ok(command)
+}
+
 pub struct Terminal {
     pub term: Arc<Mutex<Term<Listener>>>,
     tx: SyncSender<Command>,
@@ -189,26 +226,23 @@ impl Terminal {
         ctx: Context,
         launch: &str,
     ) -> Result<Self> {
-        // Match ordinary terminal PATH setup while keeping POSIX literal quoting.
-        let preferred = std::env::var("SHELL").unwrap_or_else(|_| {
-            if cfg!(target_os = "macos") {
-                "/bin/zsh".into()
-            } else {
-                "/bin/sh".into()
-            }
-        });
-        let shell = if matches!(
-            Path::new(&preferred)
-                .file_name()
-                .and_then(|name| name.to_str()),
-            Some("sh" | "bash" | "zsh")
-        ) {
-            preferred.as_str()
-        } else {
-            "/bin/sh"
-        };
-        let mut command = CommandBuilder::new(shell);
-        command.args(["-lic", &format!("exec {launch}")]);
+        let command = agent_command(directory, &format!("exec {launch}"))?;
+        Self::spawn_command(id, directory, socket, ctx, command)
+    }
+
+    pub fn spawn_claude(id: Uuid, directory: &Path, socket: &Path, ctx: Context) -> Result<Self> {
+        let command = agent_command(directory, CLAUDE_LAUNCH)?;
+        let metadata = std::fs::metadata(directory).with_context(|| {
+            format!(
+                "Cannot open {}. The folder may have moved or become inaccessible; select an existing folder again",
+                directory.display()
+            )
+        })?;
+        anyhow::ensure!(
+            metadata.is_dir(),
+            "{} is not a folder; select an existing folder",
+            directory.display()
+        );
         Self::spawn_command(id, directory, socket, ctx, command)
     }
 
@@ -752,6 +786,157 @@ mod tests {
 
 #[cfg(test)]
 mod pty_tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    fn claude_fixture(root: &Path) -> PathBuf {
+        let bin = root.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let executable = bin.join("claude");
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\nprintf '%s\\n' \"$PWD\" \"$#\" \"$TESSERA_PANE\" \"$TESSERA_SOCKET\" \"$TERM\" \"$COLORTERM\" > \"$TESSERA_TEST_OUTPUT\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        bin
+    }
+
+    #[test]
+    fn claude_launch_preserves_literal_directory_and_hook_environment_without_arguments() {
+        let root = tempfile::tempdir().unwrap();
+        let bin = claude_fixture(root.path());
+        let nested = root.path().join("project ' α $(touch INJECTED) ;");
+        std::fs::create_dir(&nested).unwrap();
+        let selected = root.path().join("selected ' α $(touch INJECTED) ; symlink");
+        std::os::unix::fs::symlink(&nested, &selected).unwrap();
+        let output = root.path().join("environment");
+        let socket = root.path().join("hooks.sock");
+        let id = Uuid::new_v4();
+        let mut command = CommandBuilder::new("/bin/bash");
+        command.args([
+            "--noprofile",
+            "--norc",
+            "-ic",
+            &format!("cd /; {}", agent_script(&selected, CLAUDE_LAUNCH).unwrap()),
+        ]);
+        command.env_clear();
+        command.env("PATH", bin);
+        command.env("HOME", root.path());
+        command.env("TESSERA_TEST_OUTPUT", &output);
+        let terminal =
+            Terminal::spawn_command(id, &selected, &socket, Context::default(), command).unwrap();
+        let expected = format!(
+            "{}\n0\n{id}\n{}\nxterm-256color\ntruecolor\n",
+            selected.canonicalize().unwrap().display(),
+            socket.display()
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !terminal.has_exited() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(terminal.exit_code(), Some(0));
+        assert_eq!(terminal.launch_directory, selected);
+        assert_eq!(std::fs::read_to_string(output).unwrap(), expected);
+        assert!(!root.path().join("INJECTED").exists());
+        assert!(!nested.join("INJECTED").exists());
+    }
+
+    #[test]
+    fn agent_launch_resolves_symlink_parent_paths_like_filesystem_validation() {
+        let root = tempfile::tempdir().unwrap();
+        let physical = root.path().join("target");
+        std::fs::create_dir_all(physical.join("nested")).unwrap();
+        std::fs::create_dir(physical.join("destination")).unwrap();
+        std::fs::create_dir(root.path().join("destination")).unwrap();
+        let link = root.path().join("selected symlink");
+        std::os::unix::fs::symlink(physical.join("nested"), &link).unwrap();
+        let selected = link.join("../destination");
+        let expected = selected.canonicalize().unwrap();
+        assert_eq!(
+            expected,
+            physical.join("destination").canonicalize().unwrap()
+        );
+        let script = agent_script(&selected, "exec /bin/pwd -P").unwrap();
+        let result = std::process::Command::new("/bin/sh")
+            .args(["-c", &script])
+            .current_dir(&selected)
+            .env_clear()
+            .output()
+            .unwrap();
+        assert!(result.status.success());
+        assert_eq!(
+            String::from_utf8(result.stdout).unwrap().trim(),
+            expected.to_str().unwrap()
+        );
+    }
+
+    #[test]
+    fn direct_claude_launch_rejects_non_utf8_paths_before_spawning() {
+        use std::os::unix::ffi::OsStringExt;
+        let root = tempfile::tempdir().unwrap();
+        let selected = root.path().join(std::ffi::OsString::from_vec(vec![0xff]));
+        let result = Terminal::spawn_claude(
+            Uuid::new_v4(),
+            &selected,
+            &root.path().join("hooks.sock"),
+            Context::default(),
+        );
+        assert_eq!(
+            result.err().unwrap().to_string(),
+            "Working directory is not valid UTF-8"
+        );
+    }
+
+    #[test]
+    fn claude_launch_reports_missing_executable_and_disappeared_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let script = agent_script(root.path(), CLAUDE_LAUNCH).unwrap();
+        let result = std::process::Command::new("/bin/sh")
+            .args(["-c", &script])
+            .env_clear()
+            .env("PATH", root.path())
+            .output()
+            .unwrap();
+        assert_eq!(result.status.code(), Some(127));
+        let error = String::from_utf8_lossy(&result.stderr);
+        assert!(error.contains("Claude Code was not found"));
+        assert!(error.contains("usual terminal, then retry"));
+
+        let missing = root.path().join("deleted folder");
+        let script = agent_script(&missing, CLAUDE_LAUNCH).unwrap();
+        let result = std::process::Command::new("/bin/sh")
+            .args(["-c", &script])
+            .env_clear()
+            .env("PATH", root.path())
+            .output()
+            .unwrap();
+        assert_eq!(result.status.code(), Some(1));
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains("Cannot enter the selected folder")
+        );
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    fn direct_claude_launch_rejects_files_and_missing_folders_without_creating_them() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("file");
+        std::fs::write(&file, "keep").unwrap();
+        let missing = root.path().join("missing/nested");
+        for directory in [&file, &missing] {
+            let result = Terminal::spawn_claude(
+                Uuid::new_v4(),
+                directory,
+                &root.path().join("hooks.sock"),
+                Context::default(),
+            );
+            assert!(result.is_err());
+        }
+        assert!(!missing.parent().unwrap().exists());
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "keep");
+    }
+
     #[test]
     fn agent_launch_uses_real_pty_directory_and_hook_environment() {
         let directory = tempfile::tempdir().unwrap();

@@ -6,7 +6,7 @@ A native terminal workspace for supervising Claude Code and Codex sessions.
 
 Run your usual shell in resizable panes. Open **Work** to see which piece of work needs a decision, inspect its linked Claude Code or Codex sessions, and return to the same terminal to act.
 
-**0.7.1** adds “Copy without indentation” to the terminal selection menu for copying passages from Claude output without leading spaces. [Release notes](docs/releases/0.7.1.md)
+**0.8.0** adds folder search for launching Claude Code and a clearer terminal interface, with stronger focus indicators, consistent themes, and easier access to pane controls and Settings. [Release notes](docs/releases/0.8.0.md)
 
 ## Install
 
@@ -45,13 +45,17 @@ Open local agents also appear before hooks arrive, labelled **Untracked** until 
 
 ## Everyday use
 
-Use **Terminal** and **Work** to switch views. **+ Workspace** opens a directory, creating it if needed. The optional name sets the workspace label. **Commands** searches workspaces and actions; Up/Down select, Enter opens, Escape closes. **Settings** holds appearance, terminal behavior, and updates.
+Use **Terminal** and **Work** to switch views. **+ Workspace** opens a directory, creating it if needed. The optional name sets the workspace label. **Commands** searches workspaces and actions; Up/Down select, Enter opens, Escape closes. The **Pane** menu groups split and maximize controls. **Settings** holds appearance, folder search roots, terminal behavior, and updates.
+
+Choose **Claude in folder** to search existing folders by name, select a result, and press Enter to open a focused terminal running `claude` there. Results include full paths; pasting an existing directory path also works. No project registration, specification, or manual work item is required. On macOS, Spotlight searches indexed folders across your Mac, with a bounded search of configurable roots for indexing gaps. Linux uses those roots, starting with your home folder. Search never creates missing directories. [Search coverage and controls](docs/usage.md)
 
 On macOS, use Cmd below. On Linux, replace Cmd with Ctrl+Alt.
 
 | Action | Shortcut |
 | --- | --- |
 | Commands / workspace picker | Cmd+Shift+P |
+| Claude in folder | Cmd+Shift+L |
+| Settings | Cmd+, |
 | Work / previous terminal | Cmd+Shift+O |
 | New workspace in the current directory | Cmd+N or Cmd+T |
 | Split side by side / stacked | Cmd+D / Cmd+Shift+D |

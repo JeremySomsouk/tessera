@@ -247,6 +247,8 @@ struct Saved {
     skip_stop_confirmation: bool,
     #[serde(default = "default_clickable_choices")]
     clickable_codex_choices: bool,
+    #[serde(default = "crate::folders::default_roots")]
+    folder_search_roots: Vec<String>,
 }
 
 impl Default for Saved {
@@ -263,6 +265,7 @@ impl Default for Saved {
             light: false,
             skip_stop_confirmation: false,
             clickable_codex_choices: default_clickable_choices(),
+            folder_search_roots: crate::folders::default_roots(),
         }
     }
 }
@@ -412,8 +415,14 @@ struct TerminalClose {
 enum CommandPage {
     #[default]
     Commands,
+    Folders,
     Create,
     Settings,
+}
+
+struct FolderLaunch {
+    pane: Uuid,
+    receiver: std::sync::mpsc::Receiver<anyhow::Result<(Uuid, PathBuf, Terminal)>>,
 }
 
 struct WorkspaceRename {
@@ -449,6 +458,12 @@ pub struct App {
     command_page: CommandPage,
     command_index: usize,
     command_focus: bool,
+    folder_search: Option<crate::folders::FolderSearch>,
+    folder_query: String,
+    folder_error: Option<String>,
+    folder_launch: Option<FolderLaunch>,
+    deferred_hooks: Vec<crate::model::HookEvent>,
+    direct_launches: HashMap<Uuid, Option<u32>>,
     rename: Option<WorkspaceRename>,
     closing: Option<TerminalClose>,
     filter: String,
@@ -545,6 +560,12 @@ impl App {
             command_page: CommandPage::Commands,
             command_index: 0,
             command_focus: false,
+            folder_search: None,
+            folder_query: String::new(),
+            folder_error: None,
+            folder_launch: None,
+            deferred_hooks: Vec::new(),
+            direct_launches: HashMap::new(),
             rename: None,
             closing: None,
             filter: String::new(),
@@ -640,8 +661,10 @@ impl App {
         }
     }
     fn add_workspace(&mut self, ctx: &egui::Context) -> bool {
-        if self.saved.workspaces.len() >= 32 {
-            self.error = "Workspace limit (32) reached".into();
+        if self.saved.workspaces.len() + usize::from(self.folder_launch.is_some()) >= 32
+            || self.panes.len() + usize::from(self.folder_launch.is_some()) >= 32
+        {
+            self.error = "Workspace/pane limit (32) reached".into();
             return false;
         }
         let directory = match self.prepare_directory(&self.new_directory.clone()) {
@@ -664,8 +687,10 @@ impl App {
         true
     }
     fn add_workspace_in(&mut self, ctx: &egui::Context, directory: String) -> bool {
-        if self.saved.workspaces.len() >= 32 {
-            self.error = "Workspace limit (32) reached".into();
+        if self.saved.workspaces.len() + usize::from(self.folder_launch.is_some()) >= 32
+            || self.panes.len() + usize::from(self.folder_launch.is_some()) >= 32
+        {
+            self.error = "Workspace/pane limit (32) reached".into();
             return false;
         }
         if !PathBuf::from(&directory).is_dir() {
@@ -698,7 +723,7 @@ impl App {
         true
     }
     fn split(&mut self, ctx: &egui::Context, vertical: bool) {
-        if self.panes.len() >= 32 {
+        if self.panes.len() + usize::from(self.folder_launch.is_some()) >= 32 {
             self.error = "Live pane limit (32) reached".into();
             return;
         }
@@ -774,6 +799,7 @@ impl App {
         }
     }
     fn stop_terminal(&mut self, id: Uuid) {
+        self.direct_launches.remove(&id);
         if self
             .closing
             .as_ref()
@@ -877,8 +903,18 @@ impl App {
             }
         }
         if let Some(endpoint) = &self.endpoint {
-            for e in endpoint.receiver.try_iter().take(256) {
+            let mut events = std::mem::take(&mut self.deferred_hooks);
+            events.extend(endpoint.receiver.try_iter().take(256));
+            for e in events {
                 if !self.panes.contains_key(&e.pane) {
+                    if self
+                        .folder_launch
+                        .as_ref()
+                        .is_some_and(|launch| launch.pane == e.pane)
+                        && self.deferred_hooks.len() < 256
+                    {
+                        self.deferred_hooks.push(e);
+                    }
                     continue;
                 }
                 if let Some(existing) = self.saved.sessions.iter().find(|session| {
@@ -952,7 +988,22 @@ impl App {
             .collect();
         for id in exited {
             let code = self.panes[&id].terminal.exit_code();
-            let mut linked = false;
+            let mut linked = self.direct_launches.contains_key(&id);
+            if let Some(reported) = self.direct_launches.get_mut(&id)
+                && reported.is_none()
+                && let Some(code) = code
+            {
+                *reported = Some(code);
+                if code != 0 {
+                    self.error = if code == 127 {
+                        "Claude Code was not found in your login shell PATH. Check that `claude` works in a terminal, then retry Claude in folder. Output is kept in this pane.".into()
+                    } else {
+                        format!(
+                            "Claude Code exited with code {code}. Read the terminal output, check the directory and authentication, then retry Claude in folder."
+                        )
+                    };
+                }
+            }
             for spec in &mut self.saved.specifications {
                 if let Some(launch) = spec.launches.iter_mut().find(|launch| launch.pane == id) {
                     linked = true;
@@ -979,7 +1030,7 @@ impl App {
                     }
                 }
             }
-            // Spec launches retain their output until explicitly closed.
+            // Agent launches retain their output until explicitly closed.
             if !linked {
                 self.stop_terminal(id);
             }
@@ -1107,6 +1158,14 @@ impl App {
             Modifiers::CTRL | Modifiers::ALT
         };
         if self.rename.is_some() || self.closing.is_some() {
+            return;
+        }
+        if ctx.input_mut(|i| i.consume_key(command | Modifiers::SHIFT, Key::L)) {
+            self.open_commands(CommandPage::Folders);
+            return;
+        }
+        if ctx.input_mut(|i| i.consume_key(command, Key::Comma)) {
+            self.open_commands(CommandPage::Settings);
             return;
         }
         if ctx.input_mut(|i| i.consume_key(command | Modifiers::SHIFT, Key::S)) {
@@ -1448,7 +1507,16 @@ impl App {
 
     fn work_list(&mut self, ui: &mut egui::Ui, items: &[WorkItem]) {
         if items.is_empty() {
-            ui.label("No work in this view");
+            if self.category == 0 && self.filter.trim().is_empty() {
+                ui.label("Nothing needs your attention");
+                ui.small("Open Active to see ongoing work, or return to your terminal.");
+                if ui.button("Show active work").clicked() {
+                    self.category = 1;
+                }
+            } else {
+                ui.label("No work in this view");
+                ui.small("Try another filter or return to your terminal.");
+            }
         }
         egui::ScrollArea::vertical()
             .id_salt("work-list")
@@ -1769,6 +1837,11 @@ impl App {
         self.command_index = 0;
         self.command_focus = true;
         self.filter.clear();
+        self.folder_query.clear();
+        self.folder_error = None;
+        if let Some(search) = &mut self.folder_search {
+            search.cancel();
+        }
     }
 
     fn chrome(
@@ -1780,11 +1853,10 @@ impl App {
         egui::TopBottomPanel::top("chrome")
             .frame(
                 egui::Frame::new()
-                    .fill(Color32::from_rgb(24, 27, 31))
+                    .fill(ctx.style().visuals.panel_fill)
                     .inner_margin(egui::Margin::symmetric(16, 8)),
             )
             .show(ctx, |ui| {
-                *ui.visuals_mut() = egui::Visuals::dark();
                 let native_controls = cfg!(target_os = "macos")
                     && !ctx.input(|input| input.viewport().fullscreen.unwrap_or(false));
                 let mut drag_rect = ui.max_rect();
@@ -1840,84 +1912,65 @@ impl App {
                         "Work".into()
                     };
                     if ui
-                        .selectable_label(self.overview || self.specifications_view, overview)
+                        .selectable_label(
+                            self.overview || self.specifications_view,
+                            RichText::new(overview).color(if attention > 0 {
+                                attention_color(ui)
+                            } else {
+                                ui.visuals().text_color()
+                            }),
+                        )
                         .on_hover_text(shortcut("Work", "Shift+O"))
                         .clicked()
                     {
                         self.overview = true;
                         self.specifications_view = false;
                     }
-                    if !self.overview
-                        && !self.specifications_view
-                        && let Some(workspace) = self.saved.workspaces.get(self.active)
-                    {
-                        let title = workspace.task.title.clone();
-                        let directory = workspace.task.directory.clone();
-                        let controls_width = if wide { 208.0 } else { 0.0 };
-                        let title_width = (ui.available_width() - 210.0 - controls_width).max(40.0);
-                        ui.allocate_ui_with_layout(
-                            Vec2::new(title_width, 24.0),
-                            egui::Layout::left_to_right(egui::Align::Center),
-                            |ui| {
-                                if wide {
-                                    ui.add_sized(
-                                        [title_width, 24.0],
-                                        egui::Label::new(RichText::new(&title).strong()).truncate(),
-                                    )
-                                    .on_hover_text(format!("{title}\n{directory}"));
-                                } else {
-                                    egui::containers::menu::MenuButton::from_button(
-                                        egui::Button::new(RichText::new(&title).strong())
-                                            .truncate()
-                                            .min_size(Vec2::new(title_width, 24.0)),
-                                    )
-                                    .ui(ui, |ui| self.workspace_actions(ui, ctx))
-                                    .0
-                                    .on_hover_text(format!(
-                                        "{title}\n{directory}\nWorkspace actions"
-                                    ));
-                                }
-                            },
-                        );
-                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
-                            .add_sized([96.0, 28.0], egui::Button::new("+ Workspace"))
-                            .on_hover_text("Create a workspace in a directory")
+                            .button("Settings")
+                            .on_hover_text(shortcut("Settings", ","))
+                            .clicked()
+                        {
+                            self.open_commands(CommandPage::Settings);
+                        }
+                        if ui
+                            .button(if wide { "+ Workspace" } else { "+ New" })
+                            .on_hover_text("Open a shell in an existing or new directory")
                             .clicked()
                         {
                             self.open_commands(CommandPage::Create);
                         }
                         if ui
-                            .add_sized([96.0, 28.0], egui::Button::new("Commands"))
+                            .button("Commands")
                             .on_hover_text(shortcut("Search workspaces and commands", "Shift+P"))
                             .clicked()
                         {
                             self.open_commands(CommandPage::Commands);
+                        }
+                        if ui
+                            .add(
+                                egui::Button::new(if wide {
+                                    "Claude in folder"
+                                } else {
+                                    "Claude…"
+                                })
+                                .fill(ui.visuals().selection.bg_fill),
+                            )
+                            .on_hover_text(shortcut(
+                                "Search folders and launch Claude Code",
+                                "Shift+L",
+                            ))
+                            .clicked()
+                        {
+                            self.open_commands(CommandPage::Folders);
                         }
                         if wide
                             && !self.overview
                             && !self.specifications_view
                             && !self.saved.workspaces.is_empty()
                         {
-                            egui::containers::menu::MenuButton::from_button(
-                                egui::Button::new("Split").min_size(Vec2::new(96.0, 28.0)),
-                            )
-                            .ui(ui, |ui| self.split_actions(ui, ctx));
-                            if ui
-                                .add_sized(
-                                    [96.0, 28.0],
-                                    egui::Button::new(if self.maximized {
-                                        "Restore"
-                                    } else {
-                                        "Maximize"
-                                    }),
-                                )
-                                .on_hover_text(shortcut("Maximize / restore pane", "Shift+Enter"))
-                                .clicked()
-                            {
-                                self.maximized = !self.maximized;
-                            }
+                            ui.menu_button("Pane", |ui| self.workspace_actions(ui, ctx));
                         }
                     });
                 });
@@ -1928,6 +1981,9 @@ impl App {
                         .auto_shrink([false, true])
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
+                                if !self.saved.workspaces.is_empty() {
+                                    ui.menu_button("Pane", |ui| self.workspace_actions(ui, ctx));
+                                }
                                 self.workspace_navigation(ui, false, pane_action);
                             });
                         });
@@ -1953,12 +2009,7 @@ impl App {
                 section_label(ui, "WORKSPACES");
                 ui.add_space(10.0);
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-                    if ui
-                        .add_sized([ui.available_width(), 32.0], egui::Button::new("Settings"))
-                        .clicked()
-                    {
-                        self.open_commands(CommandPage::Settings);
-                    }
+                    ui.small(shortcut("Switch workspace", "1–9"));
                     ui.add_space(8.0);
                     ui.separator();
                     ui.add_space(10.0);
@@ -2012,15 +2063,24 @@ impl App {
     ) {
         for (index, w) in self.saved.workspaces.iter().enumerate() {
             let selected = index == self.active && !self.overview && !self.specifications_view;
-            let title = format!("{}   {}", index + 1, w.task.title);
+            let mut panes = Vec::new();
+            w.layout.ids(&mut panes);
+            let attention = self
+                .saved
+                .sessions
+                .iter()
+                .any(|session| panes.contains(&session.pane) && session.state.attention());
+            let title = format!(
+                "{}   {}{}",
+                index + 1,
+                w.task.title,
+                if attention { " · Attention" } else { "" }
+            );
+            let directory = readable_directory(&w.task.directory);
             let response = command_row(
                 ui,
                 &title,
-                if rail {
-                    directory_name(&w.task.directory)
-                } else {
-                    ""
-                },
+                if rail { &directory } else { "" },
                 "",
                 selected,
                 if rail { ui.available_width() } else { 190.0 },
@@ -2079,6 +2139,13 @@ impl App {
     }
 
     fn command_center(&mut self, ctx: &egui::Context, submit: Option<egui::Id>, dismiss: bool) {
+        if dismiss {
+            self.palette = false;
+            if let Some(search) = &mut self.folder_search {
+                search.cancel();
+            }
+            return;
+        }
         let width = 560.0_f32.min((ctx.content_rect().width() - 80.0).max(160.0));
         let height = (if self.command_page == CommandPage::Create {
             450.0_f32
@@ -2096,7 +2163,12 @@ impl App {
                 ui.set_width(width);
                 ui.set_height(height - 44.0);
                 ui.horizontal(|ui| {
-                    ui.heading("Workspace & commands");
+                    ui.heading(match self.command_page {
+                        CommandPage::Commands => "Commands",
+                        CommandPage::Folders => "Claude in folder",
+                        CommandPage::Create => "New workspace",
+                        CommandPage::Settings => "Settings",
+                    });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button("Close").on_hover_text("Escape").clicked() {
                             self.palette = false;
@@ -2107,6 +2179,7 @@ impl App {
                 ui.horizontal(|ui| {
                     for (page, label) in [
                         (CommandPage::Commands, "Commands"),
+                        (CommandPage::Folders, "Claude in folder"),
                         (CommandPage::Create, "New workspace"),
                         (CommandPage::Settings, "Settings"),
                     ] {
@@ -2116,6 +2189,7 @@ impl App {
                         {
                             self.command_page = page;
                             self.command_focus = true;
+                            self.command_index = 0;
                         }
                     }
                 });
@@ -2125,6 +2199,8 @@ impl App {
                 let page = self.command_page;
                 if page == CommandPage::Commands {
                     self.command_results(ui, ctx, submit);
+                } else if page == CommandPage::Folders {
+                    self.folder_results(ui, ctx, submit);
                 } else {
                     egui::ScrollArea::vertical()
                         .id_salt(("command-center-body", page as u8))
@@ -2141,7 +2217,7 @@ impl App {
                         .show(ui, |ui| match page {
                             CommandPage::Create => self.workspace_form(ui),
                             CommandPage::Settings => self.settings(ui, ctx),
-                            CommandPage::Commands => {}
+                            CommandPage::Commands | CommandPage::Folders => {}
                         });
                 }
                 if page == CommandPage::Create {
@@ -2257,6 +2333,7 @@ impl App {
             }
         }
         for action in [
+            CommandAction::Folders,
             CommandAction::Create,
             CommandAction::Overview,
             CommandAction::Split,
@@ -2365,6 +2442,7 @@ impl App {
                     self.maximized = false;
                     self.palette = false;
                 }
+                CommandAction::Folders => self.open_commands(CommandPage::Folders),
                 CommandAction::Create => {
                     self.command_page = CommandPage::Create;
                     self.command_focus = true;
@@ -2392,6 +2470,216 @@ impl App {
                     self.palette = false;
                 }
                 CommandAction::Rename => self.begin_rename(),
+            }
+        }
+    }
+
+    fn folder_results(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, submit: Option<egui::Id>) {
+        ui.label("Find an existing folder, then start Claude Code in a new terminal.");
+        let down = ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowDown));
+        let up = ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowUp));
+        let launching = self.folder_launch.is_some();
+        if !launching && (self.command_focus || down || up) {
+            ctx.memory_mut(|memory| {
+                memory.move_focus(egui::FocusDirection::None);
+                memory.request_focus(egui::Id::new("folder-filter"));
+            });
+        }
+        let input = ui.add_enabled(
+            !launching,
+            egui::TextEdit::singleline(&mut self.folder_query)
+                .id(egui::Id::new("folder-filter"))
+                .desired_width(f32::INFINITY)
+                .hint_text("Folder name or ~/path/to/folder"),
+        );
+        if input.enabled() && !ui.is_sizing_pass() {
+            self.command_focus = false;
+        }
+        if input.changed() {
+            self.command_index = 0;
+            self.folder_error = None;
+        }
+        let search = self
+            .folder_search
+            .get_or_insert_with(|| crate::folders::FolderSearch::new(ctx.clone()));
+        let roots: Vec<_> = self
+            .saved
+            .folder_search_roots
+            .iter()
+            .filter(|root| !root.trim().is_empty())
+            .cloned()
+            .collect();
+        search.set_query(&self.folder_query, &roots);
+        if search.poll() {
+            self.command_index = 0;
+        }
+        let count = search.results.len();
+        self.command_index = self.command_index.min(count.saturating_sub(1));
+        if count > 0 && !launching {
+            if down {
+                self.command_index = (self.command_index + 1) % count;
+            }
+            if up {
+                self.command_index = (self.command_index + count - 1) % count;
+            }
+        }
+        ui.add_space(6.0);
+        if launching || search.loading {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(if launching {
+                    "Starting Claude Code…"
+                } else {
+                    "Searching folders…"
+                });
+            });
+        }
+        let mut chosen = None;
+        egui::ScrollArea::vertical().id_salt("folder-results")
+            .max_height((ui.available_height() - 36.0).max(40.0)).auto_shrink([false, false])
+            .show(ui, |ui| {
+                if let Some(error) = self.folder_error.as_ref().or(search.error.as_ref()) {
+                    ui.colored_label(ui.visuals().error_fg_color, error);
+                }
+                if let Some(notice) = &search.notice {
+                    egui::CollapsingHeader::new("Search coverage and limits").show(ui, |ui| { ui.small(notice); });
+                }
+                if count > 0 { section_label(ui, "FOLDERS · LAUNCH CLAUDE CODE"); }
+                for (index, folder) in search.results.iter().enumerate() {
+                    let path = folder.path.to_string_lossy();
+                    let selected = index == self.command_index;
+                    let response = ui.push_id((&folder.path, "folder-result"), |ui| {
+                        ui.add_enabled_ui(!launching, |ui| {
+                            command_row(ui, &folder.name, &path, "", selected, ui.available_width())
+                        }).inner
+                    }).inner.on_hover_text(path.as_ref());
+                    if !down && !up && response.has_focus() && self.command_index != index {
+                        self.command_index = index;
+                        ctx.request_repaint();
+                    }
+                    let selected = index == self.command_index;
+                    if selected && ui.fonts_mut(|fonts| fonts.layout_no_wrap(path.to_string(), FontId::proportional(11.0), ui.visuals().text_color()).size().x) > ui.available_width() - 24.0 {
+                        ui.add(egui::Label::new(RichText::new(path.as_ref()).small()).wrap());
+                    }
+                    if selected && (down || up) { response.scroll_to_me(Some(egui::Align::Center)); }
+                    if !launching && (response.clicked() || (selected && submit == Some(egui::Id::new("folder-filter")))) {
+                        chosen = Some(folder.path.clone());
+                    }
+                }
+                if count == 0 && !search.loading && !self.folder_query.trim().is_empty() && search.error.is_none() {
+                    ui.label("No matching folder found");
+                    ui.small("Try a shorter name, paste an existing path, or add a search root in Settings.");
+                }
+            });
+        ui.horizontal(|ui| {
+            ui.small("Up / Down select   Enter launch   Esc close");
+            if ui.small_button("Search roots…").clicked() {
+                self.command_page = CommandPage::Settings;
+            }
+        });
+        if let Some(path) = chosen {
+            self.launch_folder(ctx, path);
+        }
+    }
+
+    fn launch_folder(&mut self, ctx: &egui::Context, path: PathBuf) {
+        if self.folder_launch.is_some() {
+            return;
+        }
+        if self.saved.workspaces.len() + usize::from(self.folder_launch.is_some()) >= 32
+            || self.panes.len() + usize::from(self.folder_launch.is_some()) >= 32
+        {
+            self.folder_error =
+                Some("Workspace/pane limit (32) reached. Close a terminal and try again.".into());
+            return;
+        }
+        let socket = self
+            .endpoint
+            .as_ref()
+            .map(|e| e.path.clone())
+            .unwrap_or_default();
+        let (tx, rx) = sync_channel(1);
+        let ctx = ctx.clone();
+        let pane = Uuid::new_v4();
+        let worker = std::thread::Builder::new()
+            .name("claude-launch".into())
+            .spawn(move || {
+                let result = Terminal::spawn_claude(pane, &path, &socket, ctx.clone())
+                    .map(|terminal| (pane, path, terminal));
+                let _ = tx.send(result);
+                ctx.request_repaint();
+            });
+        match worker {
+            Ok(_) => {
+                self.folder_launch = Some(FolderLaunch { pane, receiver: rx });
+                self.folder_error = None;
+            }
+            Err(error) => self.folder_error = Some(format!("Cannot start Claude Code: {error}")),
+        }
+    }
+
+    fn poll_folder_launch(&mut self, ctx: &egui::Context) {
+        let Some(receiver) = &self.folder_launch else {
+            return;
+        };
+        let result = match receiver.receiver.try_recv() {
+            Ok(result) => result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err(anyhow::anyhow!("Launch worker stopped. Try again."))
+            }
+        };
+        self.folder_launch = None;
+        match result {
+            Ok((pane, path, terminal)) => {
+                if self.saved.workspaces.len() + usize::from(self.folder_launch.is_some()) >= 32
+                    || self.panes.len() + usize::from(self.folder_launch.is_some()) >= 32
+                {
+                    self.folder_error = Some("Workspace/pane limit (32) reached while launching. Close a terminal and try again.".into());
+                    return;
+                }
+                let directory = path.to_string_lossy().into_owned();
+                self.saved.workspaces.push(Workspace {
+                    task: Task {
+                        id: Uuid::new_v4(),
+                        title: directory_name(&directory).into(),
+                        directory,
+                        state: TaskState::Implementing,
+                    },
+                    layout: Layout::Pane(pane),
+                    focus: pane,
+                });
+                self.panes.insert(
+                    pane,
+                    Pane {
+                        terminal,
+                        search: TerminalSearch::default(),
+                    },
+                );
+                self.direct_launches.insert(pane, None);
+                self.active = self.saved.workspaces.len() - 1;
+                self.overview = false;
+                self.specifications_view = false;
+                self.maximized = false;
+                self.palette = false;
+                self.error.clear();
+                self.folder_error = None;
+                self.dirty = true;
+                ctx.memory_mut(|m| {
+                    if let Some(id) = m.focused() {
+                        m.surrender_focus(id);
+                    }
+                });
+            }
+            Err(error) => {
+                let message = format!(
+                    "Cannot launch Claude Code: {error}. Choose an accessible existing folder and retry."
+                );
+                self.folder_error = Some(message.clone());
+                self.error = message;
+                self.palette = true;
+                self.command_page = CommandPage::Folders;
+                self.command_focus = true;
             }
         }
     }
@@ -2426,6 +2714,28 @@ impl App {
             ctx.data(|data| data.get_temp::<String>(egui::Id::new("terminal-font-label")))
         {
             ui.label(format!("Font: {label}"));
+        }
+        ui.add_space(16.0);
+        section_label(ui, "FOLDER SEARCH");
+        ui.small("Fallback search roots, one folder per line. Empty uses your home folder.");
+        let mut roots = self.saved.folder_search_roots.join("\n");
+        if ui
+            .add(
+                egui::TextEdit::multiline(&mut roots)
+                    .desired_rows(3)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("~/projects\n~/Documents\n/Volumes/Work"),
+            )
+            .changed()
+        {
+            self.saved.folder_search_roots = roots.split('\n').map(str::to_owned).collect();
+            self.dirty = true;
+        }
+        ui.small("Bounded search skips hidden, dependency and build folders. Add a specific root to search inside one, or paste its exact path. Up to 16 roots.");
+        if cfg!(target_os = "macos") {
+            ui.small(
+                "Spotlight also searches indexed folders across your Mac, outside these roots.",
+            );
         }
         ui.add_space(16.0);
         section_label(ui, "TERMINAL BEHAVIOR");
@@ -2495,6 +2805,8 @@ impl App {
                 ("Focus pane in direction", "← / → / ↑ / ↓"),
                 ("Work", "Shift+O"),
                 ("Commands", "Shift+P"),
+                ("Claude in folder", "Shift+L"),
+                ("Settings", ","),
                 ("Rename workspace", "Shift+R"),
                 ("Find", "F"),
                 ("Keyboard selection", "Shift+Space"),
@@ -2544,7 +2856,8 @@ impl App {
     ) -> anyhow::Result<()> {
         let spec = &self.saved.specifications[index];
         anyhow::ensure!(
-            self.saved.workspaces.len() < 32 && self.panes.len() < 32,
+            self.saved.workspaces.len() + usize::from(self.folder_launch.is_some()) < 32
+                && self.panes.len() + usize::from(self.folder_launch.is_some()) < 32,
             "Workspace/pane limit (32) reached"
         );
         let mut draft = spec.draft.clone();
@@ -2799,6 +3112,7 @@ impl App {
         }
     }
     fn draw(&mut self, ctx: &egui::Context) {
+        self.poll_folder_launch(ctx);
         self.dirty |= self.sync_work();
         self.drain();
         if self.discovery.is_some() && !self.panes.is_empty() {
@@ -2840,17 +3154,30 @@ impl App {
                 }
             }
         }
+        if (!self.palette || self.command_page != CommandPage::Folders)
+            && let Some(search) = &mut self.folder_search
+        {
+            search.cancel();
+        }
         egui::TopBottomPanel::bottom("status")
             .frame(
                 egui::Frame::new()
                     .fill(ctx.style().visuals.panel_fill)
-                    .inner_margin(egui::Margin::symmetric(16, 7)),
+                    .inner_margin(egui::Margin::symmetric(12, 3)),
             )
             .show(ctx, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     if self.error.is_empty() {
                         let label = if self.overview {
-                            format!("{} work items", self.saved.work_items.len())
+                            format!(
+                                "{} work {}",
+                                self.saved.work_items.len(),
+                                if self.saved.work_items.len() == 1 {
+                                    "item"
+                                } else {
+                                    "items"
+                                }
+                            )
                         } else if self.maximized {
                             "Focused pane · maximized".into()
                         } else {
@@ -2862,9 +3189,12 @@ impl App {
                                 .color(ui.visuals().weak_text_color()),
                         );
                         ui.add_space(16.0);
-                        for (action, keys) in
-                            [("New tab", "T"), ("Find", "F"), ("Commands", "Shift+P")]
-                        {
+                        let primary = if self.overview || self.specifications_view {
+                            ("Return to terminal", "Shift+O")
+                        } else {
+                            ("Find", "F")
+                        };
+                        for (action, keys) in [primary, ("Claude in folder", "Shift+L")] {
                             status_shortcut(ui, action, keys);
                         }
                     } else {
@@ -2880,7 +3210,7 @@ impl App {
             .frame(
                 egui::Frame::new()
                     .fill(ctx.style().visuals.extreme_bg_color)
-                    .inner_margin(12.0),
+                    .inner_margin(6.0),
             )
             .show(ctx, |ui| {
                 if self.specifications_view {
@@ -2894,10 +3224,15 @@ impl App {
                 let Some(w) = self.saved.workspaces.get_mut(self.active) else {
                     ui.vertical_centered(|ui| {
                         ui.add_space(80.0);
-                        ui.heading("A place for your next task");
-                        ui.label("Open a terminal workspace to get started.");
+                        ui.heading("Start where your work lives");
+                        ui.label(
+                            "Find an existing folder for Claude Code, or open a shell workspace.",
+                        );
                         ui.add_space(16.0);
-                        if primary_button(ui, "Create workspace").clicked() {
+                        if primary_button(ui, "Claude in folder").clicked() {
+                            self.open_commands(CommandPage::Folders);
+                        }
+                        if ui.button("New workspace").clicked() {
                             self.open_commands(CommandPage::Create);
                         }
                     });
@@ -3023,6 +3358,7 @@ impl eframe::App for App {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CommandAction {
     Workspace(usize),
+    Folders,
     Create,
     Overview,
     Split,
@@ -3035,6 +3371,7 @@ impl CommandAction {
     fn label(self) -> &'static str {
         match self {
             Self::Workspace(_) => "Workspace",
+            Self::Folders => "Claude in folder",
             Self::Create => "New workspace",
             Self::Overview => "Toggle Work",
             Self::Split => "Split side by side",
@@ -3047,6 +3384,7 @@ impl CommandAction {
     fn detail(self) -> &'static str {
         match self {
             Self::Workspace(_) => "",
+            Self::Folders => "Search local folders and launch Claude Code",
             Self::Create => "Choose a directory and an optional name",
             Self::Overview => "Inspect work and next actions",
             Self::Split | Self::Stack => "Open another shell in the current directory",
@@ -3057,6 +3395,8 @@ impl CommandAction {
     }
     fn keys(self) -> &'static str {
         match self {
+            Self::Folders => "Shift+L",
+            Self::Settings => ",",
             Self::Overview => "Shift+O",
             Self::Split => "D",
             Self::Stack => "Shift+D",
@@ -3091,6 +3431,19 @@ fn attention_color(ui: &egui::Ui) -> Color32 {
     } else {
         Color32::from_rgb(134, 77, 14)
     }
+}
+fn readable_directory(directory: &str) -> String {
+    let path = std::path::Path::new(directory);
+    if let Some(home) = std::env::var_os("HOME")
+        && let Ok(relative) = path.strip_prefix(home)
+    {
+        return if relative.as_os_str().is_empty() {
+            "~".into()
+        } else {
+            format!("~/{}", relative.display())
+        };
+    }
+    directory.into()
 }
 fn directory_name(directory: &str) -> &str {
     std::path::Path::new(directory)
@@ -3417,7 +3770,7 @@ fn status_shortcut(ui: &mut egui::Ui, action: &str, keys: &str) {
 }
 
 fn shortcut(action: &str, keys: &str) -> String {
-    format!("{action} — {}", shortcut_keys(keys))
+    format!("{action} · {}", shortcut_keys(keys))
 }
 
 fn shortcut_keys(keys: &str) -> String {
@@ -3475,6 +3828,7 @@ fn workspace_submission(ctx: &egui::Context) -> Option<egui::Id> {
     if focused != egui::Id::new("workspace-directory")
         && focused != egui::Id::new("workspace-filter")
         && focused != egui::Id::new("new-workspace-name")
+        && focused != egui::Id::new("folder-filter")
     {
         return None;
     }
@@ -3629,7 +3983,7 @@ fn terminal_view(
         ui.painter().rect_stroke(
             rect,
             6.0,
-            Stroke::new(1.0_f32, ACCENT.gamma_multiply(0.5)),
+            Stroke::new(2.0_f32, ACCENT),
             egui::StrokeKind::Inside,
         );
     }
@@ -5347,6 +5701,12 @@ mod render_tests {
             command_page: CommandPage::Commands,
             command_index: 0,
             command_focus: false,
+            folder_search: None,
+            folder_query: String::new(),
+            folder_error: None,
+            folder_launch: None,
+            deferred_hooks: Vec::new(),
+            direct_launches: HashMap::new(),
             rename: None,
             closing: None,
             filter: String::new(),
@@ -5355,6 +5715,334 @@ mod render_tests {
             overview_inspector: false,
         }
     }
+    #[test]
+    fn folder_picker_keyboard_selection_stale_input_and_escape_never_launch_implicitly() {
+        let ctx = egui::Context::default();
+        let mut app = fixture(0);
+        let root = tempfile::tempdir().unwrap();
+        for parent in ["one", "two"] {
+            std::fs::create_dir_all(root.path().join(parent).join("tessera-picker-fixture"))
+                .unwrap();
+        }
+        app.saved.folder_search_roots = vec![root.path().display().to_string()];
+        let frame = |app: &mut App, events| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 760.0))),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.draw(ctx),
+            );
+        };
+        frame(
+            &mut app,
+            vec![key_event(Key::L, None, command() | Modifiers::SHIFT)],
+        );
+        assert!(app.palette && app.command_page == CommandPage::Folders);
+        frame(&mut app, vec![]);
+        app.folder_query = "tessera-picker-fixture".into();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            frame(&mut app, vec![]);
+            if app
+                .folder_search
+                .as_ref()
+                .is_some_and(|s| !s.loading && s.results.len() == 2)
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "folder results did not arrive"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(app.panes.is_empty() && app.folder_launch.is_none());
+        assert!(ctx.memory(|m| m.has_focus(egui::Id::new("folder-filter"))));
+        frame(
+            &mut app,
+            vec![key_event(Key::ArrowUp, None, Modifiers::NONE)],
+        );
+        assert_eq!(app.command_index, 1);
+        app.folder_query = root.path().join("missing").display().to_string();
+        frame(&mut app, vec![key_event(Key::Enter, None, Modifiers::NONE)]);
+        assert!(
+            app.folder_launch.is_none(),
+            "Enter must not launch an old result after input changes"
+        );
+        frame(
+            &mut app,
+            vec![key_event(Key::Escape, None, Modifiers::NONE)],
+        );
+        assert!(!app.palette);
+        assert!(app.panes.is_empty() && app.saved.created_directories.is_empty());
+        assert!(app.folder_search.as_ref().unwrap().results.is_empty());
+    }
+
+    #[test]
+    fn deleted_folder_launch_reports_error_without_creating_directory_or_workspace() {
+        let ctx = egui::Context::default();
+        let mut app = fixture(0);
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("deleted project");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::remove_dir(&path).unwrap();
+        app.launch_folder(&ctx, path.clone());
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while app.folder_launch.is_some() {
+            app.poll_folder_launch(&ctx);
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            app.folder_error
+                .as_ref()
+                .unwrap()
+                .contains("Cannot launch Claude Code")
+        );
+        assert!(app.palette && app.command_page == CommandPage::Folders);
+        assert!(!path.exists());
+        assert!(app.saved.workspaces.is_empty() && app.panes.is_empty());
+        assert!(app.saved.created_directories.is_empty());
+    }
+
+    #[test]
+    fn folder_launch_focuses_terminal_and_retains_missing_executable_output() {
+        let ctx = egui::Context::default();
+        let mut app = fixture(0);
+        let root = tempfile::tempdir().unwrap();
+        let id = Uuid::new_v4();
+        let terminal = Terminal::spawn_agent(
+            id,
+            root.path(),
+            &root.path().join("hooks.sock"),
+            ctx.clone(),
+            "/bin/sh -c 'printf missing-claude-fixture; exit 127'",
+        )
+        .unwrap();
+        let (tx, rx) = sync_channel(1);
+        app.folder_launch = Some(FolderLaunch {
+            pane: id,
+            receiver: rx,
+        });
+        let (hook_tx, hook_rx) = sync_channel(1);
+        app.endpoint = Some(Endpoint {
+            path: root.path().join("hooks.sock"),
+            receiver: hook_rx,
+        });
+        hook_tx
+            .send(HookEvent {
+                id: Uuid::new_v4(),
+                pane: id,
+                sequence: 1,
+                session_id: "early-launch-hook".into(),
+                agent: crate::model::Agent::Claude,
+                hook_event_name: "SessionStart".into(),
+                detail: String::new(),
+            })
+            .unwrap();
+        app.drain();
+        assert_eq!(app.deferred_hooks.len(), 1);
+        assert!(app.saved.sessions.is_empty());
+        tx.send(Ok((id, root.path().to_owned(), terminal))).unwrap();
+        app.overview = true;
+        app.maximized = true;
+        app.palette = true;
+        app.poll_folder_launch(&ctx);
+        assert_eq!(app.saved.workspaces[app.active].focus, id);
+        assert_eq!(
+            app.saved.workspaces[app.active].task.directory,
+            root.path().to_str().unwrap()
+        );
+        assert!(!app.overview && !app.maximized && !app.palette);
+        assert!(app.saved.specifications.is_empty() && app.saved.created_directories.is_empty());
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !app.panes[&id].terminal.has_exited() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        app.drain();
+        assert!(app.panes.contains_key(&id));
+        assert!(app.error.contains("login shell PATH"));
+        assert!(app.deferred_hooks.is_empty());
+        assert_eq!(app.saved.sessions.len(), 1);
+        assert_eq!(app.saved.sessions[0].pane, id);
+        assert!(app.saved.sessions[0].work_id.is_some());
+        app.error.clear();
+        app.drain();
+        assert!(
+            app.error.is_empty(),
+            "dismissed exit errors should not repeat"
+        );
+        app.stop_terminal(id);
+        assert!(app.direct_launches.is_empty());
+    }
+
+    fn folder_keyboard_fixture(ctx: &egui::Context) -> App {
+        configure_appearance(ctx, false);
+        let mut app = fixture(0);
+        app.open_commands(CommandPage::Folders);
+        let mut search = crate::folders::FolderSearch::new(ctx.clone());
+        search.set_query("", &app.saved.folder_search_roots);
+        search.notice = None;
+        search.results = vec![
+            crate::folders::FolderResult {
+                name: "one".into(),
+                path: PathBuf::from("/tessera-review-missing-folder/one"),
+            },
+            crate::folders::FolderResult {
+                name: "two".into(),
+                path: PathBuf::from("/tessera-review-missing-folder/two"),
+            },
+        ];
+        app.folder_search = Some(search);
+        for _ in 0..3 {
+            folder_keyboard_frame(&mut app, ctx, vec![]);
+        }
+        app
+    }
+
+    fn folder_keyboard_frame(app: &mut App, ctx: &egui::Context, events: Vec<egui::Event>) {
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1180.0, 760.0))),
+                events,
+                ..Default::default()
+            },
+            |ctx| app.draw(ctx),
+        );
+    }
+
+    fn tab_to_second_folder(app: &mut App, ctx: &egui::Context) {
+        for _ in 0..6 {
+            folder_keyboard_frame(app, ctx, vec![key_event(Key::Tab, None, Modifiers::NONE)]);
+            folder_keyboard_frame(app, ctx, vec![]);
+            if app.command_index == 1 {
+                return;
+            }
+        }
+        panic!("Tab did not select the second folder");
+    }
+
+    fn assert_second_folder_launched(app: &mut App, ctx: &egui::Context) {
+        assert!(
+            app.folder_launch.is_some(),
+            "Enter should start a folder launch"
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while app.folder_launch.is_some() {
+            app.poll_folder_launch(ctx);
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            app.folder_error
+                .as_ref()
+                .is_some_and(|error| error.contains("/two")),
+            "Enter should open the selected second folder, got {:?}",
+            app.folder_error
+        );
+    }
+
+    #[test]
+    fn folder_arrows_and_tab_focus_choose_same_result() {
+        let ctx = egui::Context::default();
+        let mut app = folder_keyboard_fixture(&ctx);
+        folder_keyboard_frame(
+            &mut app,
+            &ctx,
+            vec![key_event(Key::Tab, None, Modifiers::NONE)],
+        );
+        folder_keyboard_frame(&mut app, &ctx, vec![]);
+        folder_keyboard_frame(
+            &mut app,
+            &ctx,
+            vec![key_event(Key::ArrowDown, None, Modifiers::NONE)],
+        );
+        folder_keyboard_frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.command_index, 1);
+        assert!(ctx.memory(|memory| memory.has_focus(egui::Id::new("folder-filter"))));
+        folder_keyboard_frame(
+            &mut app,
+            &ctx,
+            vec![key_event(Key::Enter, None, Modifiers::NONE)],
+        );
+        assert_second_folder_launched(&mut app, &ctx);
+    }
+
+    #[test]
+    fn folder_tab_and_enter_launch_the_focused_row() {
+        let ctx = egui::Context::default();
+        let mut app = folder_keyboard_fixture(&ctx);
+        tab_to_second_folder(&mut app, &ctx);
+        folder_keyboard_frame(
+            &mut app,
+            &ctx,
+            vec![key_event(Key::Enter, None, Modifiers::NONE)],
+        );
+        assert_second_folder_launched(&mut app, &ctx);
+    }
+
+    #[test]
+    fn folder_tab_and_enter_open_search_roots_without_launching() {
+        let ctx = egui::Context::default();
+        let mut app = folder_keyboard_fixture(&ctx);
+        tab_to_second_folder(&mut app, &ctx);
+        folder_keyboard_frame(
+            &mut app,
+            &ctx,
+            vec![key_event(Key::Tab, None, Modifiers::NONE)],
+        );
+        folder_keyboard_frame(&mut app, &ctx, vec![]);
+        folder_keyboard_frame(
+            &mut app,
+            &ctx,
+            vec![key_event(Key::Enter, None, Modifiers::NONE)],
+        );
+        assert!(app.command_page == CommandPage::Settings);
+        assert!(app.folder_launch.is_none());
+        assert!(app.panes.is_empty());
+    }
+
+    #[test]
+    fn pending_folder_launch_reserves_pane_capacity_before_workspace_creation() {
+        let ctx = egui::Context::default();
+        let mut app = fixture(0);
+        let root = tempfile::tempdir().unwrap();
+        for _ in 0..31 {
+            let id = Uuid::new_v4();
+            let terminal = Terminal::spawn_test(
+                id,
+                root.path(),
+                &root.path().join("hooks.sock"),
+                ctx.clone(),
+            )
+            .unwrap();
+            app.panes.insert(
+                id,
+                Pane {
+                    terminal,
+                    search: TerminalSearch::default(),
+                },
+            );
+        }
+        let (_tx, receiver) = sync_channel(1);
+        app.folder_launch = Some(FolderLaunch {
+            pane: Uuid::new_v4(),
+            receiver,
+        });
+        let missing = root.path().join("must not be created");
+        app.new_directory = missing.to_str().unwrap().into();
+        assert!(!app.add_workspace(&ctx));
+        assert!(!missing.exists());
+        assert!(app.saved.created_directories.is_empty());
+        assert!(!app.add_workspace_in(&ctx, root.path().to_str().unwrap().into()));
+        assert_eq!(app.panes.len(), 31);
+        assert!(app.saved.workspaces.is_empty());
+        assert!(app.error.contains("limit (32)"));
+    }
+
     fn export(ctx: &egui::Context, out: egui::FullOutput, path: &std::path::Path) {
         let textures:Vec<_>=out.textures_delta.set.iter().map(|(id,delta)| {
             let egui::ImageData::Color(image)=&delta.image;
@@ -5673,7 +6361,7 @@ mod render_tests {
             },
             |ctx| app.chrome(ctx, true, &mut None),
         );
-        let controls: Vec<_> = ["Maximize", "Split", "Commands", "+ Workspace"]
+        let controls: Vec<_> = ["Claude in folder", "Commands", "+ Workspace", "Settings"]
             .iter()
             .map(|label| {
                 out.shapes
@@ -5692,12 +6380,12 @@ mod render_tests {
             assert!((height - controls[0].1).abs() < 1.0);
         }
         for pair in controls.windows(2) {
-            assert!(((pair[1].0.x - pair[0].0.x).abs() - 104.0).abs() < 1.0);
+            assert!(pair[1].0.x > pair[0].0.x + 40.0, "header actions overlap");
         }
     }
 
     #[test]
-    fn chrome_workspace_name_keeps_maximize_accessible() {
+    fn pane_menu_keeps_maximize_accessible_at_both_widths() {
         for width in [640.0, 1180.0] {
             let ctx = egui::Context::default();
             let mut app = fixture(1);
@@ -5758,24 +6446,13 @@ mod render_tests {
                     }],
                 )
             };
+            frame(&mut app, vec![]);
+            frame(&mut app, vec![]);
             let mut out = frame(&mut app, vec![]);
-            let name = text_pos(&out, "My task");
-            assert!(
-                name.y < 40.0,
-                "workspace name did not move into the top bar"
-            );
-            if width < 900.0 {
-                click(&mut app, name);
-                out = frame(&mut app, vec![]);
-            }
-            let action = text_pos(
-                &out,
-                if width < 900.0 {
-                    "Maximize pane"
-                } else {
-                    "Maximize"
-                },
-            );
+            let menu = text_pos(&out, "Pane");
+            click(&mut app, menu);
+            out = frame(&mut app, vec![]);
+            let action = text_pos(&out, "Maximize pane");
             click(&mut app, action);
             assert!(app.maximized);
         }
@@ -5888,7 +6565,7 @@ mod render_tests {
             directory.path(),
             std::path::Path::new(""),
             ctx,
-            "tessera_deliberately_missing_agent",
+            "/bin/sh -c 'exec tessera_deliberately_missing_agent'",
         )
         .unwrap();
         app.panes.insert(
@@ -6607,7 +7284,9 @@ mod render_tests {
                 .shapes
                 .iter()
                 .find_map(|shape| match &shape.shape {
-                    egui::epaint::Shape::Text(text) if text.galley.text() == "+ Workspace" => {
+                    egui::epaint::Shape::Text(text)
+                        if matches!(text.galley.text(), "+ Workspace" | "+ New") =>
+                    {
                         Some(text.pos + Vec2::new(10.0, 5.0))
                     }
                     _ => None,
@@ -6623,9 +7302,7 @@ mod render_tests {
                 .shapes
                 .iter()
                 .find_map(|shape| match &shape.shape {
-                    egui::epaint::Shape::Text(text)
-                        if text.galley.text() == "Workspace & commands" =>
-                    {
+                    egui::epaint::Shape::Text(text) if text.galley.text() == "New workspace" => {
                         Some(text.pos + Vec2::new(10.0, 5.0))
                     }
                     _ => None,
@@ -8385,7 +9062,7 @@ mod render_tests {
             &mut app,
             vec![key_event(Key::ArrowUp, None, Modifiers::NONE)],
         );
-        assert_eq!(app.command_index, 8, "Up should wrap to Settings");
+        assert_eq!(app.command_index, 9, "Up should wrap to Settings");
         frame(&mut app, vec![key_event(Key::Enter, None, Modifiers::NONE)]);
         assert!(app.palette);
         assert_eq!(app.command_page as u8, CommandPage::Settings as u8);
@@ -8423,6 +9100,7 @@ mod render_tests {
             for (width, height) in [(640.0, 400.0), (1180.0, 760.0)] {
                 for page in [
                     CommandPage::Commands,
+                    CommandPage::Folders,
                     CommandPage::Create,
                     CommandPage::Settings,
                 ] {
@@ -8434,6 +9112,20 @@ mod render_tests {
                     app.new_directory = "/a/long/project/directory/".repeat(20);
                     let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(width, height));
                     app.open_commands(page);
+                    if page == CommandPage::Folders {
+                        let mut search = crate::folders::FolderSearch::new(ctx.clone());
+                        search.set_query("", &app.saved.folder_search_roots);
+                        search.notice = Some("Spotlight may miss unindexed folders. Search limit reached; use a more specific root or paste a path.".repeat(3));
+                        search.results = vec![crate::folders::FolderResult {
+                            name: "project".into(),
+                            path: PathBuf::from(format!(
+                                "/Users/example/{}/project",
+                                "long-parent-folder/".repeat(20)
+                            )),
+                        }];
+                        app.folder_search = Some(search);
+                    }
+
                     let mut out = None;
                     for _ in 0..4 {
                         out = Some(ctx.run(
