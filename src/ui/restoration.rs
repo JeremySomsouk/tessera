@@ -279,7 +279,7 @@ impl App {
                 }
                 Err(error) => {
                     self.fresh_restored_shell(id, ctx, &directory);
-                    self.restoration.notices.insert(id, format!("Conversation could not be resumed: {error}. Fresh shell ready. Saved identity and output are kept."));
+                    self.restoration.notices.insert(id, format!("Conversation could not be resumed: {error:#}. Fresh shell ready. Saved identity and output are kept."));
                 }
             }
         }
@@ -481,10 +481,15 @@ mod tests {
         let (sender, receiver) = channel();
         app.restoration.pending.insert(first, receiver);
         sender
-            .send(Err(anyhow::anyhow!("saved session unavailable")))
+            .send(Err(
+                anyhow::anyhow!("saved session unavailable").context("Claude resume validation")
+            ))
             .unwrap();
         app.poll_restoration(&egui::Context::default());
-        assert!(app.restoration.notices[&first].contains("saved session unavailable"));
+        assert!(
+            app.restoration.notices[&first]
+                .contains("Claude resume validation: saved session unavailable")
+        );
         app.saved.sessions[0].state = SessionState::Ended;
         app.capture_restoration();
         assert_eq!(

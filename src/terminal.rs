@@ -220,7 +220,7 @@ fn agent_script(directory: &Path, launch: &str) -> Result<String> {
     ))
 }
 
-fn agent_command(directory: &Path, launch: &str) -> Result<CommandBuilder> {
+pub(crate) fn agent_shell() -> String {
     let preferred = std::env::var("SHELL").unwrap_or_else(|_| {
         if cfg!(target_os = "macos") {
             "/bin/zsh".into()
@@ -228,17 +228,20 @@ fn agent_command(directory: &Path, launch: &str) -> Result<CommandBuilder> {
             "/bin/sh".into()
         }
     });
-    let shell = if matches!(
+    if matches!(
         Path::new(&preferred)
             .file_name()
             .and_then(|name| name.to_str()),
         Some("sh" | "bash" | "zsh")
     ) {
-        preferred.as_str()
+        preferred
     } else {
-        "/bin/sh"
-    };
-    let mut command = CommandBuilder::new(shell);
+        "/bin/sh".into()
+    }
+}
+
+fn agent_command(directory: &Path, launch: &str) -> Result<CommandBuilder> {
+    let mut command = CommandBuilder::new(agent_shell());
     command.args(["-lic", &agent_script(directory, launch)?]);
     Ok(command)
 }

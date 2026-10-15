@@ -30,31 +30,48 @@ pub fn launch(agent: Agent, session_id: &str) -> Result<String> {
             session_id
         );
     }
-    let name = match agent {
-        Agent::Claude => "claude",
-        Agent::Codex => "codex",
+    verify_resume(
+        &mut Command::new(crate::terminal::agent_shell()),
+        agent,
+        session_id,
+    )
+}
+
+fn verify_resume(shell: &mut Command, agent: Agent, session_id: &str) -> Result<String> {
+    validate_id(session_id)?;
+    let (name, help_args) = match agent {
+        Agent::Claude => ("claude", "--help"),
+        Agent::Codex => ("codex", "resume --help"),
     };
-    let shell = std::env::var_os("SHELL").unwrap_or_else(|| "/bin/sh".into());
-    let path = checked_output(Command::new(shell).args(["-lc", &format!("command -v {name}")]))?;
-    let path = path.trim();
+    // Frame the response so shell startup output cannot be mistaken for a CLI path or help.
+    let marker = format!("TESSERA_RESUME_{}", uuid::Uuid::new_v4().simple());
+    let script = format!(
+        "tessera_executable=$(command -v {name}) || tessera_executable=''; \
+         if [ ! -f \"$tessera_executable\" ] || [ ! -x \"$tessera_executable\" ]; then tessera_executable=''; fi; \
+         printf '\\n{marker}\\n%s\\n' \"$tessera_executable\"; \
+         if [ -n \"$tessera_executable\" ]; then exec \"$tessera_executable\" {help_args}; fi"
+    );
+    // Match the interactive login shell used by Terminal, including PATH and CLI dependencies.
+    let output = checked_output(shell.args(["-lic", &script])).with_context(|| {
+        format!(
+            "{} resume support could not be verified in your interactive login shell",
+            agent.label()
+        )
+    })?;
+    let framed = output
+        .split_once(&format!("\n{marker}\n"))
+        .context("Login shell did not return the CLI verification result")?
+        .1;
+    let (path, help) = framed
+        .split_once('\n')
+        .context("CLI verification result is incomplete")?;
     if !Path::new(path).is_absolute() || !Path::new(path).is_file() {
         bail!(
-            "{} was not found as an executable in your login shell PATH",
+            "{} was not found as an executable in your interactive login shell PATH; check its installation and retry",
             agent.label()
         );
     }
-    let mut help = Command::new(path);
-    match agent {
-        Agent::Claude => {
-            help.arg("--help");
-        }
-        Agent::Codex => {
-            help.args(["resume", "--help"]);
-        }
-    }
-    let help = checked_output(&mut help)
-        .with_context(|| format!("{} resume support could not be verified", agent.label()))?;
-    command_for_help(agent, path, session_id, &help)
+    command_for_help(agent, path, session_id, help)
 }
 
 fn validate_id(id: &str) -> Result<()> {
@@ -83,27 +100,64 @@ fn command_for_help(agent: Agent, executable: &str, id: &str, help: &str) -> Res
     Ok(format!("{} {} {}", quote(executable), args, quote(id)))
 }
 
+fn capture_output(reader: impl Read + Send + 'static) -> mpsc::Receiver<std::io::Result<Vec<u8>>> {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = reader;
+        let mut data = Vec::new();
+        let result = (|| {
+            let mut buffer = [0; 8192];
+            loop {
+                let count = reader.read(&mut buffer)?;
+                if count == 0 {
+                    break;
+                }
+                let keep = count.min((256 * 1024usize).saturating_sub(data.len()));
+                data.extend_from_slice(&buffer[..keep]);
+            }
+            Ok(data)
+        })();
+        let _ = sender.send(result);
+    });
+    receiver
+}
+
 fn checked_output(command: &mut Command) -> Result<String> {
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
-        .context("Could not run installed CLI")?;
-    let stdout = child.stdout.take().context("CLI output unavailable")?;
-    let (sender, receiver) = mpsc::channel();
-    std::thread::spawn(move || {
-        let mut data = Vec::new();
-        let result = stdout.take(256 * 1024).read_to_end(&mut data).map(|_| data);
-        let _ = sender.send(result);
-    });
+        .context("Could not start CLI verification")?;
+    let stdout = capture_output(child.stdout.take().context("CLI output unavailable")?);
+    let stderr = capture_output(child.stderr.take().context("CLI diagnostics unavailable")?);
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
         if let Some(status) = child.try_wait()? {
             if !status.success() {
-                bail!("Installed CLI exited with {status}; repair its installation and retry");
+                let data = stderr
+                    .recv_timeout(Duration::from_millis(100))
+                    .ok()
+                    .and_then(Result::ok)
+                    .unwrap_or_default();
+                let diagnostic: String = String::from_utf8_lossy(&data)
+                    .chars()
+                    .rev()
+                    .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
+                    .take(4096)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
+                if diagnostic.trim().is_empty() {
+                    bail!("CLI verification exited with {status}");
+                }
+                bail!(
+                    "CLI verification exited with {status}: {}",
+                    diagnostic.trim()
+                );
             }
-            let data = receiver
+            let data = stdout
                 .recv_timeout(Duration::from_millis(100))
                 .context("CLI output timed out")??;
             return String::from_utf8(data).context("CLI returned invalid help text");
@@ -111,7 +165,9 @@ fn checked_output(command: &mut Command) -> Result<String> {
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            bail!("Installed CLI did not respond within three seconds; retry when it is available");
+            bail!(
+                "CLI verification did not respond within three seconds; retry when it is available"
+            );
         }
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -216,6 +272,102 @@ mod tests {
         .unwrap();
         assert!(session_exists(dir.path(), Agent::Codex, ID, 0));
     }
+    #[cfg(target_os = "macos")]
+    fn shell_fixture(cli: Option<&str>) -> (tempfile::TempDir, Command) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        fs::write(dir.path().join(".zshrc"), format!(
+            "export PATH={}\nexport TESSERA_FIXTURE=ready\nprintf 'startup chatter --resume session ID\\n'\nprintf 'startup diagnostic\\n' >&2\n",
+            quote(bin.to_str().unwrap())
+        )).unwrap();
+        if let Some(cli) = cli {
+            let path = bin.join("claude");
+            fs::write(&path, format!("#!/bin/sh\n{cli}\n")).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut shell = Command::new("/bin/zsh");
+        shell
+            .env_clear()
+            .env("HOME", dir.path())
+            .env("ZDOTDIR", dir.path())
+            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
+        (dir, shell)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn interactive_shell_resolves_cli_and_its_environment_from_desktop_path() {
+        let (dir, mut shell) = shell_fixture(Some(
+            "[ \"$TESSERA_FIXTURE\" = ready ] || exit 1\n[ \"$1\" = --help ] || exit 2\nfixture-helper",
+        ));
+        use std::os::unix::fs::PermissionsExt;
+        let helper = dir.path().join("bin/fixture-helper");
+        fs::write(&helper, "#!/bin/sh\nprintf '%s\\n' '--resume session ID'\n").unwrap();
+        fs::set_permissions(helper, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            verify_resume(&mut shell, Agent::Claude, ID).unwrap(),
+            format!(
+                "{} --resume '{ID}'",
+                quote(dir.path().join("bin/claude").to_str().unwrap())
+            )
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn startup_chatter_cannot_advertise_resume_for_an_unsupported_cli() {
+        let (_dir, mut shell) = shell_fixture(Some("printf 'unsupported CLI\\n'"));
+        assert!(
+            verify_resume(&mut shell, Agent::Claude, ID)
+                .unwrap_err()
+                .to_string()
+                .contains("does not advertise supported exact-session resume")
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn missing_cli_and_failed_cli_have_distinct_diagnostics() {
+        let (_dir, mut shell) = shell_fixture(None);
+        let missing = verify_resume(&mut shell, Agent::Claude, ID)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            missing.contains("was not found as an executable"),
+            "{missing}"
+        );
+        assert!(!missing.contains("startup diagnostic"));
+        let (_dir, mut shell) =
+            shell_fixture(Some("printf 'missing native binary\\n' >&2; exit 1"));
+        let failed = format!(
+            "{:#}",
+            verify_resume(&mut shell, Agent::Claude, ID).unwrap_err()
+        );
+        assert!(
+            failed.contains("resume support could not be verified"),
+            "{failed}"
+        );
+        assert!(failed.contains("missing native binary"), "{failed}");
+        assert!(!failed.contains("was not found"));
+    }
+
+    #[test]
+    fn captured_output_is_bounded_and_drained() {
+        let reader = std::io::Cursor::new(vec![b'x'; 1024 * 1024]);
+        assert_eq!(
+            capture_output(reader).recv().unwrap().unwrap().len(),
+            256 * 1024
+        );
+        let error = checked_output(
+            Command::new("/bin/sh").args(["-c", "printf 'native binary missing' >&2; exit 1"]),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("native binary missing"));
+    }
+
     #[test]
     fn failed_cli_does_not_create_a_launch_command() {
         assert!(checked_output(Command::new("/bin/sh").args(["-c", "exit 1"])).is_err());
