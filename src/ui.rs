@@ -445,6 +445,7 @@ pub struct App {
     selected_work: Option<Uuid>,
     spec_codex: bool,
     selected: Option<String>,
+    reveal_session: Option<String>,
     endpoint: Option<Endpoint>,
     discovery: Option<crate::discovery::Discovery>,
     error: String,
@@ -470,6 +471,7 @@ pub struct App {
     rename: Option<WorkspaceRename>,
     closing: Option<TerminalClose>,
     filter: String,
+    work_filter: String,
     maximized: bool,
     category: u8,
     overview_inspector: bool,
@@ -547,6 +549,7 @@ impl App {
             selected_work: None,
             spec_codex: false,
             selected: None,
+            reveal_session: None,
             error: load_error,
             endpoint: None,
             discovery: Some(crate::discovery::Discovery::start(cc.egui_ctx.clone())),
@@ -573,6 +576,7 @@ impl App {
             rename: None,
             closing: None,
             filter: String::new(),
+            work_filter: String::new(),
             maximized: false,
             category: 0,
             overview_inspector: false,
@@ -1341,33 +1345,63 @@ impl App {
         self.dirty |= self.sync_work();
         ui.horizontal_wrapped(|ui| {
             ui.heading("Work");
-            if ui.button("New work").clicked() {
-                if self.saved.work_items.len() >= 256 { self.error = "Work limit (256) reached. Existing work is kept.".into(); }
-                else {
-                    let mut w = WorkItem::new("Untitled work".into(), self.new_directory.clone());
-                    w.stage = WorkStage::Define;
+            if primary_button(ui, "New work").clicked() {
+                if self.saved.work_items.len() >= 256 {
+                    self.error = "Work limit (256) reached. Reuse an existing item or attach a session to it.".into();
+                } else {
+                    let directory = self.saved.workspaces.get(self.active)
+                        .map(|w| w.task.directory.clone())
+                        .unwrap_or_else(|| self.new_directory.clone());
+                    let mut work = WorkItem::new("Untitled work".into(), directory);
+                    work.stage = WorkStage::Define;
                     self.overview_inspector = true;
-                    self.selected_work = Some(w.id);
-                    self.saved.work_items.push(w);
+                    self.selected_work = Some(work.id);
+                    self.selected = None;
+                    self.work_filter.clear();
+                    ui.data_mut(|data| data.insert_temp(egui::Id::new("work-title-focus"), work.id));
+                    self.saved.work_items.push(work);
                     self.category = 1;
                     self.dirty = true;
                 }
             }
-            for (value, label) in [(0, "Attention"), (1, "Active"), (2, "History")] {
-                ui.selectable_value(&mut self.category, value, label);
+        });
+        ui.small("Track agent work, respond to requests, and review results.");
+        ui.add_space(8.0);
+        let mut counts = [0; 3];
+        for work in &self.saved.work_items {
+            if self.saved.work_is_history(work) {
+                counts[2] += 1;
+            } else {
+                counts[1] += 1;
+                counts[0] += usize::from(work.attention(&self.saved.sessions) < 3);
             }
-            if self.category == 2 { ui.menu_button("Clear disconnected sessions", |ui| {
-                ui.label("Clear disconnected session diagnostics? Work items and specifications are kept.");
-                if ui.button("Clear sessions").clicked() { self.cleanup_disconnected_sessions(); ui.close(); }
-            }); }
+        }
+        ui.horizontal_wrapped(|ui| {
+            for (value, label) in [(0, "Needs attention"), (1, "Active"), (2, "History")] {
+                if ui
+                    .selectable_value(
+                        &mut self.category,
+                        value,
+                        format!("{label} ({})", counts[value as usize]),
+                    )
+                    .changed()
+                {
+                    self.overview_inspector = false;
+                }
+            }
         });
-        ui.small(
-            "Stages are explicit. Hooks report activity, not verification or delivery evidence.",
-        );
         ui.horizontal(|ui| {
-            ui.label("Find work");
-            ui.add(egui::TextEdit::singleline(&mut self.filter).id(egui::Id::new("work-filter")));
+            ui.add(
+                egui::TextEdit::singleline(&mut self.work_filter)
+                    .id(egui::Id::new("work-filter"))
+                    .hint_text("Search title or folder")
+                    .desired_width((ui.available_width() - 60.0).max(80.0)),
+            );
+            if !self.work_filter.is_empty() && ui.button("Clear").clicked() {
+                self.work_filter.clear();
+            }
         });
+        ui.add_space(6.0);
         let mut items: Vec<_> = self
             .saved
             .work_items
@@ -1380,10 +1414,13 @@ impl App {
                     _ => history,
                 };
                 category
-                    && (w.title.to_lowercase().contains(&self.filter.to_lowercase())
+                    && (w
+                        .title
+                        .to_lowercase()
+                        .contains(&self.work_filter.trim().to_lowercase())
                         || w.directory
                             .to_lowercase()
-                            .contains(&self.filter.to_lowercase()))
+                            .contains(&self.work_filter.trim().to_lowercase()))
             })
             .cloned()
             .collect();
@@ -1408,6 +1445,7 @@ impl App {
             self.selected_work = items.first().map(|w| w.id);
             self.selected = None;
         }
+        let mut scroll_to_selection = false;
         if !keyboard_was_claimed
             && !popup_was_open
             && !ui.ctx().wants_keyboard_input()
@@ -1438,6 +1476,7 @@ impl App {
                         .id,
                 );
                 self.selected = None;
+                scroll_to_selection = true;
             }
             if ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter))
                 && let Some(id) = self.selected_work
@@ -1455,9 +1494,9 @@ impl App {
         }
         if ui.available_width() >= 760.0 {
             ui.columns(2, |columns| {
-                self.work_list(&mut columns[0], &items);
+                self.work_list(&mut columns[0], &items, scroll_to_selection);
                 egui::ScrollArea::vertical()
-                    .id_salt("work-detail")
+                    .id_salt(("work-detail", self.selected_work))
                     .show(&mut columns[1], |ui| self.work_detail(ui));
             });
         } else if self.overview_inspector {
@@ -1465,18 +1504,15 @@ impl App {
                 self.overview_inspector = false;
             }
             egui::ScrollArea::vertical()
-                .id_salt("work-detail")
+                .id_salt(("work-detail", self.selected_work))
                 .show(ui, |ui| self.work_detail(ui));
         } else {
-            self.work_list(ui, &items);
+            self.work_list(ui, &items, scroll_to_selection);
         }
     }
 
-    fn work_action(&mut self, id: Uuid) {
-        self.selected_work = Some(id);
-        self.overview_inspector = true;
-        let session = self
-            .saved
+    fn work_session(&self, id: Uuid) -> Option<&Session> {
+        self.saved
             .sessions
             .iter()
             .filter(|s| s.work_id == Some(id))
@@ -1496,91 +1532,187 @@ impl App {
                     std::cmp::Reverse(s.updated),
                 )
             })
-            .map(Session::key);
-        self.selected = session.clone();
-        if let Some(key) = session
-            && let Some(index) = self.saved.sessions.iter().position(|s| s.key() == key)
-            && self.panes.contains_key(&self.saved.sessions[index].pane)
-        {
-            self.saved.sessions[index].seen = now();
-            self.saved.sessions[index].seen_sequence = self.saved.sessions[index].last_sequence;
-            self.dirty = true;
-            self.focus_session(&key);
+    }
+
+    fn work_status(&self, work: &WorkItem) -> &'static str {
+        match work.disposition {
+            WorkDisposition::Completed => return "Completed",
+            WorkDisposition::Archived => return "Archived",
+            WorkDisposition::Active => {}
+        }
+        if self.saved.work_is_history(work) {
+            return "Session ended";
+        }
+        match work.attention(&self.saved.sessions) {
+            0 => self
+                .work_session(work.id)
+                .map_or("Needs your input", |s| s.state.label()),
+            1 => "New response",
+            2 => match work.stage {
+                WorkStage::Verify => "Ready to verify",
+                WorkStage::Review => "Ready to review",
+                _ => "Ready to deliver",
+            },
+            _ => self
+                .work_session(work.id)
+                .map_or("Not started", |s| match s.state {
+                    SessionState::Unknown => "Activity unavailable",
+                    _ => s.state.label(),
+                }),
         }
     }
 
-    fn work_list(&mut self, ui: &mut egui::Ui, items: &[WorkItem]) {
+    fn work_action_label(&self, work: &WorkItem) -> &'static str {
+        if let Some(session) = self.work_session(work.id) {
+            if self.panes.contains_key(&session.pane) {
+                if session.state.attention() {
+                    "Respond in terminal"
+                } else {
+                    "Open terminal"
+                }
+            } else {
+                "View activity"
+            }
+        } else if work.specification.is_some() {
+            "Open specification"
+        } else if self.saved.work_is_history(work) {
+            "View details"
+        } else {
+            "Create specification"
+        }
+    }
+
+    fn work_action(&mut self, id: Uuid) {
+        self.selected_work = Some(id);
+        self.overview_inspector = true;
+        let session = self.work_session(id).map(Session::key);
+        self.selected = session.clone();
+        if let Some(key) = session {
+            if let Some(index) = self.saved.sessions.iter().position(|s| s.key() == key)
+                && self.panes.contains_key(&self.saved.sessions[index].pane)
+            {
+                self.saved.sessions[index].seen = now();
+                self.saved.sessions[index].seen_sequence = self.saved.sessions[index].last_sequence;
+                self.dirty = true;
+                self.focus_session(&key);
+            } else {
+                self.reveal_session = Some(key);
+            }
+        } else if let Some(index) = self.saved.work_items.iter().position(|w| w.id == id)
+            && (self.saved.work_items[index].specification.is_some()
+                || !self.saved.work_is_history(&self.saved.work_items[index]))
+        {
+            self.open_work_specification(index);
+        }
+    }
+
+    fn open_work_specification(&mut self, index: usize) {
+        let work = &mut self.saved.work_items[index];
+        let id = *work.specification.get_or_insert_with(|| {
+            let mut spec = crate::specs::Specification::new(work.directory.clone());
+            spec.draft.title = work.title.clone();
+            let id = spec.id;
+            self.saved.specifications.push(spec);
+            self.dirty = true;
+            id
+        });
+        self.selected_spec = Some(id);
+        self.specifications_view = true;
+    }
+
+    fn work_list(&mut self, ui: &mut egui::Ui, items: &[WorkItem], scroll_to_selection: bool) {
         if items.is_empty() {
-            if self.category == 0 && self.filter.trim().is_empty() {
-                ui.label("Nothing needs your attention");
-                ui.small("Open Active to see ongoing work, or return to your terminal.");
+            ui.add_space(12.0);
+            if !self.work_filter.trim().is_empty() {
+                ui.strong("No matching work");
+                ui.small("Search another title or folder, or clear the search.");
+                if ui.button("Clear search").clicked() {
+                    self.work_filter.clear();
+                }
+            } else if self.saved.work_items.is_empty() {
+                ui.strong("Start your first work item");
+                ui.label("Choose New work to define a task. Agent sessions also appear here automatically.");
+            } else if self.category == 0 {
+                ui.strong("Nothing needs your attention");
+                ui.small("Requests and new responses will appear here.");
+                if ui.button("Show active work").clicked() {
+                    self.category = 1;
+                }
+            } else if self.category == 2 {
+                ui.strong("No work in history");
+                ui.small("Completed, archived, and ended work will appear here.");
                 if ui.button("Show active work").clicked() {
                     self.category = 1;
                 }
             } else {
-                ui.label("No work in this view");
-                ui.small("Try another filter or return to your terminal.");
+                ui.strong("No active work");
+                ui.small("Create work, or reopen an item from History.");
+                if ui.button("Show history").clicked() {
+                    self.category = 2;
+                }
             }
         }
-        egui::ScrollArea::vertical()
-            .id_salt("work-list")
-            .auto_shrink([false, false])
-            .show_rows(ui, 96.0, items.len(), |ui, range| {
-                for work in &items[range] {
-                    let sessions: Vec<_> = self
-                        .saved
-                        .sessions
-                        .iter()
-                        .filter(|s| s.work_id == Some(work.id))
-                        .collect();
-                    let action = match work.attention(&self.saved.sessions) {
-                        0 => "Inspect CLI request",
-                        1 => "Inspect response",
-                        _ => work.stage.action(),
-                    };
-                    let at = sessions
-                        .iter()
-                        .map(|s| s.updated)
-                        .filter(|at| *at > 0)
-                        .max();
-                    let count = sessions.len();
-                    ui.allocate_ui(Vec2::new(ui.available_width(), 92.0), |ui| {
-                        ui.horizontal(|ui| {
-                            if ui
-                                .add(
-                                    egui::Button::selectable(
-                                        self.selected_work == Some(work.id),
-                                        RichText::new(&work.title).strong(),
-                                    )
-                                    .truncate(),
+        let row_height = 132.0;
+        let mut scroll = egui::ScrollArea::vertical()
+            .id_salt(("work-list", self.category))
+            .auto_shrink([false, false]);
+        if scroll_to_selection
+            && let Some(index) = items.iter().position(|w| Some(w.id) == self.selected_work)
+        {
+            scroll = scroll
+                .vertical_scroll_offset(index as f32 * (row_height + ui.spacing().item_spacing.y));
+        }
+        scroll.show_rows(ui, row_height, items.len(), |ui, range| {
+            for work in &items[range] {
+                let selected = self.selected_work == Some(work.id);
+                let status = self.work_status(work);
+                let action = self.work_action_label(work);
+                ui.push_id(work.id, |ui| {
+                    ui.allocate_ui(Vec2::new(ui.available_width(), row_height), |ui| {
+                        ui.set_min_height(row_height);
+                        ui.spacing_mut().item_spacing.y = 4.0;
+                        if ui
+                            .add_sized(
+                                [ui.available_width(), 26.0],
+                                egui::Button::selectable(
+                                    selected,
+                                    RichText::new(&work.title).strong(),
                                 )
-                                .clicked()
-                            {
-                                self.selected_work = Some(work.id);
+                                .truncate(),
+                            )
+                            .clicked()
+                        {
+                            if !selected {
                                 self.selected = None;
-                                self.overview_inspector = true;
                             }
-                        });
-                        ui.label(format!(
-                            "{} · {count} {}",
-                            work.stage.label(),
-                            if count == 1 { "session" } else { "sessions" }
-                        ));
+                            self.selected_work = Some(work.id);
+                            self.overview_inspector = true;
+                        }
                         ui.horizontal(|ui| {
-                            if ui.button(action).clicked() {
-                                self.work_action(work.id);
-                            }
-                            if let Some(at) = at {
-                                ui.small(format!(
-                                    "Observed {}",
-                                    relative_time(now().saturating_sub(at))
-                                ));
-                            }
+                            ui.label(RichText::new(status).color(
+                                if work.attention(&self.saved.sessions) < 3
+                                    && !self.saved.work_is_history(work)
+                                {
+                                    attention_color(ui)
+                                } else {
+                                    ui.visuals().text_color()
+                                },
+                            ));
+                            ui.small(format!("· {}", work.stage.label()));
                         });
+                        ui.add(
+                            egui::Label::new(RichText::new(&work.directory).small().weak())
+                                .truncate(),
+                        )
+                        .on_hover_text(&work.directory);
+                        if ui.button(action).clicked() {
+                            self.work_action(work.id);
+                        }
                         ui.separator();
                     });
-                }
-            });
+                });
+            }
+        });
     }
 
     fn work_detail(&mut self, ui: &mut egui::Ui) {
@@ -1592,26 +1724,64 @@ impl App {
         else {
             return;
         };
-        ui.separator();
         section_label(ui, "WORK CONTEXT");
-        if self.saved.work_is_history(&self.saved.work_items[index])
-            && self.saved.work_items[index].disposition == WorkDisposition::Active
-        {
-            ui.small("No linked live session. Choose Active to reopen this work, or attach a live session.");
+        let work = &self.saved.work_items[index];
+        let work_id = work.id;
+        ui.heading(&work.title);
+        ui.label(RichText::new(self.work_status(work)).strong());
+        let history = self.saved.work_is_history(work);
+        if history {
+            ui.small("Kept in History. Reopen this work to continue where you left off.");
+        } else if self.work_session(work_id).is_none() {
+            ui.small("Define the task in a specification, then start an agent from it.");
+        } else {
+            ui.small(match self.work_session(work_id).unwrap().state {
+                SessionState::Permission | SessionState::Input => {
+                    "Your agent is waiting. Open its terminal to respond."
+                }
+                SessionState::Running => {
+                    "Your agent is working. Open its terminal to follow progress."
+                }
+                SessionState::Unknown => {
+                    "Activity tracking is unavailable. Open the terminal to check progress."
+                }
+                SessionState::Disconnected => {
+                    "This session is disconnected. Its saved activity is still available below."
+                }
+                _ => "Review the response before updating the stage or marking work complete.",
+            });
         }
+        let action = self.work_action_label(work);
+        ui.horizontal_wrapped(|ui| {
+            if action != "View details" && primary_button(ui, action).clicked() {
+                self.work_action(work_id);
+            }
+            if history && ui.button("Reopen work").clicked() {
+                self.saved.work_items[index].set_disposition(WorkDisposition::Active);
+                self.category = 1;
+                self.dirty = true;
+            }
+        });
+        ui.add_space(8.0);
         let work = &mut self.saved.work_items[index];
         ui.label("Title");
-        let title_changed = ui
-            .add(
-                egui::TextEdit::singleline(&mut work.title)
-                    .id(egui::Id::new(("work-title", work.id))),
-            )
-            .changed();
+        let title = ui.add(
+            egui::TextEdit::singleline(&mut work.title)
+                .id(egui::Id::new(("work-title", work.id)))
+                .desired_width(f32::INFINITY),
+        );
+        if ui.data_mut(|data| data.remove_temp::<Uuid>(egui::Id::new("work-title-focus")))
+            == Some(work.id)
+        {
+            title.request_focus();
+        }
+        let title_changed = title.changed();
         ui.label("Working directory");
         let directory_changed = ui
             .add(
                 egui::TextEdit::singleline(&mut work.directory)
-                    .id(egui::Id::new(("work-directory", work.id))),
+                    .id(egui::Id::new(("work-directory", work.id)))
+                    .desired_width(f32::INFINITY),
             )
             .changed();
         self.dirty |= title_changed || directory_changed;
@@ -1629,47 +1799,66 @@ impl App {
             }
         }
         ui.horizontal_wrapped(|ui| {
-            for stage in WorkStage::ALL {
-                if ui
-                    .selectable_label(work.stage == stage, stage.label())
-                    .clicked()
-                {
-                    work.stage = stage;
-                    self.dirty = true;
-                }
+            ui.label("Stage");
+            let step = WorkStage::ALL
+                .iter()
+                .position(|stage| *stage == work.stage)
+                .unwrap_or(0)
+                + 1;
+            egui::ComboBox::from_id_salt(("work-stage", work.id))
+                .selected_text(format!("{step}/6 · {}", work.stage.label()))
+                .show_ui(ui, |ui| {
+                    for stage in WorkStage::ALL {
+                        self.dirty |= ui
+                            .selectable_value(&mut work.stage, stage, stage.label())
+                            .changed();
+                    }
+                });
+            ui.label("Status");
+            let mut disposition = work.disposition;
+            egui::ComboBox::from_id_salt(("work-status", work.id))
+                .selected_text(match disposition {
+                    WorkDisposition::Active => "Active",
+                    WorkDisposition::Completed => "Completed",
+                    WorkDisposition::Archived => "Archived",
+                })
+                .show_ui(ui, |ui| {
+                    for (value, label) in [
+                        (WorkDisposition::Active, "Active"),
+                        (WorkDisposition::Completed, "Completed"),
+                        (WorkDisposition::Archived, "Archived"),
+                    ] {
+                        ui.selectable_value(&mut disposition, value, label);
+                    }
+                });
+            if disposition != work.disposition {
+                work.set_disposition(disposition);
+                self.category = if disposition == WorkDisposition::Active {
+                    1
+                } else {
+                    2
+                };
+                self.dirty = true;
             }
         });
-        ui.horizontal_wrapped(|ui| {
-            for (value, label) in [
-                (WorkDisposition::Active, "Active"),
-                (WorkDisposition::Completed, "Completed"),
-                (WorkDisposition::Archived, "Archived"),
-            ] {
-                if ui
-                    .selectable_label(work.disposition == value, label)
-                    .clicked()
-                {
-                    work.set_disposition(value);
-                    self.dirty = true;
-                }
-            }
-        });
-        let work_id = work.id;
-        let title = work.title.clone();
-        let directory = work.directory.clone();
-        if let Some(id) = work.specification {
-            if ui.button("Open specification and revisions").clicked() {
-                self.selected_spec = Some(id);
-                self.specifications_view = true;
-            }
-        } else if ui.button("Add specification").clicked() {
-            let mut spec = crate::specs::Specification::new(directory);
-            spec.draft.title = title;
-            work.specification = Some(spec.id);
-            self.selected_spec = Some(spec.id);
-            self.saved.specifications.push(spec);
-            self.specifications_view = true;
-            self.dirty = true;
+        if !history {
+            ui.small(format!(
+                "Next: {}. Update the stage after checking the result.",
+                work.stage.action()
+            ));
+        }
+        let has_specification = work.specification.is_some();
+        if action != "Open specification"
+            && (self.work_session(work_id).is_some() || history)
+            && ui
+                .button(if has_specification {
+                    "Open specification"
+                } else {
+                    "Add specification"
+                })
+                .clicked()
+        {
+            self.open_work_specification(index);
         }
         ui.add_space(10.0);
         section_label(ui, "LINKED SESSIONS");
@@ -1681,22 +1870,27 @@ impl App {
             .cloned()
             .collect();
         if sessions.is_empty() {
-            ui.small("Start an agent in Terminal, then attach its session here.");
+            ui.small("No sessions yet. Start an agent from the specification, or attach an existing session.");
         }
         for session in sessions {
             if ui
-                .selectable_label(
-                    self.selected.as_deref() == Some(session.key().as_str()),
-                    format!(
-                        "{} · {} · {}",
-                        session.agent.label(),
-                        session.state.label(),
-                        session.session_id
-                    ),
+                .add(
+                    egui::Button::selectable(
+                        self.selected.as_deref() == Some(session.key().as_str()),
+                        format!(
+                            "{} · {} · {}",
+                            session.agent.label(),
+                            session.session_id.chars().take(8).collect::<String>(),
+                            session.state.label()
+                        ),
+                    )
+                    .truncate(),
                 )
+                .on_hover_text(&session.session_id)
                 .clicked()
             {
                 self.selected = Some(session.key());
+                self.reveal_session = self.selected.clone();
             }
         }
         ui.menu_button("Attach a session to this work", |ui| {
@@ -1721,12 +1915,25 @@ impl App {
                 }
             }
         });
+        if self.category == 2 {
+            ui.menu_button("Session cleanup", |ui| {
+                ui.label("Clear disconnected sessions? Work items and specifications are kept.");
+                if ui.button("Clear disconnected sessions").clicked() {
+                    self.cleanup_disconnected_sessions();
+                    ui.close();
+                }
+            });
+        }
         if self.selected.as_ref().is_some_and(|key| {
             self.saved
                 .sessions
                 .iter()
                 .any(|s| s.key() == *key && s.work_id == Some(work_id))
         }) {
+            if self.reveal_session.as_ref() == self.selected.as_ref() {
+                ui.scroll_to_cursor(Some(egui::Align::Min));
+                self.reveal_session = None;
+            }
             self.inspector(ui);
         }
     }
@@ -1753,77 +1960,90 @@ impl App {
                 .find(|launch| launch.pane == pane)
                 .map(|launch| (spec.id, spec.draft.title.clone(), launch.revision))
         });
-        egui::ScrollArea::vertical()
-            .id_salt("inspector")
-            .max_height(ui.available_height())
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                section_label(ui, "SESSION CONTEXT");
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    ui.heading(session.agent.label());
-                    ui.label(RichText::new(session.state.label()).color(
-                        if session.state.attention() {
-                            attention_color(ui)
-                        } else {
-                            accent(ui)
-                        },
-                    ));
-                });
-                if session.updated > 0 { ui.small(format!("Last observed {}", relative_time(now().saturating_sub(session.updated)))); }
-                ui.small(if session.state == SessionState::Unknown { "Limited tracking: process/session observed; turn activity unknown." } else { "Hook observations only. Approval and output remain in the CLI." });
-                ui.add_space(8.0);
-                open = ui
-                    .add_enabled_ui(live, |ui| primary_button(ui, "Open live terminal"))
-                    .inner
-                    .clicked();
-                if let Some((id, title, revision)) = &linked_spec
-                    && ui
-                        .button(format!("Spec: {title} · revision {revision}"))
-                        .clicked()
-                {
-                    self.selected_spec = Some(*id);
-                    self.specifications_view = true;
-                }
-                if !live {
-                    ui.small("Terminal closed · history retained");
-                    inspected = ui.button("Mark response inspected").clicked();
-                }
-                ui.add_space(18.0);
-                let unread = session
-                    .history
-                    .iter()
-                    .filter(|a| a.sequence > session.seen_sequence)
-                    .count();
-                egui::CollapsingHeader::new(format!("Diagnostics · {unread} new events")).show(ui, |ui| {
-                ui.add_space(8.0);
-                for a in session.history.iter().rev() {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(&a.kind).strong().color(
-                            if a.sequence > session.seen_sequence {
-                                accent(ui)
-                            } else {
-                                ui.visuals().text_color()
-                            },
-                        ));
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(
-                                RichText::new(relative_time(now().saturating_sub(a.at)))
-                                    .small()
-                                    .color(ui.visuals().weak_text_color()),
+        ui.push_id(("inspector", &id), |ui| {
+            section_label(ui, "SESSION CONTEXT");
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.heading(session.agent.label());
+                ui.label(RichText::new(session.state.label()).color(
+                    if session.state.attention() {
+                        attention_color(ui)
+                    } else {
+                        accent(ui)
+                    },
+                ));
+            });
+            if session.updated > 0 {
+                ui.small(format!(
+                    "Last observed {}",
+                    relative_time(now().saturating_sub(session.updated))
+                ));
+            }
+            ui.small(if session.state == SessionState::Unknown {
+                "Limited tracking: process/session observed; turn activity unknown."
+            } else {
+                "Hook observations only. Approval and output remain in the CLI."
+            });
+            ui.add_space(8.0);
+            open = ui
+                .add_enabled_ui(live, |ui| primary_button(ui, "Open live terminal"))
+                .inner
+                .clicked();
+            if let Some((id, title, revision)) = &linked_spec
+                && ui
+                    .button(format!("Spec: {title} · revision {revision}"))
+                    .clicked()
+            {
+                self.selected_spec = Some(*id);
+                self.specifications_view = true;
+            }
+            if !live {
+                ui.small("Terminal closed · history retained");
+                inspected = ui.button("Mark response inspected").clicked();
+            }
+            ui.add_space(18.0);
+            let unread = session
+                .history
+                .iter()
+                .filter(|a| a.sequence > session.seen_sequence)
+                .count();
+            egui::CollapsingHeader::new(format!("Diagnostics · {unread} new events")).show(
+                ui,
+                |ui| {
+                    ui.add_space(8.0);
+                    for a in session.history.iter().rev() {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(&a.kind).strong().color(
+                                if a.sequence > session.seen_sequence {
+                                    accent(ui)
+                                } else {
+                                    ui.visuals().text_color()
+                                },
+                            ));
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        RichText::new(relative_time(now().saturating_sub(a.at)))
+                                            .small()
+                                            .color(ui.visuals().weak_text_color()),
+                                    );
+                                },
                             );
                         });
-                    });
-                    if !a.detail.is_empty() {
-                        ui.label(&a.detail);
+                        if !a.detail.is_empty() {
+                            ui.label(&a.detail);
+                        }
+                        ui.add_space(5.0);
+                        ui.separator();
+                        ui.add_space(5.0);
                     }
-                    ui.add_space(5.0);
-                    ui.separator();
-                    ui.add_space(5.0);
-                }
-                });
-                ui.small("Stage and completion are explicit work actions. Hooks do not prove checks passed.");
-            });
+                },
+            );
+            ui.small(
+                "Stage and completion are explicit work actions. Hooks do not prove checks passed.",
+            );
+        });
         if open || inspected {
             self.saved.sessions[index].seen = now();
             self.saved.sessions[index].seen_sequence = self.saved.sessions[index].last_sequence;
@@ -2478,10 +2698,38 @@ impl App {
         }
     }
 
+    fn folder_search_roots_editor(&mut self, ui: &mut egui::Ui) {
+        ui.label("Search roots");
+        let mut roots = self.saved.folder_search_roots.join("\n");
+        if ui
+            .add(
+                egui::TextEdit::multiline(&mut roots)
+                    .id(egui::Id::new("folder-search-roots"))
+                    .desired_rows(1)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("~/projects"),
+            )
+            .changed()
+        {
+            self.saved.folder_search_roots = roots.split('\n').map(str::to_owned).collect();
+            self.command_index = 0;
+            self.folder_error = None;
+            self.dirty = true;
+        }
+        ui.small("Search only inside these folders and their subfolders. One root per line, up to 16. Empty uses your home folder. Exact folder paths can still be opened outside these roots.");
+    }
+
     fn folder_results(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, submit: Option<egui::Id>) {
         ui.label("Find an existing folder, then start Claude Code in a new terminal.");
-        let down = ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowDown));
-        let up = ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowUp));
+        ui.add_enabled_ui(self.folder_launch.is_none(), |ui| {
+            self.folder_search_roots_editor(ui);
+        });
+        ui.add_space(8.0);
+        let editing_roots =
+            ctx.memory(|memory| memory.has_focus(egui::Id::new("folder-search-roots")));
+        let down =
+            !editing_roots && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowDown));
+        let up = !editing_roots && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowUp));
         let launching = self.folder_launch.is_some();
         if !launching && (self.command_focus || down || up) {
             ctx.memory_mut(|memory| {
@@ -2722,26 +2970,7 @@ impl App {
         }
         ui.add_space(16.0);
         section_label(ui, "FOLDER SEARCH");
-        ui.small("Fallback search roots, one folder per line. Empty uses your home folder.");
-        let mut roots = self.saved.folder_search_roots.join("\n");
-        if ui
-            .add(
-                egui::TextEdit::multiline(&mut roots)
-                    .desired_rows(3)
-                    .desired_width(f32::INFINITY)
-                    .hint_text("~/projects\n~/Documents\n/Volumes/Work"),
-            )
-            .changed()
-        {
-            self.saved.folder_search_roots = roots.split('\n').map(str::to_owned).collect();
-            self.dirty = true;
-        }
-        ui.small("Bounded search skips hidden, dependency and build folders. Add a specific root to search inside one, or paste its exact path. Up to 16 roots.");
-        if cfg!(target_os = "macos") {
-            ui.small(
-                "Spotlight also searches indexed folders across your Mac, outside these roots.",
-            );
-        }
+        self.folder_search_roots_editor(ui);
         ui.add_space(16.0);
         section_label(ui, "TERMINAL BEHAVIOR");
         ui.add_space(8.0);
@@ -5739,6 +5968,7 @@ mod render_tests {
             selected_work: None,
             spec_codex: false,
             selected,
+            reveal_session: None,
             endpoint: None,
             discovery: None,
             error: String::new(),
@@ -5764,11 +5994,41 @@ mod render_tests {
             rename: None,
             closing: None,
             filter: String::new(),
+            work_filter: String::new(),
             maximized: false,
             category: 0,
             overview_inspector: false,
         }
     }
+    #[test]
+    fn folder_roots_editor_saves_custom_paths() {
+        let ctx = egui::Context::default();
+        let mut app = fixture(0);
+        app.saved.folder_search_roots.clear();
+        app.dirty = false;
+        let frame = |app: &mut App, events| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default()
+                        .show(ctx, |ui| app.folder_search_roots_editor(ui));
+                },
+            );
+        };
+        frame(&mut app, vec![]);
+        ctx.memory_mut(|memory| memory.request_focus(egui::Id::new("folder-search-roots")));
+        let root = "/path/to/projects";
+        frame(&mut app, vec![egui::Event::Text(root.into())]);
+        assert_eq!(app.saved.folder_search_roots, vec![root]);
+        assert!(app.dirty);
+        let restored: Saved =
+            serde_json::from_str(&serde_json::to_string(&app.saved).unwrap()).unwrap();
+        assert_eq!(restored.folder_search_roots, vec![root]);
+    }
+
     #[test]
     fn folder_picker_keyboard_selection_stale_input_and_escape_never_launch_implicitly() {
         let ctx = egui::Context::default();
@@ -9454,7 +9714,7 @@ mod render_tests {
         render(&mut app, vec![]);
         ctx.memory_mut(|m| m.request_focus(egui::Id::new("work-filter")));
         render(&mut app, vec![egui::Event::Text("Tessera".into())]);
-        assert_eq!(app.filter, "Tessera");
+        assert_eq!(app.work_filter, "Tessera");
         assert!(
             ctx.wants_keyboard_input(),
             "filter should have keyboard focus"
@@ -9464,7 +9724,7 @@ mod render_tests {
             vec![key_event(Key::Escape, Some(Key::Escape), Modifiers::NONE)],
         );
         assert!(app.overview);
-        assert_eq!(app.filter, "Tessera");
+        assert_eq!(app.work_filter, "Tessera");
         ctx.memory_mut(|m| m.surrender_focus(egui::Id::new("work-filter")));
         app.rename = Some(WorkspaceRename {
             workspace: app.saved.workspaces[0].task.id,
@@ -9476,6 +9736,240 @@ mod render_tests {
             vec![key_event(Key::Escape, Some(Key::Escape), Modifiers::NONE)],
         );
         assert!(app.overview);
+    }
+
+    #[test]
+    fn work_creation_search_and_specification_journey_preserves_context() {
+        let ctx = egui::Context::default();
+        configure_appearance(&ctx, false);
+        let mut app = fixture(0);
+        app.saved.work_version = 1;
+        app.work_filter = "no match".into();
+        app.open_commands(CommandPage::Commands);
+        assert_eq!(app.work_filter, "no match");
+        app.filter = "Settings".into();
+        app.palette = false;
+        let frame = |app: &mut App, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(640.0, 500.0))),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| app.overview(ui));
+                },
+            )
+        };
+        frame(&mut app, vec![]);
+        let out = frame(&mut app, vec![]);
+        let pos = out
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text) if text.galley.text() == "New work" => {
+                    Some(text.pos + Vec2::splat(5.0))
+                }
+                _ => None,
+            })
+            .unwrap();
+        for pressed in [true, false] {
+            frame(
+                &mut app,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        assert!(
+            app.work_filter.is_empty(),
+            "creation must reveal the new item"
+        );
+        assert_eq!(app.filter, "Settings", "command search stays independent");
+        assert_eq!(app.saved.work_items.len(), 1);
+        let id = app.saved.work_items[0].id;
+        assert_eq!(app.selected_work, Some(id));
+        assert!(app.overview_inspector);
+        assert!(ctx.memory(|m| m.has_focus(egui::Id::new(("work-title", id)))));
+        assert_eq!(
+            app.work_action_label(&app.saved.work_items[0]),
+            "Create specification"
+        );
+        app.work_action(id);
+        let spec = app.selected_spec;
+        assert!(app.specifications_view);
+        assert_eq!(app.saved.specifications.len(), 1);
+        app.specifications_view = false;
+        app.work_action(id);
+        assert_eq!(app.selected_spec, spec);
+        assert_eq!(
+            app.saved.specifications.len(),
+            1,
+            "reopening must reuse the specification"
+        );
+        app.saved.work_items[0].set_disposition(WorkDisposition::Completed);
+        assert_eq!(app.work_status(&app.saved.work_items[0]), "Completed");
+    }
+
+    #[test]
+    fn work_keyboard_selection_scrolls_into_view_in_both_themes() {
+        for light in [false, true] {
+            let ctx = egui::Context::default();
+            configure_appearance(&ctx, light);
+            let mut app = fixture(0);
+            app.saved.work_version = 1;
+            app.category = 1;
+            app.saved.work_items = (0..100)
+                .map(|n| WorkItem::new(format!("Task {n:03}"), "/tmp/project".into()))
+                .collect();
+            let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(640.0, 400.0));
+            let frame = |app: &mut App, events| {
+                ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(screen),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| app.overview(ui));
+                    },
+                )
+            };
+            frame(&mut app, vec![]);
+            for _ in 0..20 {
+                frame(
+                    &mut app,
+                    vec![key_event(Key::ArrowDown, None, Modifiers::NONE)],
+                );
+                frame(
+                    &mut app,
+                    vec![egui::Event::Key {
+                        key: Key::ArrowDown,
+                        physical_key: None,
+                        pressed: false,
+                        repeat: false,
+                        modifiers: Modifiers::NONE,
+                    }],
+                );
+            }
+            assert_eq!(app.selected_work, Some(app.saved.work_items[20].id));
+            let out = frame(&mut app, vec![]);
+            let title = out
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::epaint::Shape::Text(text) if text.galley.text() == "Task 020" => Some((
+                        shape.clip_rect,
+                        text.galley.rect.translate(text.pos.to_vec2()),
+                    )),
+                    _ => None,
+                })
+                .expect("keyboard-selected row must be rendered");
+            assert!(
+                title.0.contains_rect(title.1),
+                "selected title must be visible"
+            );
+            assert!(screen.contains_rect(title.1));
+            let positions: Vec<_> = out
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::epaint::Shape::Text(text) if text.galley.text().starts_with("Task ") => {
+                        Some(text.pos.y)
+                    }
+                    _ => None,
+                })
+                .collect();
+            for pair in positions.windows(2) {
+                assert!(
+                    (pair[1] - pair[0] - 139.0).abs() < 1.0,
+                    "virtual row stride must match actual row height: {positions:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn work_activity_action_reveals_the_selected_session_in_a_short_window() {
+        let ctx = egui::Context::default();
+        configure_appearance(&ctx, false);
+        let mut app = fixture(1);
+        app.saved.ensure_work();
+        app.category = 2;
+        app.saved.sessions[0].state = SessionState::Disconnected;
+        let id = app.saved.sessions[0].work_id.unwrap();
+        app.work_action(id);
+        let mut output = None;
+        for step in 0..10 {
+            output = Some(ctx.run(
+                egui::RawInput {
+                    time: Some(step as f64 * 0.1),
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(640.0, 400.0))),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| app.overview(ui));
+                },
+            ));
+        }
+        assert!(app.reveal_session.is_none());
+        let out = output.unwrap();
+        let heading = out
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text) if text.galley.text() == "SESSION CONTEXT" => {
+                    Some((
+                        shape.clip_rect,
+                        text.galley.rect.translate(text.pos.to_vec2()),
+                    ))
+                }
+                _ => None,
+            })
+            .expect("activity action must reveal the inspector");
+        assert!(
+            heading.0.contains_rect(heading.1),
+            "session details must be visible after the action"
+        );
+    }
+
+    #[test]
+    fn work_status_explains_activity_without_claiming_completion() {
+        let mut app = fixture(1);
+        app.saved.ensure_work();
+        let index = app
+            .saved
+            .work_items
+            .iter()
+            .position(|w| Some(w.id) == app.saved.sessions[0].work_id)
+            .unwrap();
+        app.saved.work_items[index].keep_active = true;
+        app.saved.sessions[0].history.clear();
+        for (state, label) in [
+            (SessionState::Permission, "Permission needed"),
+            (SessionState::Input, "Input needed"),
+            (SessionState::Running, "Running"),
+            (SessionState::Unknown, "Activity unavailable"),
+            (SessionState::Disconnected, "Disconnected"),
+            (SessionState::Idle, "Response finished"),
+        ] {
+            app.saved.sessions[0].state = state;
+            assert_eq!(app.work_status(&app.saved.work_items[index]), label);
+            assert_eq!(
+                app.work_action_label(&app.saved.work_items[index]),
+                "View activity"
+            );
+            assert_eq!(
+                app.saved.work_items[index].disposition,
+                WorkDisposition::Active
+            );
+        }
     }
 
     #[test]
@@ -9570,7 +10064,7 @@ mod render_tests {
             "empty filter must not retain unrelated session context"
         );
         assert!(out.shapes.iter().any(|shape| matches!(&shape.shape,
-            egui::epaint::Shape::Text(text) if text.galley.text() == "No work in this view")));
+            egui::epaint::Shape::Text(text) if text.galley.text() == "No active work")));
     }
     #[test]
     fn overview_hundred_session_workload() {
