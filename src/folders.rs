@@ -267,10 +267,6 @@ fn discover(request: &Request, cancelled: &impl Fn() -> bool) -> Response {
     let query = query.to_lowercase();
     let mut paths = HashSet::new();
     let mut notes = Vec::new();
-    platform::indexed(&query, &mut paths, &mut notes, cancelled);
-    if cancelled() {
-        return response;
-    }
     let mut roots = Vec::new();
     for root in request.roots.iter().take(MAX_ROOTS) {
         match existing_directory(root) {
@@ -283,6 +279,15 @@ fn discover(request: &Request, cancelled: &impl Fn() -> bool) -> Response {
             "Only the first {MAX_ROOTS} search roots were used."
         ));
     }
+    for root in &roots {
+        if cancelled() || paths.len() >= MAX_RESULTS {
+            break;
+        }
+        platform::indexed(&query, root, &mut paths, &mut notes, cancelled);
+    }
+    if cancelled() {
+        return response;
+    }
     let stats = search_roots(&roots, &query, &mut paths, Limits::default(), cancelled);
     if stats.limited {
         notes.push("Search limit reached. Narrow the name, choose a more specific search root, or paste a path.".into());
@@ -293,7 +298,7 @@ fn discover(request: &Request, cancelled: &impl Fn() -> bool) -> Response {
             stats.inaccessible
         ));
     }
-    notes.push(format!("Fallback searches {} root(s), up to 6 levels and 20,000 entries. Hidden and dependency/build folders are skipped; paste a path to open one.", roots.len()));
+    notes.push(format!("Search is limited to {} root(s). Fallback scans up to 6 levels and 20,000 entries. Hidden and dependency/build folders are skipped; paste a path to open one.", roots.len()));
     response.results = paths.into_iter().map(FolderResult::new).collect();
     response.results.sort_by_cached_key(|folder| {
         let name = folder.name.to_lowercase();
@@ -445,7 +450,14 @@ fn search_roots(
 mod platform {
     use super::*;
 
-    pub fn indexed(_: &str, _: &mut HashSet<PathBuf>, _: &mut Vec<String>, _: &impl Fn() -> bool) {}
+    pub fn indexed(
+        _: &str,
+        _: &Path,
+        _: &mut HashSet<PathBuf>,
+        _: &mut Vec<String>,
+        _: &impl Fn() -> bool,
+    ) {
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -463,14 +475,24 @@ mod platform {
         format!("kMDItemContentTypeTree == \"public.folder\" && kMDItemFSName == \"*{escaped}*\"cd")
     }
 
+    fn search_command(query: &str, root: &Path) -> Command {
+        let mut command = Command::new("/usr/bin/mdfind");
+        command
+            .arg("-0")
+            .arg("-onlyin")
+            .arg(root)
+            .arg(predicate(query));
+        command
+    }
+
     pub fn indexed(
         query: &str,
+        root: &Path,
         results: &mut HashSet<PathBuf>,
         notes: &mut Vec<String>,
         cancelled: &impl Fn() -> bool,
     ) {
-        let mut child = match Command::new("/usr/bin/mdfind")
-            .args(["-0", &predicate(query)])
+        let mut child = match search_command(query, root)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -522,9 +544,10 @@ mod platform {
                             PathBuf::from(OsString::from_vec(pending.drain(..end).collect()));
                         pending.remove(0);
                         candidates += 1;
-                        if !path
-                            .components()
-                            .any(|part| excluded(Path::new(part.as_os_str())))
+                        if path.starts_with(root)
+                            && !path
+                                .components()
+                                .any(|part| excluded(Path::new(part.as_os_str())))
                             && matches_name(&path, query)
                             && path.is_dir()
                         {
@@ -574,7 +597,7 @@ mod platform {
             } else if limited {
                 "Spotlight search was bounded; more indexed matches may exist."
             } else {
-                "Spotlight searched indexed locations; unindexed folders rely on search roots."
+                "Spotlight searched within the configured root; unindexed folders rely on bounded search."
             }
             .into(),
         );
@@ -583,6 +606,17 @@ mod platform {
     #[cfg(test)]
     mod tests {
         use super::*;
+        #[test]
+        fn spotlight_command_is_limited_to_the_selected_root() {
+            let root = Path::new("/Users/example/projects/My Work");
+            let command = search_command("folder", root);
+            let args: Vec<_> = command.get_args().collect();
+            assert_eq!(args[0], "-0");
+            assert_eq!(args[1], "-onlyin");
+            assert_eq!(args[2], root.as_os_str());
+            assert_eq!(args[3], predicate("folder").as_str());
+        }
+
         #[test]
         fn spotlight_query_quotes_literal_input() {
             assert_eq!(
@@ -601,6 +635,33 @@ mod tests {
         let mut results = HashSet::new();
         let stats = search_roots(&[root.to_owned()], query, &mut results, limits, &|| false);
         (results, stats)
+    }
+
+    #[test]
+    fn discovery_stays_inside_configured_roots_and_reports_invalid_roots() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("selected");
+        let inside = root.join("tessera-scope-match");
+        let outside = parent.path().join("tessera-scope-match");
+        std::fs::create_dir_all(&inside).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let mut request = Request {
+            generation: 1,
+            query: "tessera-scope-match".into(),
+            roots: vec![root.to_string_lossy().into_owned()],
+            ready_at: Instant::now(),
+        };
+        let response = discover(&request, &|| false);
+        assert_eq!(response.results, vec![FolderResult::new(inside)]);
+        request.roots = vec![parent.path().join("missing").to_string_lossy().into_owned()];
+        let response = discover(&request, &|| false);
+        assert!(response.results.is_empty());
+        assert!(response.notice.unwrap().contains("Cannot open"));
+        request.query = outside.to_string_lossy().into_owned();
+        assert_eq!(
+            discover(&request, &|| false).results,
+            vec![FolderResult::new(outside)]
+        );
     }
 
     #[test]

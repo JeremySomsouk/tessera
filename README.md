@@ -6,7 +6,7 @@ A native terminal workspace for supervising Claude Code and Codex sessions.
 
 Run your usual shell in resizable panes. Open **Work** to see which piece of work needs a decision, inspect its linked Claude Code or Codex sessions, and return to the same terminal to act.
 
-**0.8.1** keeps unnamed workspace titles in sync with the focused terminal's current folder and preserves readable prefixes when long titles are shortened. Explicit workspace names stay fixed. [Release notes](docs/releases/0.8.1.md)
+**0.9.0** makes Work easier to browse and act on, and adds configurable roots directly to Claude in folder so folder-name searches stay within your chosen directories. [Release notes](docs/releases/0.9.0.md)
 
 ## Install
 
@@ -47,7 +47,7 @@ Open local agents also appear before hooks arrive, labelled **Untracked** until 
 
 Use **Terminal** and **Work** to switch views. **+ Workspace** opens a directory, creating it if needed. The optional name sets the workspace label. **Commands** searches workspaces and actions; Up/Down select, Enter opens, Escape closes. The **Pane** menu groups split and maximize controls. **Settings** holds appearance, folder search roots, terminal behavior, and updates.
 
-Choose **Claude in folder** to search existing folders by name, select a result, and press Enter to open a focused terminal running `claude` there. Results include full paths; pasting an existing directory path also works. No project registration, specification, or manual work item is required. On macOS, Spotlight searches indexed folders across your Mac, with a bounded search of configurable roots for indexing gaps. Linux uses those roots, starting with your home folder. Search never creates missing directories. [Search coverage and controls](docs/usage.md)
+Choose **Claude in folder** to search existing folders by name, select a result, and press Enter to open a focused terminal running `claude` there. Results include full paths; pasting an existing directory path also works. No project registration, specification, or manual work item is required. Configure **Search roots** directly on this page or in Settings to limit folder-name searches to those folders and their subfolders. One root per line is supported; an empty setting uses your home folder. On macOS, Spotlight and the bounded fallback both stay within these roots. Linux uses the bounded search. Pasting an exact directory path can still open a folder outside the search roots. Search never creates missing directories. [Search coverage and controls](docs/usage.md)
 
 On macOS, use Cmd below. On Linux, replace Cmd with Ctrl+Alt.
 
