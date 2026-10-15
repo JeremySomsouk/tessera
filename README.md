@@ -6,7 +6,7 @@ A native terminal workspace for supervising Claude Code and Codex sessions.
 
 Run your usual shell in resizable panes. Open **Work** to see which piece of work needs a decision, inspect its linked Claude Code or Codex sessions, and return to the same terminal to act.
 
-**0.8.0** adds folder search for launching Claude Code and a clearer terminal interface, with stronger focus indicators, consistent themes, and easier access to pane controls and Settings. [Release notes](docs/releases/0.8.0.md)
+**0.8.1** keeps unnamed workspace titles in sync with the focused terminal's current folder and preserves readable prefixes when long titles are shortened. Explicit workspace names stay fixed. [Release notes](docs/releases/0.8.1.md)
 
 ## Install
 
