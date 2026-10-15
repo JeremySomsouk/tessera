@@ -52,11 +52,27 @@ impl App {
         }
     }
 
+    fn record_workspace_folder(&mut self, index: usize) {
+        let Some(workspace) = self.saved.workspaces.get(index) else {
+            return;
+        };
+        let path = self
+            .panes
+            .get(&workspace.focus)
+            .and_then(|pane| pane.terminal.current_directory().ok())
+            .or_else(|| crate::directories::resolve(&workspace.task.directory).ok());
+        if let Some(path) = path {
+            self.saved.record_folder_open(path);
+            self.dirty = true;
+        }
+    }
+
     pub(super) fn focus_workspace(&mut self, index: usize) {
         let workspace = &self.saved.workspaces[index];
         let id = workspace.task.id;
         let owner = self.workspace_window(id);
         if owner == self.current_window {
+            self.record_workspace_folder(index);
             self.ui.active = index;
             self.ui.overview = false;
             self.ui.specifications_view = false;
@@ -67,6 +83,7 @@ impl App {
             window.ui.specifications_view = false;
             window.ui.maximized = false;
             self.pending_focus = Some(id);
+            self.record_workspace_folder(index);
         }
     }
 

@@ -252,6 +252,8 @@ struct Saved {
     clickable_codex_choices: bool,
     #[serde(default = "crate::folders::default_roots")]
     folder_search_roots: Vec<String>,
+    #[serde(default)]
+    recent_folders: Vec<PathBuf>,
 }
 
 impl Default for Saved {
@@ -269,10 +271,17 @@ impl Default for Saved {
             skip_stop_confirmation: false,
             clickable_codex_choices: default_clickable_choices(),
             folder_search_roots: crate::folders::default_roots(),
+            recent_folders: Vec::new(),
         }
     }
 }
 impl Saved {
+    fn record_folder_open(&mut self, path: PathBuf) {
+        self.recent_folders.retain(|previous| previous != &path);
+        self.recent_folders.insert(0, path);
+        self.recent_folders.truncate(80);
+    }
+
     fn work_is_history(&self, work: &WorkItem) -> bool {
         if work.disposition != WorkDisposition::Active {
             return true;
@@ -742,6 +751,7 @@ impl App {
         if !self.spawn(id, ctx, &directory) {
             return false;
         }
+        self.saved.record_folder_open(PathBuf::from(&directory));
         let title = workspace_folder_title(std::path::Path::new(&directory));
         self.saved.workspaces.push(Workspace {
             task: Task {
@@ -1310,7 +1320,7 @@ impl App {
         if let Some(slot) =
             ctx.input_mut(|input| workspace_shortcut(input, command, workspaces.len()))
         {
-            self.ui.active = workspaces[slot];
+            self.focus_workspace(workspaces[slot]);
             self.ui.overview = false;
             self.ui.specifications_view = false;
             self.ui.palette = false;
@@ -2331,6 +2341,7 @@ impl App {
         pane_action: &mut Option<(Uuid, &'static str)>,
     ) {
         let mut detach = None;
+        let mut focus = None;
         for (slot, index) in self.window_workspaces().into_iter().enumerate() {
             let w = &self.saved.workspaces[index];
             let selected =
@@ -2398,7 +2409,7 @@ impl App {
                 ] {
                     if ui.button(shortcut(action, keys)).clicked() {
                         *pane_action = Some((w.focus, action));
-                        self.ui.active = index;
+                        focus = Some(index);
                         self.ui.overview = false;
                         self.ui.specifications_view = false;
                         self.ui.maximized = false;
@@ -2410,11 +2421,14 @@ impl App {
                 *pane_action = Some((w.focus, "Stop terminal"));
             }
             if response.clicked() {
-                self.ui.active = index;
+                focus = Some(index);
                 self.ui.overview = false;
                 self.ui.specifications_view = false;
                 self.ui.maximized = false;
             }
+        }
+        if let Some(index) = focus {
+            self.focus_workspace(index);
         }
         if let Some(workspace) = detach {
             self.detach_workspace(ui.ctx(), workspace, None);
@@ -2824,6 +2838,21 @@ impl App {
             .collect();
         search.set_query(&self.ui.folder_query, &roots);
         if search.poll() {
+            let ranking_roots = if roots.is_empty() {
+                crate::folders::default_roots()
+            } else {
+                roots.clone()
+            };
+            let paths: Vec<_> = ranking_roots
+                .iter()
+                .filter_map(|root| crate::directories::resolve(root).ok())
+                .collect();
+            crate::folders::rank_results(
+                &mut search.results,
+                &paths,
+                &self.ui.folder_query,
+                &self.saved.recent_folders,
+            );
             self.ui.command_index = 0;
         }
         let count = search.results.len();
@@ -2958,6 +2987,7 @@ impl App {
                     self.ui.folder_error = Some("Workspace/pane limit (32) reached while launching. Close a terminal and try again.".into());
                     return;
                 }
+                self.saved.record_folder_open(path.clone());
                 let directory = path.to_string_lossy().into_owned();
                 self.saved.workspaces.push(Workspace {
                     task: Task {
@@ -6379,6 +6409,46 @@ mod render_tests {
             direct_launches: HashMap::new(),
         }
     }
+    #[test]
+    fn focusing_existing_workspace_refreshes_folder_recency() {
+        let mut app = fixture(2);
+        app.saved.workspaces[0].task.directory = "/tmp/first".into();
+        app.saved.workspaces[1].task.directory = "/tmp/second".into();
+        app.focus_workspace(0);
+        app.focus_workspace(1);
+        app.focus_workspace(0);
+        assert_eq!(
+            app.saved.recent_folders,
+            vec![PathBuf::from("/tmp/first"), PathBuf::from("/tmp/second")]
+        );
+        assert!(app.dirty);
+    }
+
+    #[test]
+    fn regular_workspace_open_updates_persisted_folder_recency() {
+        let ctx = egui::Context::default();
+        let mut app = fixture(0);
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        for path in [&first, &second, &first] {
+            assert!(app.add_workspace_in(&ctx, path.to_string_lossy().into_owned()));
+        }
+        assert_eq!(
+            app.saved.recent_folders,
+            vec![first.clone(), second.clone()]
+        );
+        assert!(!app.add_workspace_in(
+            &ctx,
+            root.path().join("missing").to_string_lossy().into_owned()
+        ));
+        let restored: Saved =
+            serde_json::from_slice(&serde_json::to_vec(&app.saved).unwrap()).unwrap();
+        assert_eq!(restored.recent_folders, vec![first, second]);
+    }
+
     #[test]
     fn folder_roots_editor_saves_custom_paths() {
         let ctx = egui::Context::default();

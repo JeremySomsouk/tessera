@@ -279,6 +279,7 @@ fn discover(request: &Request, cancelled: &impl Fn() -> bool) -> Response {
             "Only the first {MAX_ROOTS} search roots were used."
         ));
     }
+    let stats = search_roots(&roots, &query, &mut paths, Limits::default(), cancelled);
     for root in &roots {
         if cancelled() || paths.len() >= MAX_RESULTS {
             break;
@@ -288,7 +289,6 @@ fn discover(request: &Request, cancelled: &impl Fn() -> bool) -> Response {
     if cancelled() {
         return response;
     }
-    let stats = search_roots(&roots, &query, &mut paths, Limits::default(), cancelled);
     if stats.limited {
         notes.push("Search limit reached. Narrow the name, choose a more specific search root, or paste a path.".into());
     }
@@ -300,18 +300,38 @@ fn discover(request: &Request, cancelled: &impl Fn() -> bool) -> Response {
     }
     notes.push(format!("Search is limited to {} root(s). Fallback scans up to 6 levels and 20,000 entries. Hidden and dependency/build folders are skipped; paste a path to open one.", roots.len()));
     response.results = paths.into_iter().map(FolderResult::new).collect();
-    response.results.sort_by_cached_key(|folder| {
+    rank_results(&mut response.results, &roots, &query, &[]);
+    response.results.truncate(MAX_RESULTS);
+    response.notice = Some(notes.join(" "));
+    response
+}
+
+pub fn rank_results(
+    results: &mut [FolderResult],
+    roots: &[PathBuf],
+    query: &str,
+    recent: &[PathBuf],
+) {
+    let query = query.trim().to_lowercase();
+    results.sort_by_cached_key(|folder| {
         let name = folder.name.to_lowercase();
         (
+            roots
+                .iter()
+                .filter_map(|root| folder.path.strip_prefix(root).ok())
+                .map(|relative| relative.components().count())
+                .min()
+                .unwrap_or(usize::MAX),
+            recent
+                .iter()
+                .position(|path| path == &folder.path)
+                .unwrap_or(usize::MAX),
             name != query,
             !name.starts_with(&query),
             name,
             folder.path.clone(),
         )
     });
-    response.results.truncate(MAX_RESULTS);
-    response.notice = Some(notes.join(" "));
-    response
 }
 
 #[derive(Clone, Copy)]
@@ -661,6 +681,70 @@ mod tests {
         assert_eq!(
             discover(&request, &|| false).results,
             vec![FolderResult::new(outside)]
+        );
+    }
+
+    #[test]
+    fn recent_folders_break_ties_without_promoting_nested_matches() {
+        let roots = vec![PathBuf::from("/projects")];
+        let mut results: Vec<_> = [
+            "/projects/project",
+            "/projects/project-z",
+            "/projects/other/project",
+        ]
+        .into_iter()
+        .map(|path| FolderResult::new(path.into()))
+        .collect();
+        rank_results(
+            &mut results,
+            &roots,
+            "project",
+            &[
+                PathBuf::from("/projects/other/project"),
+                PathBuf::from("/projects/project-z"),
+            ],
+        );
+        assert_eq!(
+            results
+                .iter()
+                .map(|folder| folder.path.as_path())
+                .collect::<Vec<_>>(),
+            vec![
+                Path::new("/projects/project-z"),
+                Path::new("/projects/project"),
+                Path::new("/projects/other/project")
+            ]
+        );
+    }
+
+    #[test]
+    fn discovery_ranks_direct_matches_before_nested_matches() {
+        let root = tempfile::tempdir().unwrap();
+        for directory in ["project-z/project-a", "project", "other/project"] {
+            std::fs::create_dir_all(root.path().join(directory)).unwrap();
+        }
+        let response = discover(
+            &Request {
+                generation: 1,
+                query: "project".into(),
+                roots: vec![root.path().to_string_lossy().into_owned()],
+                ready_at: Instant::now(),
+            },
+            &|| false,
+        );
+        let paths: Vec<_> = response
+            .results
+            .into_iter()
+            .map(|folder| folder.path)
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                root.path().join("project"),
+                root.path().join("project-z"),
+                root.path().join("other/project"),
+                root.path().join("project-z/project-a"),
+            ]
         );
     }
 
