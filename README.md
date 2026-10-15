@@ -6,7 +6,7 @@ A native terminal workspace for supervising Claude Code and Codex sessions.
 
 Run your usual shell in resizable panes. Open **Work** to see which piece of work needs a decision, inspect its linked Claude Code or Codex sessions, and return to the same terminal to act.
 
-**0.9.0** makes Work easier to browse and act on, and adds configurable roots directly to Claude in folder so folder-name searches stay within your chosen directories. [Release notes](docs/releases/0.9.0.md)
+**0.10.0** lets you drag workspace tabs into new windows at the drop point, preserving running shells and split panes. Moving the last tab out closes its source window. [Release notes](docs/releases/0.10.0.md)
 
 ## Install
 
@@ -58,6 +58,7 @@ On macOS, use Cmd below. On Linux, replace Cmd with Ctrl+Alt.
 | Settings | Cmd+, |
 | Work / previous terminal | Cmd+Shift+O |
 | New workspace in the current directory | Cmd+N or Cmd+T |
+| New terminal window in the current directory | Cmd+Shift+T |
 | Split side by side / stacked | Cmd+D / Cmd+Shift+D |
 | Focus neighboring split pane | Cmd+← / → / ↑ / ↓ |
 | Maximize / restore pane | Cmd+Shift+Enter |
@@ -86,7 +87,7 @@ The editor lists launches, pinned revisions and exit results. Agent terminals re
 
 Preferences, bounded work items, specifications and session histories are saved locally. Every launch opens a fresh terminal; previous tabs and splits are not restored. Retained work does not reconnect old processes. Quitting stops hosted shells.
 
-The macOS app downloads signed updates and installs them when you quit. On Linux, rerun the installer. Tessera is still an alpha: one window, local sessions, and an initial terminal renderer. [Terminal compatibility](docs/terminal-compatibility.md) · [Updates](docs/updates.md)
+The macOS app downloads signed updates and installs them when you quit. On Linux, rerun the installer. Tessera is still an alpha with local sessions and an initial terminal renderer. Windows share one app process; closing a window stops only its terminals, and closing the final window quits the app. [Terminal compatibility](docs/terminal-compatibility.md) · [Updates](docs/updates.md)
 
 ## Development
 

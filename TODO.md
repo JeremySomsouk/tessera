@@ -19,7 +19,8 @@
 - [ ] Additional font/key configuration and native font fallback.
 - [ ] Mouse wheel/motion/keypad/function-key coverage, IME preedit and accessibility.
 - [ ] Saved layout recipes, pane moves, workspace close/archive, layout undo.
-- [ ] Durable host process, detach/move/stop choices, reconnect protocol and multiple windows.
+- [x] Move workspace tabs into separate windows while preserving running terminals and splits.
+- [ ] Durable host process, external detach/reconnect protocol, and process-restart survival.
 - [x] Durable work context, session grouping, explicit developer stages and an attention queue.
 - [ ] Branch/worktree metadata, bookmark/excerpt inspector and verification receipts.
 - [ ] Explicit unknown/stale tracking freshness and optional remote helper.

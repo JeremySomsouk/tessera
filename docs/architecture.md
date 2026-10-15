@@ -17,7 +17,9 @@ The spike demonstrated real shell I/O and resizing, ANSI/alternate-screen parsin
 - `ui.rs`: workspace split tree, terminal painting/input, Work queue and inspector, nested specification editing, and background persistence.
 - `main.rs`: native app and integration CLI. No agent can invoke application actions through terminal escape sequences.
 
-The current host is independent of view selection but **not of the application process**. A daemon/protocol boundary must be introduced before claiming window-restart survival or detach/reconnect. macOS paths and packaging are small adapters; PTY/model/layout code is usable on Unix. Credentials/connectors are intentionally absent.
+Terminal windows use immediate egui viewports in one application process. `ui/windows.rs` assigns each workspace to a window and keeps selection, navigation, and dialogs local to that window. Moving a workspace changes its window assignment without replacing its PTYs, split layout, or session identities. Work records, preferences, event ingestion, resource limits, and persistence remain shared. Workspace number shortcuts are local; Commands and Work links focus the owning window. The original egui viewport remains an invisible event-loop host if its last tab moves away while other windows remain. Closing a window stops only its own panes; closing the final window exits the process. Immediate viewports repaint together, trading some rendering work for direct access to the shared terminal state.
+
+The current host is independent of view selection but **not of the application process**. A daemon/protocol boundary must be introduced before claiming application-restart survival or external detach/reconnect. macOS paths and packaging are small adapters; PTY/model/layout code is usable on Unix. Credentials/connectors are intentionally absent.
 
 ## Folder search and direct launch
 
