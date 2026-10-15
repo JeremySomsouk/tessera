@@ -1,12 +1,38 @@
-![Tessera — tiled T identity and terminal pane mosaic](assets/tessera-banner.png)
+![Tessera: terminal workspaces for Claude Code and Codex](assets/tessera-banner.png)
 
 # Tessera
 
-A native terminal workspace for supervising Claude Code and Codex sessions.
+**Manage your work across Claude Code and Codex sessions.**
 
-Run your usual shell in resizable panes. Open **Work** to see which piece of work needs a decision, inspect its linked Claude Code or Codex sessions, and return to the same terminal to act.
+See which task needs a decision, keep related agent sessions together, and carry specifications and work stages beyond a single terminal session. Tessera brings that context into a native terminal workspace, so you can return to the CLI to review, approve, and act.
 
-**0.9.0** makes Work easier to browse and act on, and adds configurable roots directly to Claude in folder so folder-name searches stay within your chosen directories. [Release notes](docs/releases/0.9.0.md)
+[Download](https://github.com/JeremySomsouk/tessera/releases) · [Getting started](#install) · [Documentation](docs/usage.md) · [Release notes](docs/releases/0.9.0.md)
+
+Tessera runs on **macOS and Linux**, on Intel/AMD and ARM64. Built with Rust, with no browser runtime. Current version: **0.9.0 (alpha)**.
+
+## A look inside
+
+### Know which work needs you next
+
+Work groups a task's directory, stage, specifications, and related sessions. Attention indicators help surface permission requests, input requests, and responses waiting for inspection. Move between Define, Plan, Build, Verify, Review, and Deliver yourself: an agent finishing a response does not mean the work is done.
+
+![Tessera 0.9.0 Work view with fictional Atlas, Fieldnotes, and Orbit projects](assets/screenshots/work.png)
+
+### Act in the terminal you already use
+
+Return to the linked terminal to respond to an agent or inspect its output. Run your usual shell in resizable panes, switch between project workspaces, and search terminal output. You can start with terminal multitasking and add work tracking as you need it.
+
+![Tessera 0.9.0 terminal workspace showing a fictional Atlas keyboard-navigation task](assets/screenshots/terminal.png)
+
+*Screenshots show the actual macOS app with fictional projects and sample terminal text. No private session content is included. The terminal example is an illustrative task brief, not a live agent response.*
+
+## Why Tessera
+
+- **Work across agent sessions.** Group related Claude Code and Codex sessions around a shared task, with its directory, stage, and specification.
+- **A clear next decision.** See agent activity and work stages without treating an agent's finished response as accepted work.
+- **Local specifications.** Draft Markdown scope, save immutable revisions, and launch an implementation with a pinned revision.
+- **Quick project access.** Open Claude in an existing folder with configurable search roots, or use the command picker to switch workspaces.
+- **Local work history.** Keep task context and specifications after a terminal closes or the app restarts.
 
 ## Install
 
@@ -45,9 +71,9 @@ Open local agents also appear before hooks arrive, labelled **Untracked** until 
 
 ## Everyday use
 
-Use **Terminal** and **Work** to switch views. **+ Workspace** opens a directory, creating it if needed. The optional name sets the workspace label. **Commands** searches workspaces and actions; Up/Down select, Enter opens, Escape closes. The **Pane** menu groups split and maximize controls. **Settings** holds appearance, folder search roots, terminal behavior, and updates.
+Use **Terminal** for shells and **Work** for task context. **+ Workspace** opens a directory. **Commands** finds workspaces and actions; **Pane** groups split and maximize controls. **Settings** holds appearance, folder search roots, terminal behavior, and updates.
 
-Choose **Claude in folder** to search existing folders by name, select a result, and press Enter to open a focused terminal running `claude` there. Results include full paths; pasting an existing directory path also works. No project registration, specification, or manual work item is required. Configure **Search roots** directly on this page or in Settings to limit folder-name searches to those folders and their subfolders. One root per line is supported; an empty setting uses your home folder. On macOS, Spotlight and the bounded fallback both stay within these roots. Linux uses the bounded search. Pasting an exact directory path can still open a folder outside the search roots. Search never creates missing directories. [Search coverage and controls](docs/usage.md)
+**Claude in folder** searches existing folders by name and opens a terminal running `claude`. Configure **Search roots** there or in Settings to keep folder-name searches within selected directories. Pasting an exact existing path also works, including outside those roots.
 
 On macOS, use Cmd below. On Linux, replace Cmd with Ctrl+Alt.
 
@@ -66,29 +92,23 @@ On macOS, use Cmd below. On Linux, replace Cmd with Ctrl+Alt.
 | Next session needing attention | Cmd+Shift+N |
 | Stop focused pane | Cmd+W |
 
-On macOS, Command+Enter sends a line feed (the same as Ctrl+J) to insert a newline in Claude Code without submitting. Plain Enter still submits. Middle-click a workspace tab to stop its focused terminal using the existing close-confirmation setting.
+On macOS, Cmd+Enter inserts a newline in Claude Code without submitting. Drag to select terminal text; right-click for copy, paste, and search actions. [Full controls and keyboard reference](docs/usage.md)
 
-Drag terminal text to select it; right-click for copy, paste, new-tab, or browser-search actions. Drop a saved file to paste its path. Neither action submits a command for you. [Full controls and keyboard reference](docs/usage.md)
+## Specifications and agent launches
 
-## Work and specifications
+Select a work item to add a specification, edit its Markdown scope, and save a revision. Choose Claude or Codex, inspect the launch context, then use **Launch implementation** to start a new agent terminal in that directory. Launches remain linked to their pinned revision.
 
-Work keeps the developer stage separate from agent activity. Choose Define, Plan, Build, Verify, Review or Deliver explicitly. Completed and archived work moves to History; changing a stage does not certify tests, review or delivery. Attention prioritizes observed permission/input requests and uninspected response endings. Raw hook events remain available under tracking details.
+Stages are yours to change. Launching an agent does not advance a stage, and a finished response does not complete or accept the work. Approvals stay in the real CLI. [Work and specification guide](docs/usage.md)
 
-Ordinary Claude Code and Codex sessions receive lightweight work context. Attach related sessions to the same work item when they share a purpose; sessions in a single terminal workspace can belong to different work. Work titles, directories, stages, specification links and session associations survive terminal closure and application restart. An observed response ending never advances a stage or completes the work automatically.
+## Local data and current limits
 
-Select a work item and use **Add specification** or **Open specification and revisions** to prepare local Markdown scope. Edit the title, working directory, and scope; **Save revision** retains an immutable snapshot. Revision history remains available after later edits. Cmd+Shift+S (Ctrl+Alt+Shift+S on Linux) opens specification editing through Work.
+Preferences, work items, specifications, and bounded session histories are saved locally. Lifecycle tracking records events and tool names, not prompts or transcripts. Specification text is sent to the selected agent when you launch it.
 
-Choose Claude or Codex and inspect the exact launch context. **Launch implementation** saves the current revision and starts the agent in a new PTY in the working directory. This launcher explicitly requests implementation; use the terminal for investigation, planning, verification and review. Launching does not change the work stage. Codex uses `--no-daemon`. The command is passed as a quoted literal through an interactive login shell (`$SHELL` for sh/bash/zsh, `/bin/sh` otherwise); the agent executable must be available in that shell's PATH. Hooks and approvals behave as in ordinary agent terminals.
+Tessera is an alpha. It currently supports one window and local sessions. Each app launch opens a fresh terminal; previous tabs and splits are not restored, and retained work does not reconnect old processes. Quitting stops hosted shells. See [terminal compatibility](docs/terminal-compatibility.md) for renderer limitations.
 
-The editor lists launches, pinned revisions and exit results. Agent terminals retain their output after exit until explicitly closed; failed launches show an error. Work links sessions back to their launch specification and pinned revision. Agent completion never accepts the specification automatically. Specifications, revision text, and launch links are stored locally with preferences; they are sent to the selected agent only on launch. Launch context is limited to 8000 bytes, with up to 256 revisions and launches per specification. GitHub/Jira import and agent-proposed specification changes are future increments.
+The macOS app downloads signed updates and installs them when you quit. On Linux, rerun the installer. [Update details](docs/updates.md)
 
-## What persists
-
-Preferences, bounded work items, specifications and session histories are saved locally. Every launch opens a fresh terminal; previous tabs and splits are not restored. Retained work does not reconnect old processes. Quitting stops hosted shells.
-
-The macOS app downloads signed updates and installs them when you quit. On Linux, rerun the installer. Tessera is still an alpha: one window, local sessions, and an initial terminal renderer. [Terminal compatibility](docs/terminal-compatibility.md) · [Updates](docs/updates.md)
-
-## Development
+## Build from source
 
 ```sh
 git clone https://github.com/JeremySomsouk/tessera.git
@@ -96,6 +116,12 @@ cd tessera
 cargo run --locked
 ```
 
-Rust stable is required; macOS needs Xcode Command Line Tools and Linux needs native GUI development libraries. [Build, validation, and release guide](docs/development.md)
+Rust stable is required. macOS needs Xcode Command Line Tools; Linux needs native GUI development libraries. [Build, validation, and release guide](docs/development.md)
 
-[Architecture](docs/architecture.md) · [Progress](PROGRESS.md) · [Roadmap](TODO.md) · [MIT license](LICENSE)
+## Documentation
+
+[Installation](docs/installation.md) · [Usage](docs/usage.md) · [Agent integration](docs/integration.md) · [Architecture](docs/architecture.md) · [Roadmap](TODO.md)
+
+## License
+
+Tessera is open source under the [MIT license](LICENSE).
