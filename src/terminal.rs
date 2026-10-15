@@ -3,7 +3,8 @@ use alacritty_terminal::{
     Term,
     event::{Event, EventListener},
     grid::{Dimensions, Scroll},
-    term::{Config, TermMode},
+    index::{Column, Line},
+    term::{Config, TermMode, cell::Flags},
     vte::ansi::{Color, CursorShape, CursorStyle, NamedColor, Processor, Rgb},
 };
 use anyhow::{Context as _, Result, bail};
@@ -105,6 +106,60 @@ fn terminal_config() -> Config {
         ..Default::default()
     }
 }
+pub const SNAPSHOT_MAX_BYTES: usize = 256 * 1024;
+pub const SNAPSHOT_MAX_LINES: usize = 2_000;
+
+/// Rendered text only: persisted output must never pass through the ANSI parser.
+fn snapshot_grid<T: EventListener>(term: &Term<T>) -> String {
+    let grid = term.grid();
+    let first = -(grid.history_size() as i32);
+    let last = grid.screen_lines() as i32;
+    let mut lines = Vec::new();
+    let mut bytes = 0;
+    for row in (first..last).rev() {
+        let mut line = String::new();
+        for column in 0..grid.columns() {
+            let cell = &grid[Line(row)][Column(column)];
+            if cell
+                .flags
+                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+            {
+                continue;
+            }
+            if cell.flags.contains(Flags::HIDDEN) {
+                line.push(' ');
+                continue;
+            }
+            if !cell.c.is_control() {
+                line.push(cell.c);
+            }
+            if let Some(marks) = cell.zerowidth() {
+                line.extend(marks.iter().copied().filter(|c| !c.is_control()));
+            }
+        }
+        line.truncate(line.trim_end().len());
+        if lines.is_empty() && line.is_empty() {
+            continue;
+        }
+        let separator = usize::from(!lines.is_empty());
+        let available = SNAPSHOT_MAX_BYTES.saturating_sub(bytes + separator);
+        if line.len() > available {
+            let mut start = line.len() - available;
+            while !line.is_char_boundary(start) {
+                start += 1;
+            }
+            line.drain(..start);
+        }
+        bytes += line.len() + separator;
+        lines.push(line);
+        if bytes >= SNAPSHOT_MAX_BYTES || lines.len() >= SNAPSHOT_MAX_LINES {
+            break;
+        }
+    }
+    lines.reverse();
+    lines.join("\n")
+}
+
 enum Command {
     Input(Vec<u8>),
     UserInput(Vec<u8>),
@@ -205,6 +260,17 @@ pub struct Terminal {
     launch_directory: PathBuf,
 }
 impl Terminal {
+    pub fn try_snapshot_output(&self) -> Option<String> {
+        self.term.try_lock().ok().map(|term| snapshot_grid(&term))
+    }
+
+    pub fn snapshot_output(&self) -> String {
+        self.term
+            .lock()
+            .map(|term| snapshot_grid(&term))
+            .unwrap_or_default()
+    }
+
     #[cfg(not(test))]
     pub fn spawn(id: Uuid, directory: &Path, socket: &Path, ctx: Context) -> Result<Self> {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| {
@@ -682,6 +748,54 @@ mod tests {
         event::VoidListener,
         index::{Column, Line, Point},
     };
+    #[test]
+    fn snapshot_is_rendered_text_without_control_sequences_or_hidden_content() {
+        let mut term = Term::new(terminal_config(), &Size { cols: 40, rows: 3 }, VoidListener);
+        let mut parser: Processor = Processor::new();
+        parser.advance(
+            &mut term,
+            "old\rnew\x1b[31m 界e\u{301}\x1b[0m\x1b[8msecret\x1b[0m\x1b[6n\x1b]52;c;ZXZpbA==\x07"
+                .as_bytes(),
+        );
+        let text = snapshot_grid(&term);
+        assert_eq!(text, "new 界e\u{301}");
+        assert!(!text.contains('\x1b'));
+        assert!(!text.contains("secret"));
+    }
+
+    #[test]
+    fn snapshot_includes_history_regardless_of_scroll_position_and_bounds_lines() {
+        let mut term = Term::new(terminal_config(), &Size { cols: 40, rows: 3 }, VoidListener);
+        let mut parser: Processor = Processor::new();
+        for index in 0..3_000 {
+            parser.advance(&mut term, format!("line {index}\r\n").as_bytes());
+        }
+        let text = snapshot_grid(&term);
+        assert_eq!(text.lines().count(), SNAPSHOT_MAX_LINES);
+        assert!(text.starts_with("line 1000\n"));
+        assert!(text.ends_with("line 2999"));
+        term.scroll_display(Scroll::Top);
+        assert_eq!(text, snapshot_grid(&term));
+    }
+
+    #[test]
+    fn snapshot_bounds_utf8_bytes_and_retains_latest_output() {
+        let mut term = Term::new(
+            terminal_config(),
+            &Size { cols: 500, rows: 3 },
+            VoidListener,
+        );
+        let mut parser: Processor = Processor::new();
+        for _ in 0..1_000 {
+            parser.advance(&mut term, format!("{}\r\n", "界".repeat(240)).as_bytes());
+        }
+        parser.advance(&mut term, b"latest");
+        let text = snapshot_grid(&term);
+        assert!(text.len() <= SNAPSHOT_MAX_BYTES);
+        assert!(text.len() > SNAPSHOT_MAX_BYTES - 4);
+        assert!(text.ends_with("latest"));
+    }
+
     #[test]
     fn parser_handles_alt_screen_utf8_and_resize() {
         let mut t = Term::new(Config::default(), &Size { cols: 20, rows: 5 }, VoidListener);

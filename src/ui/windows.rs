@@ -1,6 +1,152 @@
 use super::*;
 
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub(super) struct SavedWindow {
+    #[serde(default)]
+    pub(super) root: bool,
+    #[serde(default)]
+    pub(super) workspaces: Vec<Uuid>,
+    #[serde(default)]
+    pub(super) active: Option<Uuid>,
+    #[serde(default)]
+    pub(super) bounds: Option<[f32; 4]>,
+}
+
+fn valid_bounds(bounds: [f32; 4]) -> bool {
+    bounds.iter().all(|v| v.is_finite()) && bounds[2] >= 640.0 && bounds[3] >= 400.0
+}
+
 impl App {
+    pub(super) fn capture_windows(&mut self) {
+        let mut owners: Vec<_> = self
+            .saved
+            .workspaces
+            .iter()
+            .map(|w| self.workspace_window(w.task.id))
+            .chain(self.windows.keys().copied())
+            .collect();
+        owners.sort_by_key(|id| (id != &egui::ViewportId::ROOT, id.0.value()));
+        owners.dedup();
+        self.saved.restoration.windows = owners
+            .into_iter()
+            .map(|id| {
+                let workspaces: Vec<_> = self
+                    .saved
+                    .workspaces
+                    .iter()
+                    .filter(|w| self.workspace_window(w.task.id) == id)
+                    .map(|w| w.task.id)
+                    .collect();
+                let window = self.windows.get(&id);
+                let active = if self.drawing_window == Some(id) || self.windows.is_empty() {
+                    self.saved.workspaces.get(self.ui.active).map(|w| w.task.id)
+                } else {
+                    window.and_then(|w| w.active)
+                };
+                let active = active
+                    .filter(|id| workspaces.contains(id))
+                    .or_else(|| workspaces.first().copied());
+                SavedWindow {
+                    root: id == egui::ViewportId::ROOT,
+                    workspaces,
+                    active,
+                    bounds: window.and_then(|w| w.bounds),
+                }
+            })
+            .collect();
+    }
+
+    pub(super) fn restore_windows(&mut self, ctx: &egui::Context) {
+        self.windows.clear();
+        self.workspace_windows.clear();
+        let mut assigned = std::collections::HashSet::new();
+        let mut root_used = false;
+        for saved in self.saved.restoration.windows.clone() {
+            let workspaces: Vec<_> = saved
+                .workspaces
+                .iter()
+                .copied()
+                .filter(|id| {
+                    self.saved.workspaces.iter().any(|w| w.task.id == *id) && assigned.insert(*id)
+                })
+                .collect();
+            if workspaces.is_empty() && !saved.workspaces.is_empty() {
+                continue;
+            }
+            let root = saved.root && !root_used;
+            root_used |= root;
+            let id = if root {
+                egui::ViewportId::ROOT
+            } else {
+                egui::ViewportId::from_hash_of(
+                    workspaces.first().copied().unwrap_or_else(Uuid::new_v4),
+                )
+            };
+            let active = saved
+                .active
+                .filter(|id| workspaces.contains(id))
+                .or_else(|| workspaces.first().copied());
+            for workspace in workspaces {
+                self.workspace_windows.insert(workspace, id);
+            }
+            let bounds = saved.bounds.filter(|bounds| valid_bounds(*bounds));
+            if root && let Some([x, y, width, height]) = bounds {
+                ctx.send_viewport_cmd_to(
+                    id,
+                    egui::ViewportCommand::OuterPosition(egui::pos2(x, y)),
+                );
+                ctx.send_viewport_cmd_to(
+                    id,
+                    egui::ViewportCommand::InnerSize(egui::vec2(width, height)),
+                );
+            }
+            self.windows.insert(
+                id,
+                TerminalWindow {
+                    active,
+                    ui: WindowUi::default(),
+                    position: None,
+                    bounds,
+                    restore_geometry: !root,
+                },
+            );
+        }
+        let missing: Vec<_> = self
+            .saved
+            .workspaces
+            .iter()
+            .filter(|w| !assigned.contains(&w.task.id))
+            .map(|w| w.task.id)
+            .collect();
+        if !missing.is_empty() {
+            let active = self
+                .saved
+                .restoration
+                .active
+                .filter(|id| missing.contains(id))
+                .or(Some(missing[0]));
+            self.windows
+                .entry(egui::ViewportId::ROOT)
+                .or_insert_with(|| TerminalWindow {
+                    active,
+                    ui: WindowUi::default(),
+                    position: None,
+                    bounds: None,
+                    restore_geometry: false,
+                });
+            for workspace in missing {
+                self.workspace_windows
+                    .insert(workspace, egui::ViewportId::ROOT);
+            }
+        }
+        if !self.windows.is_empty() && !self.windows.contains_key(&egui::ViewportId::ROOT) {
+            ctx.send_viewport_cmd_to(
+                egui::ViewportId::ROOT,
+                egui::ViewportCommand::Visible(false),
+            );
+        }
+    }
+
     pub(super) fn new_terminal_window(&mut self, ctx: &egui::Context) {
         let count = self.saved.workspaces.len();
         let active = self.ui.active;
@@ -105,6 +251,8 @@ impl App {
                 active: Some(workspace),
                 ui: WindowUi::default(),
                 position: None,
+                bounds: None,
+                restore_geometry: false,
             });
         let target = egui::ViewportId::from_hash_of(Uuid::new_v4());
         self.workspace_windows.insert(workspace, target);
@@ -114,6 +262,8 @@ impl App {
                 active: Some(workspace),
                 ui: WindowUi::default(),
                 position,
+                bounds: None,
+                restore_geometry: false,
             },
         );
         self.ui.palette = false;
@@ -146,6 +296,13 @@ impl App {
     }
 
     pub(super) fn close_terminal_window(&mut self, ctx: &egui::Context, id: egui::ViewportId) {
+        if self.quitting {
+            return;
+        }
+        if self.windows.len() == 1 {
+            ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close);
+            return;
+        }
         let panes: Vec<_> = self
             .saved
             .workspaces
@@ -167,9 +324,22 @@ impl App {
     }
 
     fn draw_terminal_window(&mut self, ctx: &egui::Context, id: egui::ViewportId) {
+        self.handle_app_quit(ctx);
+        if self.quitting {
+            return;
+        }
         let Some(window) = self.windows.get_mut(&id) else {
             return;
         };
+        ctx.input(|i| {
+            if let (Some(outer), Some(inner)) = (i.viewport().outer_rect, i.viewport().inner_rect) {
+                let bounds = [outer.min.x, outer.min.y, inner.width(), inner.height()];
+                if valid_bounds(bounds) {
+                    window.bounds = Some(bounds);
+                }
+            }
+        });
+        self.drawing_window = Some(id);
         std::mem::swap(&mut self.ui, &mut window.ui);
         let active = window.active;
         self.current_window = id;
@@ -189,9 +359,27 @@ impl App {
             self.ui = WindowUi::default();
         }
         self.current_window = egui::ViewportId::ROOT;
+        self.drawing_window = None;
+    }
+
+    fn handle_app_quit(&mut self, ctx: &egui::Context) {
+        let quit_modifiers = if cfg!(target_os = "macos") {
+            egui::Modifiers::COMMAND
+        } else {
+            egui::Modifiers::CTRL | egui::Modifiers::SHIFT
+        };
+        if ctx.input_mut(|i| i.consume_key(quit_modifiers, Key::Q)) {
+            self.quitting = true;
+            self.capture_restoration();
+            ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close);
+        }
     }
 
     pub(super) fn show_windows(&mut self, ctx: &egui::Context) {
+        self.handle_app_quit(ctx);
+        if self.quitting {
+            return;
+        }
         if self.windows.is_empty() {
             if ctx.input(|i| i.viewport().close_requested()) {
                 return;
@@ -202,6 +390,8 @@ impl App {
                     active: self.saved.workspaces.get(self.ui.active).map(|w| w.task.id),
                     ui: std::mem::take(&mut self.ui),
                     position: None,
+                    bounds: None,
+                    restore_geometry: false,
                 },
             );
         }
@@ -219,13 +409,7 @@ impl App {
             let Some(window) = self.windows.get_mut(&id) else {
                 continue;
             };
-            let mut builder = crate::main_viewport()
-                .with_title("Tessera")
-                .with_inner_size([1180.0, 760.0])
-                .with_min_inner_size([640.0, 400.0]);
-            if let Some(position) = window.position.take() {
-                builder = builder.with_position(position);
-            }
+            let builder = window.viewport_builder();
             ctx.show_viewport_immediate(id, builder, |ctx, _| {
                 self.draw_terminal_window(ctx, id);
             });
@@ -289,5 +473,92 @@ impl App {
         if outside {
             self.detach_workspace(ctx, workspace, position);
         }
+    }
+}
+
+impl TerminalWindow {
+    fn viewport_builder(&mut self) -> egui::ViewportBuilder {
+        let mut builder = crate::main_viewport()
+            .with_title("Tessera")
+            .with_inner_size([1180.0, 760.0])
+            .with_min_inner_size([640.0, 400.0]);
+        if let Some([x, y, width, height]) = self.bounds {
+            builder = builder.with_inner_size([width, height]);
+            if self.restore_geometry {
+                builder = builder.with_position(egui::pos2(x, y));
+            }
+        }
+        self.restore_geometry = false;
+        if let Some(position) = self.position.take() {
+            builder = builder.with_position(position);
+        }
+        builder
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restored_geometry_does_not_reset_on_next_frame() {
+        let mut window = TerminalWindow {
+            active: None,
+            ui: WindowUi::default(),
+            position: None,
+            bounds: Some([40.0, 50.0, 900.0, 600.0]),
+            restore_geometry: true,
+        };
+        let mut initial = window.viewport_builder();
+        let (commands, _) = initial.patch(window.viewport_builder());
+        assert!(
+            !commands
+                .iter()
+                .any(|cmd| matches!(cmd, egui::ViewportCommand::InnerSize(_)))
+        );
+    }
+
+    #[test]
+    fn invalid_geometry_is_rejected() {
+        assert!(!valid_bounds([f32::NAN, 0.0, 900.0, 600.0]));
+        assert!(!valid_bounds([0.0, 0.0, -900.0, 600.0]));
+        assert!(valid_bounds([-1000.0, 0.0, 900.0, 600.0]));
+    }
+
+    #[test]
+    fn app_quit_keeps_all_windows() {
+        let ctx = egui::Context::default();
+        let mut app = super::super::render_tests::fixture(2);
+        app.restore_windows(&ctx);
+        let ids: Vec<_> = app.saved.workspaces.iter().map(|w| w.task.id).collect();
+        app.detach_workspace(&ctx, ids[1], None);
+        let modifiers = if cfg!(target_os = "macos") {
+            egui::Modifiers::COMMAND
+        } else {
+            egui::Modifiers::CTRL | egui::Modifiers::SHIFT
+        };
+        let input = egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: Key::Q,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            }],
+            modifiers,
+            ..Default::default()
+        };
+        let child = app.workspace_window(ids[1]);
+        let output = ctx.run(input, |ctx| app.draw_terminal_window(ctx, child));
+        app.close_terminal_window(&ctx, egui::ViewportId::ROOT);
+        assert!(app.quitting);
+        assert_eq!(app.saved.workspaces.len(), 2);
+        assert_eq!(app.windows.len(), 2);
+        assert!(
+            output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .iter()
+                .any(|cmd| matches!(cmd, egui::ViewportCommand::Close))
+        );
     }
 }

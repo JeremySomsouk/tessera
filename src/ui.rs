@@ -25,6 +25,7 @@ use std::{
     time::{Duration, Instant},
 };
 use uuid::Uuid;
+mod restoration;
 mod windows;
 const ACCENT: Color32 = Color32::from_rgb(130, 198, 180);
 #[derive(Clone, Serialize, Deserialize)]
@@ -231,6 +232,8 @@ struct Workspace {
 #[derive(Clone, Serialize, Deserialize)]
 struct Saved {
     #[serde(default)]
+    restoration: restoration::SavedRestoration,
+    #[serde(default)]
     work_items: Vec<WorkItem>,
     #[serde(default)]
     work_version: u8,
@@ -259,6 +262,7 @@ struct Saved {
 impl Default for Saved {
     fn default() -> Self {
         Self {
+            restoration: Default::default(),
             work_items: Vec::new(),
             work_version: 0,
             created_directories: Vec::new(),
@@ -476,6 +480,8 @@ struct TerminalWindow {
     active: Option<Uuid>,
     ui: WindowUi,
     position: Option<Pos2>,
+    bounds: Option<[f32; 4]>,
+    restore_geometry: bool,
 }
 
 impl Default for WindowUi {
@@ -513,10 +519,13 @@ impl Default for WindowUi {
 }
 
 pub struct App {
+    restoration: restoration::Restoration,
     ui: WindowUi,
     windows: HashMap<egui::ViewportId, TerminalWindow>,
     workspace_windows: HashMap<Uuid, egui::ViewportId>,
     current_window: egui::ViewportId,
+    drawing_window: Option<egui::ViewportId>,
+    quitting: bool,
     dragged_workspace: Option<Uuid>,
     pending_focus: Option<Uuid>,
     updater: crate::updater::Updater,
@@ -553,20 +562,23 @@ fn state_path() -> PathBuf {
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let mut path = state_path();
-        let (saved, load_error) = match std::fs::read(&path) {
-            Ok(bytes) => match serde_json::from_slice::<Saved>(&bytes) {
-                Ok(s) => (s, String::new()),
-                Err(e) => (
-                    Saved::default(),
-                    format!("Could not read saved workspace: {e}. Original file kept."),
-                ),
-            },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Saved::default(), String::new()),
-            Err(e) => (Saved::default(), e.to_string()),
+        let (saved, load_error) = match crate::snapshot::load::<Saved>(&path) {
+            Ok(saved) => (saved.unwrap_or_default(), String::new()),
+            Err(error) => {
+                path = path.with_extension("recovered.json");
+                let recovered = crate::snapshot::load::<Saved>(&path);
+                let detail = match &recovered {
+                    Ok(Some(_)) => "Loaded the recovery workspace.",
+                    _ => "A separate recovery workspace will be saved.",
+                };
+                (
+                    recovered.ok().flatten().unwrap_or_default(),
+                    format!(
+                        "Could not read saved workspace: {error}. Original file kept. {detail}"
+                    ),
+                )
+            }
         };
-        if !load_error.is_empty() && path.exists() {
-            path = path.with_extension("recovered.json");
-        }
         let endpoint = Endpoint::start(cc.egui_ctx.clone());
         let (writer, rx) = sync_channel::<Saved>(1);
         let persistence_ctx = cc.egui_ctx.clone();
@@ -574,16 +586,7 @@ impl App {
         let worker_error = save_error.clone();
         let persistence = std::thread::spawn(move || {
             while let Ok(s) = rx.recv() {
-                let result = (|| -> anyhow::Result<()> {
-                    let parent = path.parent().unwrap();
-                    std::fs::create_dir_all(parent)?;
-                    let tmp = path.with_extension("tmp");
-                    std::fs::write(&tmp, serde_json::to_vec_pretty(&s)?)?;
-                    use std::os::unix::fs::PermissionsExt;
-                    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-                    std::fs::rename(tmp, &path)?;
-                    Ok(())
-                })();
+                let result = crate::snapshot::save(&path, &s);
                 if let Err(e) = result
                     && let Ok(mut error) = worker_error.lock()
                 {
@@ -597,6 +600,8 @@ impl App {
             windows: HashMap::new(),
             workspace_windows: HashMap::new(),
             current_window: egui::ViewportId::ROOT,
+            drawing_window: None,
+            quitting: false,
             dragged_workspace: None,
             pending_focus: None,
             updater: crate::updater::Updater::default(),
@@ -619,6 +624,7 @@ impl App {
             folder_launch: None,
             deferred_hooks: Vec::new(),
             direct_launches: HashMap::new(),
+            restoration: Default::default(),
         };
         match endpoint {
             Ok(e) => app.endpoint = Some(e),
@@ -630,7 +636,21 @@ impl App {
         }
         configure_terminal_fonts_with(&cc.egui_ctx, crate::fonts::automatic_terminal_fonts());
         configure_appearance(&cc.egui_ctx, app.saved.light);
-        app.start_fresh_workspace(&cc.egui_ctx);
+        app.restore_workspace(&cc.egui_ctx);
+        if !load_error.is_empty() {
+            app.ui.error = load_error;
+        }
+        let diagnostic_window = if app.windows.contains_key(&egui::ViewportId::ROOT) {
+            Some(egui::ViewportId::ROOT)
+        } else {
+            app.saved
+                .workspaces
+                .first()
+                .map(|w| app.workspace_window(w.task.id))
+        };
+        if let Some(window) = diagnostic_window.and_then(|id| app.windows.get_mut(&id)) {
+            window.ui.error = std::mem::take(&mut app.ui.error);
+        }
         app
     }
     fn spawn(&mut self, id: Uuid, ctx: &egui::Context, directory: &str) -> bool {
@@ -848,6 +868,11 @@ impl App {
         }
     }
     fn stop_terminal(&mut self, id: Uuid) {
+        self.saved.restoration.panes.remove(&id);
+        self.restoration.pending.remove(&id);
+        self.restoration.resumed.remove(&id);
+        self.restoration.notices.remove(&id);
+        self.restoration.history.remove(&id);
         self.direct_launches.remove(&id);
         if self
             .ui
@@ -900,21 +925,6 @@ impl App {
                 self.dirty = true;
             }
         }
-    }
-    fn start_fresh_workspace(&mut self, ctx: &egui::Context) {
-        self.sync_work();
-        // Saved pane IDs refer to processes that stopped when the app exited.
-        self.saved.workspaces.clear();
-        for session in &mut self.saved.sessions {
-            if session.state != SessionState::Ended {
-                session.state = SessionState::Disconnected;
-            }
-        }
-        self.ui.active = 0;
-        self.ui.overview = false;
-        self.ui.specifications_view = false;
-        self.dirty = true;
-        self.add_workspace_in(ctx, self.ui.new_directory.clone());
     }
     fn sync_work(&mut self) -> bool {
         let legacy = self.saved.work_version == 0;
@@ -1029,6 +1039,10 @@ impl App {
                         self.ui.selected = Some(self.saved.sessions[idx].key());
                     }
                 }
+                if let Some(saved) = self.saved.restoration.panes.get_mut(&e.pane) {
+                    saved.conversation = Some((e.agent, e.session_id.clone()));
+                    self.restoration.notices.remove(&e.pane);
+                }
                 self.dirty |= self.saved.sessions[idx].apply(e, now());
             }
         }
@@ -1086,7 +1100,10 @@ impl App {
                 }
             }
             // Agent launches retain their output until explicitly closed.
-            if !linked {
+            if !linked
+                && !self.restoration.pending.contains_key(&id)
+                && !self.restoration.resumed.contains(&id)
+            {
                 self.stop_terminal(id);
             }
         }
@@ -3490,6 +3507,7 @@ impl App {
         }
     }
     fn draw(&mut self, ctx: &egui::Context) {
+        self.poll_restoration(ctx);
         self.poll_folder_launch(ctx);
         self.dirty |= self.sync_work();
         self.drain();
@@ -3661,6 +3679,7 @@ impl App {
                 }
                 for (id, rect) in rects {
                     ui.scope_builder(egui::UiBuilder::new().max_rect(rect).id_salt(id), |ui| {
+                        self.restoration_panel(ui, ctx, id);
                         if let Some(pane) = self.panes.get_mut(&id) {
                             if let Some(err) =
                                 pane.terminal.error.try_lock().ok().and_then(|e| e.clone())
@@ -3672,6 +3691,7 @@ impl App {
                                 &mut pane.terminal,
                                 &mut pane.search,
                                 focused == id
+                                    && !self.restoration.pending.contains_key(&id)
                                     && !self.ui.palette
                                     && self.ui.rename.is_none()
                                     && self.ui.closing.is_none(),
@@ -3693,7 +3713,7 @@ impl App {
                             }
                         } else {
                             ui.label(
-                                "Terminal unavailable. Create a new workspace to start a shell.",
+                                "Terminal is unavailable or restoration is in progress. Saved workspace is retained.",
                             );
                         }
                     });
@@ -3707,8 +3727,17 @@ impl App {
         }
         self.rename_dialog(ctx);
         self.close_dialog(ctx);
+        if let Some(workspace) = self.saved.workspaces.get(self.ui.active) {
+            self.saved.restoration.active = Some(workspace.task.id);
+        }
+        if now().saturating_sub(self.last_save) >= 5 {
+            self.capture_restoration();
+            self.dirty = true;
+        }
+        ctx.request_repaint_after(Duration::from_secs(5));
         if self.dirty {
             if now().saturating_sub(self.last_save) >= 2 {
+                self.capture_restoration();
                 match self.writer.try_send(self.saved.clone()) {
                     Ok(()) => {
                         self.dirty = false;
@@ -3727,6 +3756,8 @@ impl eframe::App for App {
         self.show_windows(ctx);
     }
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.drain();
+        self.capture_restoration_with(true);
         let _ = self.writer.send(self.saved.clone());
         let (dummy, _) = sync_channel(1);
         drop(std::mem::replace(&mut self.writer, dummy));
@@ -5911,103 +5942,6 @@ mod render_tests {
     }
 
     #[test]
-    fn startup_opens_one_fresh_terminal_and_preserves_preferences_and_history() {
-        let ctx = egui::Context::default();
-        let directory = tempfile::tempdir().unwrap();
-        for count in [0, 3] {
-            let mut app = fixture(count);
-            let previous_panes: Vec<_> = app.saved.workspaces.iter().map(|w| w.focus).collect();
-            if count > 0 {
-                let extra = Uuid::new_v4();
-                app.saved.workspaces[0]
-                    .layout
-                    .split(previous_panes[0], extra, true);
-                app.saved.sessions[0].state = SessionState::Ended;
-            }
-            app.saved.light = true;
-            app.saved.font_size = 18.0;
-            app.saved.skip_stop_confirmation = true;
-            app.saved.clickable_codex_choices = true;
-            // Exercise loading the legacy state format, including missing directories.
-            app.saved = serde_json::from_slice(&serde_json::to_vec(&app.saved).unwrap()).unwrap();
-            let history: Vec<_> = app
-                .saved
-                .sessions
-                .iter()
-                .map(|s| (s.key(), s.history.len()))
-                .collect();
-            app.ui.new_directory = directory.path().to_string_lossy().into_owned();
-            app.start_fresh_workspace(&ctx);
-
-            assert_eq!(app.saved.workspaces.len(), 1);
-            assert_eq!(app.panes.len(), 1);
-            assert_eq!(app.ui.active, 0);
-            assert!(!app.ui.overview);
-            assert!(app.dirty);
-            let workspace = &app.saved.workspaces[0];
-            assert!(matches!(workspace.layout, Layout::Pane(id) if id == workspace.focus));
-            assert!(!previous_panes.contains(&workspace.focus));
-            assert_eq!(workspace.task.directory, app.ui.new_directory);
-            let terminal = &app.panes[&workspace.focus].terminal;
-            assert!(terminal.alive.load(Ordering::Acquire));
-            assert_eq!(
-                terminal.current_directory().unwrap(),
-                directory.path().canonicalize().unwrap()
-            );
-            assert!(app.saved.light);
-            assert_eq!(app.saved.font_size, 18.0);
-            assert!(app.saved.skip_stop_confirmation);
-            assert!(app.saved.clickable_codex_choices);
-            assert_eq!(
-                history,
-                app.saved
-                    .sessions
-                    .iter()
-                    .map(|s| (s.key(), s.history.len()))
-                    .collect::<Vec<_>>()
-            );
-            for (index, session) in app.saved.sessions.iter().enumerate() {
-                assert_eq!(
-                    session.state,
-                    if index == 0 {
-                        SessionState::Ended
-                    } else {
-                        SessionState::Disconnected
-                    }
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn startup_failure_discards_old_layout_and_reports_the_error() {
-        let ctx = egui::Context::default();
-        let directory = tempfile::tempdir().unwrap();
-        let mut app = fixture(3);
-        app.ui.new_directory = directory
-            .path()
-            .join("missing")
-            .to_string_lossy()
-            .into_owned();
-        app.start_fresh_workspace(&ctx);
-        assert!(app.saved.workspaces.is_empty());
-        assert!(app.panes.is_empty());
-        assert!(!app.ui.overview);
-        assert!(app.dirty);
-        assert!(app.ui.error.contains("Working directory does not exist"));
-        assert!(
-            app.saved
-                .sessions
-                .iter()
-                .all(|s| s.state == SessionState::Disconnected)
-        );
-        app.ui.new_directory = directory.path().to_string_lossy().into_owned();
-        assert!(app.add_workspace(&ctx));
-        assert_eq!(app.saved.workspaces.len(), 1);
-        assert_eq!(app.panes.len(), 1);
-    }
-
-    #[test]
     fn dropping_last_workspace_outside_hides_source_without_stopping_its_terminal() {
         let ctx = egui::Context::default();
         let mut app = fixture(1);
@@ -6258,8 +6192,8 @@ mod render_tests {
         let out = ctx.run(Default::default(), |ctx| {
             app.close_terminal_window(ctx, egui::ViewportId::ROOT)
         });
-        assert!(app.panes.is_empty());
-        assert!(app.windows.is_empty());
+        assert!(app.panes.contains_key(&second));
+        assert_eq!(app.windows.len(), 1);
         let commands = &out.viewport_output[&egui::ViewportId::ROOT].commands;
         assert!(commands.contains(&egui::ViewportCommand::Close));
         assert!(!commands.contains(&egui::ViewportCommand::CancelClose));
@@ -6319,7 +6253,7 @@ mod render_tests {
         assert_eq!(app.ui.active, 1);
     }
 
-    fn fixture(count: usize) -> App {
+    pub(super) fn fixture(count: usize) -> App {
         let (writer, _) = sync_channel(1);
         let mut saved = Saved::default();
         for n in 0..count {
@@ -6389,6 +6323,8 @@ mod render_tests {
             windows: HashMap::new(),
             workspace_windows: HashMap::new(),
             current_window: egui::ViewportId::ROOT,
+            drawing_window: None,
+            quitting: false,
             dragged_workspace: None,
             pending_focus: None,
             updater: crate::updater::Updater::default(),
@@ -6407,6 +6343,7 @@ mod render_tests {
             folder_launch: None,
             deferred_hooks: Vec::new(),
             direct_launches: HashMap::new(),
+            restoration: Default::default(),
         }
     }
     #[test]
@@ -7602,7 +7539,7 @@ mod render_tests {
         assert!(app.saved.created_directories[0].created_at > 0);
         app.saved = serde_json::from_slice(&serde_json::to_vec(&app.saved).unwrap()).unwrap();
         app.ui.new_directory = existing.to_string_lossy().into_owned();
-        app.start_fresh_workspace(&ctx);
+        app.restore_workspace(&ctx);
         assert_eq!(app.saved.created_directories.len(), 1);
         assert!(folder.is_dir());
     }
