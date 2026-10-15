@@ -22,7 +22,7 @@ use std::{
         atomic::Ordering,
         mpsc::{SyncSender, sync_channel},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use uuid::Uuid;
 const ACCENT: Color32 = Color32::from_rgb(130, 198, 180);
@@ -222,6 +222,8 @@ impl Layout {
 #[derive(Clone, Serialize, Deserialize)]
 struct Workspace {
     task: Task,
+    #[serde(default)]
+    custom_title: Option<bool>,
     layout: Layout,
     focus: Uuid,
 }
@@ -451,6 +453,7 @@ pub struct App {
     save_error: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     dirty: bool,
     last_save: u64,
+    last_title_sync: Option<Instant>,
     font_size: f32,
     new_directory: String,
     new_workspace_name: String,
@@ -552,6 +555,7 @@ impl App {
             save_error,
             dirty: false,
             last_save: 0,
+            last_title_sync: None,
             new_directory: crate::directories::default_directory()
                 .to_string_lossy()
                 .into(),
@@ -680,7 +684,9 @@ impl App {
         self.new_directory = directory;
         let name = self.new_workspace_name.trim();
         if !name.is_empty() {
-            self.saved.workspaces[self.active].task.title = name.to_owned();
+            let workspace = &mut self.saved.workspaces[self.active];
+            workspace.task.title = name.to_owned();
+            workspace.custom_title = Some(true);
         }
         self.new_workspace_name.clear();
         self.error.clear();
@@ -702,10 +708,7 @@ impl App {
         if !self.spawn(id, ctx, &directory) {
             return false;
         }
-        let title = PathBuf::from(&directory)
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "Workspace".into());
+        let title = workspace_folder_title(std::path::Path::new(&directory));
         self.saved.workspaces.push(Workspace {
             task: Task {
                 id: Uuid::new_v4(),
@@ -713,6 +716,7 @@ impl App {
                 directory,
                 state: TaskState::Implementing,
             },
+            custom_title: Some(false),
             layout: Layout::Pane(id),
             focus: id,
         });
@@ -1094,10 +1098,10 @@ impl App {
             .workspaces
             .iter_mut()
             .find(|workspace| workspace.task.id == rename.workspace)
-            && workspace.task.title != title
         {
+            self.dirty |= workspace.task.title != title || workspace.custom_title != Some(true);
             workspace.task.title = title.to_owned();
-            self.dirty = true;
+            workspace.custom_title = Some(true);
         }
         self.rename = None;
     }
@@ -2646,6 +2650,7 @@ impl App {
                         directory,
                         state: TaskState::Implementing,
                     },
+                    custom_title: Some(false),
                     layout: Layout::Pane(pane),
                     focus: pane,
                 });
@@ -2903,6 +2908,7 @@ impl App {
                 directory,
                 state: TaskState::Implementing,
             },
+            custom_title: Some(true),
             layout: Layout::Pane(pane),
             focus: pane,
         });
@@ -3111,6 +3117,43 @@ impl App {
             self.dirty = true;
         }
     }
+    fn sync_workspace_titles(&mut self, ctx: &egui::Context) {
+        if self.panes.is_empty() {
+            return;
+        }
+        let interval = Duration::from_millis(500);
+        ctx.request_repaint_after(interval);
+        if self
+            .last_title_sync
+            .is_some_and(|last| last.elapsed() < interval)
+        {
+            return;
+        }
+        self.last_title_sync = Some(Instant::now());
+        for workspace in &mut self.saved.workspaces {
+            let custom = *workspace.custom_title.get_or_insert_with(|| {
+                self.dirty = true;
+                workspace.task.title
+                    != workspace_folder_title(std::path::Path::new(&workspace.task.directory))
+            });
+            if custom {
+                continue;
+            }
+            let Some(pane) = self.panes.get(&workspace.focus) else {
+                continue;
+            };
+            if !pane.terminal.alive.load(Ordering::Acquire) {
+                continue;
+            }
+            if let Ok(directory) = pane.terminal.current_directory() {
+                let title = workspace_folder_title(&directory);
+                if workspace.task.title != title {
+                    workspace.task.title = title;
+                    self.dirty = true;
+                }
+            }
+        }
+    }
     fn draw(&mut self, ctx: &egui::Context) {
         self.poll_folder_launch(ctx);
         self.dirty |= self.sync_work();
@@ -3122,6 +3165,7 @@ impl App {
             self.error = error;
         }
         self.shortcuts(ctx);
+        self.sync_workspace_titles(ctx);
         let dismiss_palette =
             self.palette && ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape));
         let workspace_submit = if self.palette {
@@ -3445,6 +3489,12 @@ fn readable_directory(directory: &str) -> String {
     }
     directory.into()
 }
+fn workspace_folder_title(directory: &std::path::Path) -> String {
+    directory
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "Workspace".into())
+}
 fn directory_name(directory: &str) -> &str {
     std::path::Path::new(directory)
         .file_name()
@@ -3549,6 +3599,7 @@ fn command_row(
         );
         job.wrap.max_width = width;
         job.wrap.max_rows = 1;
+        job.wrap.break_anywhere = true;
         ui.fonts_mut(|fonts| fonts.layout_job(job))
     };
     let title_galley = line(title, 14.0, ui.visuals().text_color());
@@ -5068,6 +5119,7 @@ mod tests {
         };
         saved.workspaces.push(Workspace {
             task,
+            custom_title: None,
             layout: Layout::Pane(Uuid::new_v4()),
             focus: Uuid::new_v4(),
         });
@@ -5632,6 +5684,7 @@ mod render_tests {
                     directory: format!("~/Projects/{}", ["tessera", "melimo", "prctrl"][n % 3]),
                     state: TaskState::Implementing,
                 },
+                custom_title: None,
                 layout: Layout::Pane(pane),
                 focus: pane,
             });
@@ -5694,6 +5747,7 @@ mod render_tests {
             save_error: std::sync::Arc::new(std::sync::Mutex::new(None)),
             dirty: false,
             last_save: 0,
+            last_title_sync: None,
             font_size: 15.0,
             new_directory: String::new(),
             new_workspace_name: String::new(),
@@ -6272,6 +6326,63 @@ mod render_tests {
             |ctx| app.workspace_sidebar(ctx, &mut None),
         );
         assert_eq!(saved.sidebar_width, app.saved.sidebar_width);
+    }
+
+    #[test]
+    fn long_workspace_titles_keep_a_visible_prefix_before_the_ellipsis() {
+        for rail in [false, true] {
+            for light in [false, true] {
+                for (name, prefix) in [
+                    (
+                        "workspacewithaverylongunbrokenfoldername".repeat(3),
+                        "1   workspace",
+                    ),
+                    ("équipeavecunnomdetravailtrèslong".repeat(3), "1   équipe"),
+                ] {
+                    let ctx = egui::Context::default();
+                    configure_appearance(&ctx, light);
+                    let mut app = fixture(1);
+                    app.saved.workspaces[0].task.title = name;
+                    let out = ctx.run(
+                        egui::RawInput {
+                            screen_rect: Some(Rect::from_min_size(
+                                Pos2::ZERO,
+                                Vec2::new(206.0, 400.0),
+                            )),
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            egui::CentralPanel::default().show(ctx, |ui| {
+                                app.workspace_navigation(ui, rail, &mut None);
+                            });
+                        },
+                    );
+                    let title = out
+                        .shapes
+                        .iter()
+                        .find_map(|shape| match &shape.shape {
+                            egui::epaint::Shape::Text(text)
+                                if text.galley.text().starts_with("1   ") =>
+                            {
+                                Some(text)
+                            }
+                            _ => None,
+                        })
+                        .unwrap();
+                    let visible: String = title.galley.rows[0]
+                        .glyphs
+                        .iter()
+                        .map(|glyph| glyph.chr)
+                        .collect();
+                    assert!(
+                        visible.starts_with(prefix),
+                        "title lost its prefix: {visible:?}"
+                    );
+                    assert!(visible.ends_with('…'), "title lacks ellipsis: {visible:?}");
+                    assert!(title.galley.size().x <= 166.0);
+                }
+            }
+        }
     }
 
     #[test]
@@ -8039,6 +8150,120 @@ mod render_tests {
             .remove("skip_stop_confirmation");
         let restored: Saved = serde_json::from_value(old).unwrap();
         assert!(!restored.skip_stop_confirmation);
+    }
+
+    #[test]
+    fn automatic_workspace_title_follows_cd_and_focused_pane() {
+        let ctx = egui::Context::default();
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        let nested = project.join("nested folder α");
+        std::fs::create_dir_all(&nested).unwrap();
+        let mut app = fixture(0);
+        assert!(app.add_workspace_in(&ctx, project.to_string_lossy().into_owned()));
+        let original = app.saved.workspaces[0].focus;
+        app.split(&ctx, true);
+        let focused = app.saved.workspaces[0].focus;
+        app.panes[&focused]
+            .terminal
+            .input("cd 'nested folder α'\r".as_bytes().to_vec())
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| app.draw(ctx));
+            if app.saved.workspaces[0].task.title == "nested folder α" {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "title did not follow cd"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        app.saved = serde_json::from_slice(&serde_json::to_vec(&app.saved).unwrap()).unwrap();
+        app.saved.workspaces[0].focus = original;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| app.draw(ctx));
+            if app.saved.workspaces[0].task.title == "project" {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "title did not follow focused pane"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            app.saved.workspaces[0].task.directory,
+            project.to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn legacy_workspace_titles_infer_automatic_names_and_preserve_custom_names() {
+        let ctx = egui::Context::default();
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        let other = root.path().join("other");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::create_dir(&other).unwrap();
+        for (previous, expected) in [("project", "other"), ("My task", "My task")] {
+            let mut app = fixture(1);
+            app.saved.workspaces[0].task.title = previous.into();
+            app.saved.workspaces[0].task.directory = project.to_string_lossy().into_owned();
+            let mut legacy = serde_json::to_value(&app.saved).unwrap();
+            legacy["workspaces"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("custom_title");
+            app.saved = serde_json::from_value(legacy).unwrap();
+            let pane = app.saved.workspaces[0].focus;
+            assert!(app.spawn(pane, &ctx, other.to_str().unwrap()));
+            let _ = ctx.run(egui::RawInput::default(), |ctx| app.draw(ctx));
+            assert_eq!(app.saved.workspaces[0].task.title, expected);
+        }
+    }
+
+    #[test]
+    fn explicit_workspace_titles_survive_directory_changes_and_serialization() {
+        let ctx = egui::Context::default();
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        let other = root.path().join("other");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::create_dir(&other).unwrap();
+        for rename in [false, true] {
+            let mut app = fixture(0);
+            app.new_directory = project.to_string_lossy().into_owned();
+            app.new_workspace_name = if rename {
+                String::new()
+            } else {
+                "project".into()
+            };
+            assert!(app.add_workspace(&ctx));
+            if rename {
+                app.begin_rename();
+                app.finish_rename();
+            }
+            app.saved = serde_json::from_slice(&serde_json::to_vec(&app.saved).unwrap()).unwrap();
+            let pane = app.saved.workspaces[0].focus;
+            app.panes[&pane]
+                .terminal
+                .input("cd ../other\r".as_bytes().to_vec())
+                .unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !app.panes[&pane]
+                .terminal
+                .current_directory()
+                .is_ok_and(|path| path == other.canonicalize().unwrap())
+            {
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let _ = ctx.run(egui::RawInput::default(), |ctx| app.draw(ctx));
+            assert_eq!(app.saved.workspaces[0].task.title, "project");
+        }
     }
 
     #[test]
