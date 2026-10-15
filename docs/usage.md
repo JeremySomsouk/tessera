@@ -9,6 +9,7 @@ On macOS, `Command` below is Cmd. On Linux, use Ctrl+Alt so ordinary terminal Ct
 | --- | --- |
 | Work / previous terminal | Command+Shift+O |
 | New terminal workspace in the active pane’s current directory | Command+N or Command+T |
+| New terminal window in the active pane’s current directory | Command+Shift+T |
 | Rename current workspace | Command+Shift+R |
 | Side-by-side split | Command+D |
 | Stacked split | Command+Shift+D |
@@ -35,6 +36,8 @@ On macOS, Command+Enter inserts a newline in Claude Code without submitting by s
 
 Tessera detects the terminal font at startup from the default iTerm2 or Terminal.app profile, or an explicit `font_family` in kitty configuration. When launched from a recognized terminal, that terminal takes precedence; otherwise Tessera checks iTerm2, Terminal.app, then kitty. The font must be installed and monospace. An installed Nerd Font supplies missing prompt icons, followed by bundled Unicode and monochrome emoji fallbacks. Settings shows the selected font. Restart Tessera after changing a terminal profile or installing fonts. Other terminal configurations and included kitty configuration files are not read yet.
 
+Drag a workspace tab or rail entry outside its window and release to move it into a new terminal window. Its running shells, scrollback, split panes, and agent links move together. The new window starts at the screen drop point. Moving the last tab out closes the source window. Releasing inside the source window leaves it there; Escape cancels the drag. You can also right-click a tab and choose **Move to new window**. **New terminal window** in Commands, or Command+Shift+T, starts a fresh shell in a separate window. Workspace number shortcuts apply to the current window; Commands and Work can find terminals in other windows and bring their window forward. Closing a window stops its hosted shells, while the other windows keep running. Closing the final window quits Tessera.
+
 Hover the workspace title to see its launch directory. The compact header leaves more room for terminal output.
 
 New terminals opened with Command+N, Command+T, or either split shortcut inherit the focused shell’s current working directory, including changes made with `cd`. Workspaces whose shell has exited use their launch directory. New workspace accepts an existing or new directory and an optional separate name. Missing folders are created on submission. `~/` expands to your home directory; relative paths resolve against the application's starting directory (your home directory when started at `/`). The resolved path is shown before creation. A leading `/` denotes an absolute path: for a missing root-level folder, the form offers an explicit home-directory alternative. Read-only and permission failures include recovery guidance. Enter in either field creates the workspace. Escape or a click outside the command center closes it.
@@ -57,7 +60,7 @@ Normal terminal typing uses a slim beam caret; applications can request block, u
 
 Every startup opens one fresh login-shell terminal in the application's starting directory, using your home directory when the application starts at the filesystem root. Previous tabs and split layouts are discarded. Themes, font sizes, terminal preferences, work items, specifications and bounded session histories are saved locally. The saved Light/Dark appearance applies from the first frame, independently of the system theme. Previous sessions are marked disconnected unless already ended; their work context and histories remain available in Work. Closing a pane stops its shell; quitting the app stops hosted shells. Independently detached `nohup`/daemon processes are outside this lifecycle.
 
-This increment has one application window, no external session daemon, no remote SSH tracking, no Jira/GitHub connector. Hook histories contain event/tool names, not prompts, arguments, results, transcripts, or permission decisions. Ordinary terminal output remains in memory only. The terminal renderer is an initial implementation; see [compatibility](terminal-compatibility.md) before treating it as a replacement for a mature terminal.
+Terminal windows share one application process. There is no external session daemon, remote SSH tracking, or Jira/GitHub connector. Moving a tab to a new window preserves its live terminals within that process; windows and terminals are not restored after quitting. Hook histories contain event/tool names, not prompts, arguments, results, transcripts, or permission decisions. Ordinary terminal output remains in memory only. The terminal renderer is an initial implementation; see [compatibility](terminal-compatibility.md) before treating it as a replacement for a mature terminal.
 
 [Agent hooks](integration.md) · [Terminal compatibility](terminal-compatibility.md)
 
