@@ -399,11 +399,23 @@ fn safe_gh_error(error: &str) -> &str {
     }
 }
 
+fn needs_cooldown(diagnostics: &[u8]) -> bool {
+    let diagnostic = String::from_utf8_lossy(diagnostics).to_ascii_lowercase();
+    [
+        "http 429",
+        "secondary rate limit",
+        "abuse detection",
+        "abuse rate limit",
+    ]
+    .iter()
+    .any(|text| diagnostic.contains(text))
+}
+
 fn classify_failure(code: Option<i32>, diagnostics: &[u8]) -> &'static str {
     let diagnostic = String::from_utf8_lossy(diagnostics).to_ascii_lowercase();
     if code == Some(127) {
         GH_MISSING
-    } else if diagnostic.contains("http 429") || diagnostic.contains("rate limit") {
+    } else if needs_cooldown(diagnostics) || diagnostic.contains("rate limit") {
         GH_RATE_LIMIT
     } else if ["http 500", "http 502", "http 503", "http 504"]
         .iter()
@@ -713,7 +725,7 @@ impl GhCli {
                             .and_then(Result::ok)
                             .unwrap_or_default();
                         let failure = GhFailure::process(status.code(), &diagnostics);
-                        if failure.cause == GH_RATE_LIMIT {
+                        if needs_cooldown(&diagnostics) {
                             runtime::backoff();
                         }
                         return Err(failure);
@@ -2093,6 +2105,47 @@ mod cli_tests {
             assert!(!error.contains("SECRET"));
         }
     }
+    #[test]
+    fn global_cooldown_is_reserved_for_secondary_limits() {
+        for diagnostic in [
+            "HTTP 429",
+            "HTTP 403: secondary rate limit",
+            "HTTP 403: abuse detection mechanism",
+        ] {
+            assert!(needs_cooldown(diagnostic.as_bytes()));
+            assert_eq!(
+                classify_failure(Some(1), diagnostic.as_bytes()),
+                GH_RATE_LIMIT
+            );
+        }
+        for diagnostic in ["HTTP 403: API rate limit exceeded", "HTTP 401", "HTTP 500"] {
+            assert!(!needs_cooldown(diagnostic.as_bytes()));
+        }
+    }
+
+    #[test]
+    fn primary_quota_failure_does_not_pause_healthy_run_requests() {
+        let failed_dir = tempfile::tempdir().unwrap();
+        let failing = executable(
+            failed_dir.path(),
+            "#!/bin/sh\nprintf 'HTTP 403: API rate limit exceeded' >&2\nexit 1\n",
+        );
+        assert!(
+            failing
+                .run(&strings(&["api", "graphql"]))
+                .unwrap_err()
+                .contains("rate limit")
+        );
+        let healthy_dir = tempfile::tempdir().unwrap();
+        let healthy = executable(healthy_dir.path(), "#!/bin/sh\nprintf '[]'\n");
+        assert_eq!(
+            healthy
+                .run(&strings(&["run", "list", "--repo", "fiction/atlas"]))
+                .unwrap(),
+            "[]"
+        );
+    }
+
     #[test]
     fn cli_enforces_deadline_and_output_bound() {
         let dir = tempfile::tempdir().unwrap();
