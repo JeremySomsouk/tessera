@@ -6,9 +6,9 @@
 
 See which task needs a decision, keep related agent sessions together, and carry specifications and work stages beyond a single terminal session. Tessera brings that context into a native terminal workspace, so you can return to the CLI to review, approve, and act.
 
-[Download](https://github.com/JeremySomsouk/tessera/releases) · [Getting started](#install) · [Documentation](docs/usage.md) · [Release notes](docs/releases/0.12.0.md)
+[Download](https://github.com/JeremySomsouk/tessera/releases) · [Getting started](#install) · [Documentation](docs/usage.md) · [Release notes](docs/releases/0.13.0.md)
 
-Tessera runs on **macOS and Linux**, on Intel/AMD and ARM64. Built with Rust, with no browser runtime. Current version: **0.12.0 (alpha)**.
+Tessera runs on **macOS and Linux**, on Intel/AMD and ARM64. Built with Rust, with no browser runtime. Current version: **0.13.0 (alpha)**.
 
 ## A look inside
 
@@ -71,7 +71,9 @@ Open local agents also appear before hooks arrive, labelled **Untracked** until 
 
 ## Everyday use
 
-Use **Terminal** for shells and **Work** for task context. **+ Workspace** opens a directory. **Commands** finds workspaces and actions; **Pane** groups split and maximize controls. **Settings** holds appearance, folder search roots, terminal behavior, and updates.
+Use **Terminal** for shells, **Work** for task context, and **Autobot** for configured GitHub Actions sources. **+ Workspace** opens a directory. **Commands** finds workspaces and actions; **Pane** groups split and maximize controls. **Settings** holds appearance, folder search roots, terminal behavior, Autobot sources, and updates.
+
+Configure an Autobot source in Settings, then track ticket keys such as `ACME-42`. The page groups recent runs and linked pull requests by source and ticket, surfaces failures, and opens a run timeline with job/step progress. Refresh manually or enable optional live refresh while the page is visible. Autobot stays hidden until a source is configured. Authentication remains with your installed `gh` CLI. [Autobot setup and controls](docs/usage.md#autobot)
 
 **Claude in folder** searches existing folders by name and opens a terminal running `claude`. Configure **Search roots** there or in Settings to keep folder-name searches within selected directories. Pasting an exact existing path also works, including outside those roots.
 
@@ -103,7 +105,7 @@ Stages are yours to change. Launching an agent does not advance a stage, and a f
 
 ## Local data and current limits
 
-Preferences, work items, specifications, and bounded session histories are saved locally. Lifecycle tracking records events and tool names, not prompts or transcripts. Specification text is sent to the selected agent when you launch it.
+Preferences, work items, specifications, and bounded session histories are saved locally. Autobot saves source configuration, tracked ticket keys, and tracking preferences; fetched metadata, logs, and comment bodies are not saved. Lifecycle tracking records events and tool names, not prompts or transcripts. Specification text is sent to the selected agent when you launch it.
 
 Tessera restores open workspaces, tabs, split ratios, focused panes, and their latest recorded directories automatically. Quitting or closing the final window saves the workspace and stops hosted processes. Explicitly stopped panes and workspaces stay closed. Closing a window while other windows remain open stops that window's terminals. Separate windows reopen with their original tabs, tab order, active tab, position, and size. Use Cmd+Q (Ctrl+Shift+Q on Linux) to quit while keeping all windows for the next launch. Older snapshots without window metadata open in one main window. Window placement may be adjusted by the operating system when the display setup changes.
 
