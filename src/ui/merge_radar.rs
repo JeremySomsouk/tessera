@@ -86,6 +86,7 @@ pub(super) struct Panel {
     query: String,
     lane: Option<Lane>,
     editor: Option<Editor>,
+    open_repo: Option<String>,
 }
 
 impl Panel {
@@ -282,7 +283,7 @@ impl Panel {
             }
             let reviews: Vec<_> = active.iter().copied().filter(|pr| pr.lane == Lane::Review).collect();
             if !reviews.is_empty() {
-                changed |= lane(ui, Lane::Review, &reviews, preferences);
+                changed |= lane(ui, Lane::Review, &reviews, preferences, &mut self.open_repo);
                 ui.add_space(16.0);
             }
             let order = if preferences.config.bot_first { [true, false] } else { [false, true] };
@@ -296,13 +297,13 @@ impl Panel {
                     ui.columns(3, |columns| {
                         for (column, kind) in columns.iter_mut().zip(lanes) {
                             let prs: Vec<_> = group.iter().copied().filter(|pr| pr.lane == kind).collect();
-                            changed |= lane(column, kind, &prs, preferences);
+                            changed |= lane(column, kind, &prs, preferences, &mut self.open_repo);
                         }
                     });
                 } else {
                     for kind in lanes {
                         let prs: Vec<_> = group.iter().copied().filter(|pr| pr.lane == kind).collect();
-                        if !prs.is_empty() { changed |= lane(ui, kind, &prs, preferences); }
+                        if !prs.is_empty() { changed |= lane(ui, kind, &prs, preferences, &mut self.open_repo); }
                     }
                 }
                 ui.add_space(16.0);
@@ -310,13 +311,13 @@ impl Panel {
             let drafts: Vec<_> = active.iter().copied().filter(|pr| pr.lane == Lane::Draft).collect();
             if !drafts.is_empty() {
                 egui::CollapsingHeader::new(format!("Drafts · {}", drafts.len())).show(ui, |ui| {
-                    for pr in drafts { changed |= card(ui, pr, preferences, false); }
+                    for pr in drafts { changed |= card(ui, pr, preferences, false, &mut self.open_repo); }
                 });
             }
             let snoozed: Vec<_> = filtered.iter().copied().filter(|pr| preferences.snoozed(&pr.url, now())).collect();
             if !snoozed.is_empty() {
                 egui::CollapsingHeader::new(format!("Snoozed · {}", snoozed.len())).show(ui, |ui| {
-                    for pr in snoozed { changed |= card(ui, pr, preferences, true); }
+                    for pr in snoozed { changed |= card(ui, pr, preferences, true, &mut self.open_repo); }
                 });
             }
             ui.add_space(12.0);
@@ -343,6 +344,7 @@ fn lane(
     kind: Lane,
     prs: &[&PullRequest],
     preferences: &mut Preferences,
+    open_repo: &mut Option<String>,
 ) -> bool {
     let mut changed = false;
     egui::Frame::new()
@@ -376,13 +378,19 @@ fn lane(
                 ui.weak("All clear");
             }
             for pr in prs {
-                changed |= card(ui, pr, preferences, false);
+                changed |= card(ui, pr, preferences, false, open_repo);
             }
         });
     changed
 }
 
-fn card(ui: &mut egui::Ui, pr: &PullRequest, preferences: &mut Preferences, snoozed: bool) -> bool {
+fn card(
+    ui: &mut egui::Ui,
+    pr: &PullRequest,
+    preferences: &mut Preferences,
+    snoozed: bool,
+    open_repo: &mut Option<String>,
+) -> bool {
     let mut changed = false;
     egui::Frame::new()
         .fill(ui.visuals().panel_fill)
@@ -422,6 +430,15 @@ fn card(ui: &mut egui::Ui, pr: &PullRequest, preferences: &mut Preferences, snoo
             });
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
+                if ui
+                    .small_button("Open Claude")
+                    .on_hover_text(
+                        "Choose a related folder and start Claude Code in a new terminal tab",
+                    )
+                    .clicked()
+                {
+                    *open_repo = Some(pr.repo.clone());
+                }
                 if pr.lane == Lane::Review {
                     web_link(ui, RichText::new("Review changes").small(), &pr.review_url);
                 }
@@ -546,9 +563,24 @@ impl App {
         self.ui.palette = false;
     }
 
+    fn open_radar_folder(&mut self, repo: &str) {
+        self.open_commands(CommandPage::Folders);
+        let name = repo.rsplit('/').next().unwrap_or(repo);
+        self.ui.folder_query = self
+            .saved
+            .recent_folders
+            .iter()
+            .find(|path| path.file_name().is_some_and(|folder| folder == name) && path.is_dir())
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_else(|| name.to_owned());
+    }
+
     pub(super) fn merge_radar_page(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let mut panel = self.ui.radar.take().unwrap_or_default();
         self.dirty |= panel.show(&mut self.saved.merge_radar, ui, ctx, self.ui.palette);
+        if let Some(repo) = panel.open_repo.take() {
+            self.open_radar_folder(&repo);
+        }
         self.ui.radar = Some(panel);
     }
 }
@@ -599,6 +631,38 @@ mod tests {
             last_attempt: Some(Instant::now()),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn opening_claude_filters_folders_without_launching_implicitly() {
+        let mut app = super::super::render_tests::fixture(2);
+        app.open_merge_radar();
+        app.open_radar_folder("example/project");
+        assert!(app.ui.palette && app.ui.radar_visible);
+        assert!(app.ui.command_page == CommandPage::Folders);
+        assert_eq!(app.ui.folder_query, "project");
+        assert_eq!(app.ui.command_index, 0);
+        assert!(app.folder_launch.is_none());
+        assert_eq!(app.saved.workspaces.len(), 2);
+    }
+
+    #[test]
+    fn radar_autofills_most_recent_existing_matching_folder() {
+        let root = tempfile::tempdir().unwrap();
+        let older = root.path().join("older/project");
+        let newer = root.path().join("newer/project");
+        let missing = root.path().join("missing/project");
+        let unrelated = root.path().join("project-other");
+        for path in [&older, &newer, &unrelated] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let mut app = super::super::render_tests::fixture(2);
+        app.saved.recent_folders = vec![missing, unrelated, newer.clone(), older];
+        app.open_radar_folder("example/project");
+        assert_eq!(app.ui.folder_query, newer.to_string_lossy());
+        assert!(app.folder_launch.is_none());
+        app.open_radar_folder("example/unknown");
+        assert_eq!(app.ui.folder_query, "unknown");
     }
 
     #[test]
