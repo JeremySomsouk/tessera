@@ -295,4 +295,25 @@ mod tests {
         run.started_at.clear();
         assert_eq!(elapsed(&run, 0), "Elapsed unavailable");
     }
+    #[test]
+    fn bounded_lookup_warning_is_successful_and_does_not_mark_metadata_stale() {
+        let mut cached = CachedRepo::new(
+            RepoResult {
+                warnings: vec!["Lookup window reached".into()],
+                ..Default::default()
+            },
+            100,
+        );
+        assert!(!cached.stale);
+        assert_eq!(cached.last_success, Some(100));
+        cached.update(
+            RepoResult {
+                warnings: vec!["Lookup window reached".into()],
+                ..Default::default()
+            },
+            200,
+        );
+        assert!(!cached.stale);
+        assert_eq!(cached.last_success, Some(200));
+    }
 }

@@ -34,6 +34,7 @@
 - [ ] Scope amendments with acknowledgement, independent worktrees and collision warnings.
 
 ## Connectors and release
+- [x] Native Merge Radar with review queues, repository/team filters, bot grouping, and saved snoozes.
 - [ ] Jira/GitHub read/import, project configuration and Keychain credential adapter (partial: configured GitHub Actions run lookup and pull request comment posting; no Jira or issue import, project connector, or credential adapter).
 - [x] Native Autobot page for multiple tracked tickets, configured GitHub Actions sources, run timelines, job/step progress, and confirmed pull request comments.
 - [x] Settings source editor and optional visible-page live refresh with backoff, cancellation, and stale data timestamps.

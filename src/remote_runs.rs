@@ -389,6 +389,7 @@ pub struct RepoResult {
     pub runs: Vec<Run>,
     pub prs: Vec<PullRequest>,
     pub errors: Vec<String>,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -488,7 +489,7 @@ pub fn lookup(gh: &dyn Gh, task: &LookupTask, key: &str, limit: usize) -> RepoRe
         }) {
             Ok(runs) => {
                 if runs.len() >= limit.clamp(1, 1000) {
-                    result.errors.push(format!(
+                    result.warnings.push(format!(
                         "{}: run lookup window reached {}{}; older matching runs may be omitted",
                         task.repo,
                         limit.clamp(1, 1000),
@@ -560,7 +561,7 @@ pub fn lookup(gh: &dyn Gh, task: &LookupTask, key: &str, limit: usize) -> RepoRe
         }) {
             Ok(prs) => {
                 if prs.len() >= 1000 {
-                    result.errors.push(format!(
+                    result.warnings.push(format!(
                         "{}: PR {} reached 1000 results; older matching PRs may be omitted",
                         task.repo,
                         if title_search {
@@ -954,8 +955,14 @@ mod contract_tests {
         ]);
         let result = lookup(&gh, &task, "ATL-42", 1);
         assert_eq!(result.runs.len(), 2);
-        assert_eq!(result.errors.len(), 2);
-        assert!(result.errors.iter().all(|error| error.contains("window")));
+        assert!(result.errors.is_empty());
+        assert_eq!(result.warnings.len(), 2);
+        assert!(
+            result
+                .warnings
+                .iter()
+                .all(|warning| warning.contains("window"))
+        );
     }
     #[test]
     fn pr_query_failure_keeps_the_other_search_and_a_safe_recovery_reason() {
@@ -990,8 +997,14 @@ mod contract_tests {
         ]);
         let result = lookup(&gh, &task, "ATL-42", 20);
         assert_eq!(result.prs.len(), 1);
-        assert_eq!(result.errors.len(), 2);
-        assert!(result.errors.iter().all(|error| error.contains("1000")));
+        assert!(result.errors.is_empty());
+        assert_eq!(result.warnings.len(), 2);
+        assert!(
+            result
+                .warnings
+                .iter()
+                .all(|warning| warning.contains("1000"))
+        );
     }
     #[test]
     fn job_and_step_metadata_parse_recorded_response() {

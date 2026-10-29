@@ -1,10 +1,15 @@
 # Progress
 
+2026-10-29: 0.14.0 combined Autobot and Merge Radar.
+
+Integrated the latest Autobot implementation with native Merge Radar review queues, filters, bot grouping, and saved snoozes. Preserved both work streams and updated shared navigation and command-menu coverage. Validation: all 290 Rust unit tests plus three CLI integration tests pass, including ignored socket tests, with `LC_ALL=C`, a clean fallback shell, and four test threads. All 18 Python tests, formatting, warnings-denied Clippy, ShellCheck, shell syntax, and diff checks pass. Both page navigation/input isolation and light/dark narrow layouts are covered, including combined navigation at 900 pixels. The Apple Silicon 0.14.0 app and DMG built successfully; ad hoc code signature, 0.14.0 / 1.14.0 bundle metadata, and DMG checksum verify. Native authenticated GitHub, Intel/Linux, accessibility, and installed updater acceptance remain pending. No push, tag, or publication was performed.
+
+
 2026-10-29: 0.13.0 native Autobot page.
 
 Promoted configured Remote runs into Autobot alongside Terminal and Work. Added multiple tracked ticket keys, source/repository overview, run timeline and job/step progress, stale metadata timestamps, optional visible-page live refresh, and a validated Settings source editor. Configuration and tracking preferences use existing local persistence; fetched metadata, logs, and comment drafts stay ephemeral. GitHub run completion does not advance or accept work. Existing terminal output privacy and explicit pull request comment confirmation remain in place.
 
-Validation is pending completion of the implementation. Native acceptance still needs authenticated source setup, multiple matching sources/tickets, running and failed workflow transitions, offline recovery, visible-only refresh, output/watch panes, and the comment preview/cancel flow in both themes and narrow windows. No live comment or release has been published.
+Validation: 277 Rust unit tests and three CLI integration tests pass, including local socket, terminal privacy, source editing, controlled refresh timing/cancellation, stale-result rejection, stable selection, and headless narrow/light/dark checks. The full suite used `LC_ALL=C`, an unavailable `SHELL` to exercise the clean `/bin/sh` fallback, and four test threads; the initial inherited-shell run timed out in existing launch fixtures. All 18 Python tests, formatting, warnings-denied Clippy, shell syntax, ShellCheck, and diff checks pass. The Apple Silicon release app and DMG build successfully; 0.13.0 / 1.13.0 bundle metadata, ad hoc signature, and DMG checksum verify. Review fixes include separating lookup-limit warnings from failures, preserving job/step selection, pausing minimized pages, narrow toolbar layout, and joining file-owning remote workers on normal exit. Native acceptance still needs authenticated source setup, multiple matching sources/tickets, running/failed transitions, offline recovery, visible-only refresh, output/watch panes, and comment preview/cancel in both themes and narrow windows. Intel/Linux, accessibility, and installed-update acceptance remain pending. No live comment, release tag, push, or publication was performed. Work is isolated from concurrent Merge Radar changes on `codex/autobot-native-page`.
 
 2026-10-29: 0.12.0 Remote runs release preparation.
 

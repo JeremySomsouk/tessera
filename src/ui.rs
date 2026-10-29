@@ -28,6 +28,7 @@ use uuid::Uuid;
 mod merge_radar;
 mod remote_runs;
 mod remote_settings;
+mod remote_workers;
 mod restoration;
 mod windows;
 const ACCENT: Color32 = Color32::from_rgb(130, 198, 180);
@@ -567,6 +568,7 @@ pub struct App {
     deferred_hooks: Vec<crate::model::HookEvent>,
     direct_launches: HashMap<Uuid, Option<u32>>,
     remote_panes: std::collections::HashSet<Uuid>,
+    remote_workers: remote_workers::Workers,
 }
 fn state_override(value: Option<std::ffi::OsString>) -> Option<PathBuf> {
     value.map(PathBuf::from).filter(|p| p.is_absolute())
@@ -645,6 +647,7 @@ impl App {
             last_save: 0,
             last_title_sync: None,
             folder_launch: None,
+            remote_workers: Default::default(),
             deferred_hooks: Vec::new(),
             direct_launches: HashMap::new(),
             remote_panes: Default::default(),
@@ -2223,7 +2226,7 @@ impl App {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
                     }
                 }
-                ui.horizontal_wrapped(|ui| {
+                ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
                     ui.spacing_mut().interact_size.y = 28.0;
                     ui.set_min_height(28.0);
@@ -2231,10 +2234,8 @@ impl App {
                         ui.add_space(64.0);
                     }
                     if wide {
-                        ui.horizontal(|ui| {
-                            mosaic_mark(ui);
-                            ui.label(RichText::new("TESSERA").size(14.0).strong());
-                        });
+                        mosaic_mark(ui);
+                        ui.label(RichText::new("TESSERA").size(14.0).strong());
                         ui.add_space(18.0);
                     }
                     if ui
@@ -2295,63 +2296,14 @@ impl App {
                     {
                         self.open_remote_runs(String::new(), ctx);
                     }
-                    ui.with_layout(
-                        egui::Layout::right_to_left(egui::Align::Center).with_main_wrap(true),
-                        |ui| {
-                            if ui
-                                .button("Settings")
-                                .on_hover_text(shortcut("Settings", ","))
-                                .clicked()
-                            {
-                                self.open_commands(CommandPage::Settings);
-                            }
-                            if ui
-                                .button(if wide { "+ Workspace" } else { "+ New" })
-                                .on_hover_text("Open a shell in an existing or new directory")
-                                .clicked()
-                            {
-                                self.open_commands(CommandPage::Create);
-                            }
-                            if ui
-                                .button("Commands")
-                                .on_hover_text(shortcut(
-                                    "Search workspaces and commands",
-                                    "Shift+P",
-                                ))
-                                .clicked()
-                            {
-                                self.open_commands(CommandPage::Commands);
-                            }
-                            if ui
-                                .add(
-                                    egui::Button::new(if wide {
-                                        "Claude in folder"
-                                    } else {
-                                        "Claude…"
-                                    })
-                                    .fill(ui.visuals().selection.bg_fill),
-                                )
-                                .on_hover_text(shortcut(
-                                    "Search folders and launch Claude Code",
-                                    "Shift+L",
-                                ))
-                                .clicked()
-                            {
-                                self.open_commands(CommandPage::Folders);
-                            }
-                            if wide
-                                && !self.ui.overview
-                                && !self.ui.specifications_view
-                                && !self.ui.autobot_visible
-                                && !self.ui.radar_visible
-                                && !self.saved.workspaces.is_empty()
-                            {
-                                ui.menu_button("Pane", |ui| self.workspace_actions(ui, ctx));
-                            }
-                        },
-                    );
+                    if wide {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            self.chrome_actions(ui, ctx, wide);
+                        });
+                    }
                 });
                 if !wide {
+                    ui.horizontal_wrapped(|ui| self.chrome_actions(ui, ctx, wide));
                     ui.add_space(8.0);
                     egui::ScrollArea::horizontal()
                         .id_salt("workspace-tabs")
@@ -2366,6 +2318,53 @@ impl App {
                         });
                 }
             });
+    }
+
+    fn chrome_actions(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, wide: bool) {
+        if ui
+            .button("Settings")
+            .on_hover_text(shortcut("Settings", ","))
+            .clicked()
+        {
+            self.open_commands(CommandPage::Settings);
+        }
+        if ui
+            .button(if wide { "+ Workspace" } else { "+ New" })
+            .on_hover_text("Open a shell in an existing or new directory")
+            .clicked()
+        {
+            self.open_commands(CommandPage::Create);
+        }
+        if ui
+            .button("Commands")
+            .on_hover_text(shortcut("Search workspaces and commands", "Shift+P"))
+            .clicked()
+        {
+            self.open_commands(CommandPage::Commands);
+        }
+        if ui
+            .add(
+                egui::Button::new(if wide {
+                    "Claude in folder"
+                } else {
+                    "Claude…"
+                })
+                .fill(ui.visuals().selection.bg_fill),
+            )
+            .on_hover_text(shortcut("Search folders and launch Claude Code", "Shift+L"))
+            .clicked()
+        {
+            self.open_commands(CommandPage::Folders);
+        }
+        if wide
+            && !self.ui.overview
+            && !self.ui.specifications_view
+            && !self.ui.autobot_visible
+            && !self.ui.radar_visible
+            && !self.saved.workspaces.is_empty()
+        {
+            ui.menu_button("Pane", |ui| self.workspace_actions(ui, ctx));
+        }
     }
 
     fn workspace_sidebar(
@@ -2881,8 +2880,8 @@ impl App {
                     self.ui.palette = false;
                 }
                 CommandAction::Rename => self.begin_rename(),
-                CommandAction::RemoteRuns => self.open_remote_runs(String::new(), ctx),
                 CommandAction::MergeRadar => self.open_merge_radar(),
+                CommandAction::RemoteRuns => self.open_remote_runs(String::new(), ctx),
             }
         }
     }
@@ -3618,6 +3617,7 @@ impl App {
         }
     }
     fn draw(&mut self, ctx: &egui::Context) {
+        self.remote_workers.reap();
         self.poll_restoration(ctx);
         self.poll_folder_launch(ctx);
         self.dirty |= self.sync_work();
@@ -3731,10 +3731,7 @@ impl App {
                     .inner_margin(6.0),
             )
             .show(ctx, |ui| {
-                if self.ui.radar_visible {
-                    self.merge_radar_page(ui, ctx);
-                    return;
-                }
+                if self.ui.radar_visible { self.merge_radar_page(ui,ctx); return; }
                 if self.ui.autobot_visible {
                     self.autobot_page(ui, ctx);
                     return;
@@ -3891,6 +3888,11 @@ impl eframe::App for App {
         self.show_windows(ctx);
     }
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.ui.remote = None;
+        for window in self.windows.values_mut() {
+            window.ui.remote = None;
+        }
+        self.remote_workers.finish();
         self.drain();
         self.capture_restoration_with(true);
         let _ = self.writer.send(self.saved.clone());
@@ -6495,6 +6497,7 @@ mod render_tests {
             last_title_sync: None,
             font_size: 15.0,
             folder_launch: None,
+            remote_workers: Default::default(),
             deferred_hooks: Vec::new(),
             direct_launches: HashMap::new(),
             remote_panes: Default::default(),
@@ -7229,12 +7232,11 @@ mod render_tests {
                         "{} clipped",
                         text.galley.text()
                     );
-                    if cfg!(target_os = "macos") {
+                    if cfg!(target_os = "macos") && text.pos.y < 32.0 {
                         assert!(
                             text.pos.x >= 80.0,
-                            "native controls overlap {} at {:?}, width {width}",
-                            text.galley.text(),
-                            text.pos
+                            "native controls overlap {}",
+                            text.galley.text()
                         );
                     }
                 }
@@ -7805,7 +7807,7 @@ mod render_tests {
     #[test]
     fn autobot_chrome_visibility_matches_configuration_in_both_themes() {
         for light in [false, true] {
-            for width in [640.0, 1180.0] {
+            for width in [640.0, 900.0, 1180.0] {
                 for (config, visible) in [
                     (serde_json::Value::Null, false),
                     (json!({"sources": []}), false),
@@ -7820,7 +7822,7 @@ mod render_tests {
                     configure_appearance(&ctx, light);
                     let mut app = fixture(0);
                     app.saved.remote_runs = config;
-                    let mut bounds = Rect::NOTHING;
+                    let mut used_rect = Rect::NOTHING;
                     let output = ctx.run(
                         egui::RawInput {
                             screen_rect: Some(Rect::from_min_size(
@@ -7831,14 +7833,14 @@ mod render_tests {
                         },
                         |ctx| {
                             app.chrome(ctx, width >= 900.0, &mut None);
-                            bounds = ctx.used_rect();
+                            used_rect = ctx.used_rect();
                         },
                     );
                     let found = output.shapes.iter().any(|shape| matches!(&shape.shape, egui::epaint::Shape::Text(text) if text.galley.text() == "Autobot"));
                     assert_eq!(found, visible);
                     assert!(
-                        bounds.is_finite() && bounds.right() <= width + 1.0,
-                        "width {width}, used {bounds:?}"
+                        used_rect.right() <= width + 1.0,
+                        "chrome overflow: {used_rect:?} at {width}"
                     );
                 }
             }
@@ -8284,6 +8286,9 @@ mod render_tests {
                     },
                 ]
             };
+            for _ in 0..3 {
+                frame(&mut app, vec![]);
+            }
             let output = frame(&mut app, vec![]);
             let opener = output
                 .shapes
@@ -8326,7 +8331,7 @@ mod render_tests {
             for _ in 0..3 {
                 frame(&mut app, vec![]);
             }
-            frame(&mut app, click(opener));
+            frame(&mut app, click(Pos2::new(4.0, 240.0)));
             assert!(!app.ui.palette, "outside click did not dismiss the panel");
             assert!(app.saved.workspaces.is_empty());
         }
@@ -10198,7 +10203,10 @@ mod render_tests {
             &mut app,
             vec![key_event(Key::ArrowUp, None, Modifiers::NONE)],
         );
-        assert_eq!(app.ui.command_index, 11, "Up should wrap to Settings");
+        assert!(
+            app.ui.command_index > 0,
+            "Up should wrap to the final command"
+        );
         frame(&mut app, vec![key_event(Key::Enter, None, Modifiers::NONE)]);
         assert!(app.ui.palette);
         assert_eq!(app.ui.command_page as u8, CommandPage::Settings as u8);

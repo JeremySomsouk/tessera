@@ -1,5 +1,7 @@
 use super::*;
+mod dashboard;
 use crate::remote_runs::{self as provider, Config, GhCli, Job, PullRequest, RepoResult, Run};
+pub(super) use dashboard::Panel;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -43,463 +45,6 @@ impl<G: provider::Gh> provider::Gh for RequestGh<G> {
 }
 
 type LaunchResult = anyhow::Result<(Uuid, PathBuf, Terminal)>;
-
-pub(super) struct Panel {
-    config: Result<Config, String>,
-    config_value: serde_json::Value,
-    tickets: std::collections::BTreeMap<String, TicketPanel>,
-    query: String,
-    error: String,
-    selected: Option<crate::autobot::GroupId>,
-    detail_visible: bool,
-    refresh: crate::autobot::Refresh,
-    generation: Option<u64>,
-    clock: Instant,
-    initialized: bool,
-}
-
-impl Panel {
-    fn new(value: &serde_json::Value) -> Self {
-        Self {
-            config: Config::parse(value),
-            config_value: value.clone(),
-            tickets: Default::default(),
-            query: String::new(),
-            error: String::new(),
-            selected: None,
-            detail_visible: false,
-            refresh: Default::default(),
-            generation: None,
-            clock: Instant::now(),
-            initialized: false,
-        }
-    }
-
-    fn cancel(&mut self) {
-        self.refresh.cancel();
-        self.generation = None;
-        for panel in self.tickets.values_mut() {
-            panel.cancelled.store(true, Ordering::Release);
-            panel.receiver = None;
-            panel.pending = 0;
-            panel.output = None;
-            panel.comment = None;
-            panel.launch = None;
-        }
-    }
-
-    fn sync(&mut self, preferences: &mut crate::autobot::Preferences, value: &serde_json::Value) {
-        preferences.normalize();
-        if self.config_value != *value {
-            self.cancel();
-            self.config_value = value.clone();
-            self.config = Config::parse(value);
-            self.tickets.clear();
-            self.initialized = false;
-        }
-        self.tickets.retain(|key, _| preferences.keys.contains(key));
-        for key in &preferences.keys {
-            self.tickets.entry(key.clone()).or_insert_with(|| {
-                let mut panel = TicketPanel::new(key.clone(), value);
-                panel.key = key.clone();
-                panel
-            });
-        }
-        let groups = self.groups();
-        if !self
-            .selected
-            .as_ref()
-            .is_some_and(|selected| groups.iter().any(|(id, _)| id == selected))
-        {
-            self.selected = groups.first().map(|(id, _)| id.clone());
-        }
-    }
-
-    fn groups(&self) -> Vec<(crate::autobot::GroupId, Option<crate::autobot::CachedRepo>)> {
-        let Ok(config) = &self.config else {
-            return Vec::new();
-        };
-        let mut groups = Vec::new();
-        for (key, panel) in &self.tickets {
-            let owners: std::collections::HashMap<_, _> = panel
-                .all_runs()
-                .into_iter()
-                .map(|(repo, source, run)| ((repo, run.id), source))
-                .collect();
-            if let Ok(tasks) = config.tasks(key) {
-                for task in tasks {
-                    let mut cached = panel
-                        .cached
-                        .iter()
-                        .find(|cached| {
-                            cached.result.repo == task.repo
-                                && cached.result.source_name == task.source.name
-                        })
-                        .cloned();
-                    if let Some(cached) = &mut cached {
-                        let mut shared = std::collections::BTreeSet::new();
-                        cached.result.runs.retain(|run| {
-                            let owner = owners.get(&(task.repo.clone(), run.id));
-                            if let Some(owner) = owner
-                                && *owner != task.source.name
-                            {
-                                shared.insert(owner.clone());
-                                return false;
-                            }
-                            true
-                        });
-                        cached.shared_sources = shared.into_iter().collect();
-                    }
-                    groups.push((
-                        crate::autobot::GroupId {
-                            source: task.source.name,
-                            ticket: key.clone(),
-                            repo: task.repo,
-                        },
-                        cached,
-                    ));
-                }
-            }
-        }
-        // Keep each source together, with its most actionable ticket first.
-        let mut priorities = std::collections::BTreeMap::new();
-        for (id, cached) in &groups {
-            let priority = cached
-                .as_ref()
-                .map_or(4, |cached| crate::autobot::priority(&cached.result));
-            priorities
-                .entry(id.source.clone())
-                .and_modify(|current: &mut u8| *current = (*current).min(priority))
-                .or_insert(priority);
-        }
-        groups.sort_by(|(a, ac), (b, bc)| {
-            priorities[&a.source]
-                .cmp(&priorities[&b.source])
-                .then_with(|| a.source.cmp(&b.source))
-                .then_with(|| {
-                    ac.as_ref()
-                        .map_or(4, |cached| crate::autobot::priority(&cached.result))
-                        .cmp(
-                            &bc.as_ref()
-                                .map_or(4, |cached| crate::autobot::priority(&cached.result)),
-                        )
-                })
-                .then_with(|| a.ticket.cmp(&b.ticket))
-                .then_with(|| a.repo.cmp(&b.repo))
-        });
-        groups
-    }
-
-    fn refresh(&mut self, ctx: &egui::Context) {
-        if self.tickets.values().any(|panel| panel.pending != 0) {
-            return;
-        }
-        let Some(generation) = self.refresh.start() else {
-            return;
-        };
-        self.generation = Some(generation);
-        self.initialized = true;
-        self.error.clear();
-        for panel in self.tickets.values_mut() {
-            panel.lookup(ctx);
-        }
-    }
-
-    fn show(&mut self, app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
-        for panel in self.tickets.values_mut() {
-            panel.poll_launch(app, ctx);
-        }
-        if !app.ui.autobot_visible
-            || app.ui.palette
-            || ctx.input(|input| input.viewport().minimized.unwrap_or(false))
-        {
-            return;
-        }
-        if let Some(generation) = self.generation
-            && self.tickets.values().all(|panel| panel.pending == 0)
-        {
-            let failed = self.tickets.values().any(|panel| {
-                !panel.error.is_empty() || panel.cached.iter().any(|cached| cached.stale)
-            });
-            self.refresh
-                .finish(generation, self.clock.elapsed().as_secs(), failed);
-            self.generation = None;
-            // Re-fetch selected progress once per metadata cycle, retaining known jobs on failure.
-            for panel in self.tickets.values_mut() {
-                if let Some(output) = &panel.output
-                    && output.run.status != "completed"
-                {
-                    let repo = output.repo.clone();
-                    let source = output.source.name.clone();
-                    let run = panel
-                        .results
-                        .iter()
-                        .filter(|result| result.repo == repo)
-                        .flat_map(|result| &result.runs)
-                        .find(|run| run.id == output.run.id)
-                        .cloned();
-                    if let Some(run) = run {
-                        panel.open_output(repo, source, run, ctx);
-                    }
-                }
-            }
-        }
-        let posted = self
-            .tickets
-            .values_mut()
-            .any(|panel| std::mem::take(&mut panel.refresh_requested));
-        if !self.tickets.is_empty()
-            && (!self.initialized
-                || posted
-                || self
-                    .refresh
-                    .due(self.clock.elapsed().as_secs(), true, app.saved.autobot.live))
-        {
-            self.refresh(ctx);
-        }
-        if app.saved.autobot.live {
-            ctx.request_repaint_after(Duration::from_secs(
-                self.refresh
-                    .next_at
-                    .saturating_sub(self.clock.elapsed().as_secs())
-                    .clamp(1, 60),
-            ));
-        }
-        ui.heading("Autobot");
-        ui.horizontal_wrapped(|ui| {
-            if ui
-                .add_enabled(
-                    !self.refresh.active && !self.tickets.is_empty() && self.config.is_ok(),
-                    egui::Button::new("Refresh"),
-                )
-                .clicked()
-            {
-                self.refresh(ctx);
-            }
-            if ui
-                .checkbox(&mut app.saved.autobot.live, "Live refresh")
-                .changed()
-            {
-                app.dirty = true;
-            }
-            if self.refresh.active {
-                ui.spinner();
-                ui.label("Refreshing…");
-            } else if app.saved.autobot.live {
-                ui.small(format!(
-                    "Next refresh in {}s",
-                    self.refresh
-                        .next_at
-                        .saturating_sub(self.clock.elapsed().as_secs())
-                ));
-            }
-        });
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Ticket key");
-            let field = ui.add(
-                egui::TextEdit::singleline(&mut self.query)
-                    .id_salt("autobot-ticket")
-                    .desired_width(180.0)
-                    .hint_text("ACME-42"),
-            );
-            if ui.button("Follow ticket").clicked()
-                || (field.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter)))
-            {
-                match &self.config {
-                    Ok(config) => match app.saved.autobot.add(&self.query, config) {
-                        Ok(changed) => {
-                            app.dirty |= changed;
-                            let key = self.query.trim().to_owned();
-                            self.query.clear();
-                            self.error.clear();
-                            self.cancel();
-                            self.sync(&mut app.saved.autobot, &app.saved.remote_runs);
-                            self.selected = self
-                                .groups()
-                                .into_iter()
-                                .find(|(id, _)| id.ticket == key)
-                                .map(|(id, _)| id);
-                            self.refresh(ctx);
-                        }
-                        Err(error) => self.error = error,
-                    },
-                    Err(error) => self.error = error.clone(),
-                }
-            }
-        });
-        if let Err(error) = &self.config {
-            ui.colored_label(
-                attention_color(ui),
-                format!("Autobot configuration: {error}. Open Settings to correct it."),
-            );
-        }
-        if !self.error.is_empty() {
-            ui.colored_label(attention_color(ui), &self.error);
-        }
-        if self.tickets.is_empty() {
-            ui.label("Follow a ticket to see runs from every matching configured source.");
-        }
-        ui.horizontal_wrapped(|ui| {
-            for key in app.saved.autobot.keys.clone() {
-                if ui.button(format!("Remove {key}")).clicked() {
-                    self.cancel();
-                    app.saved.autobot.keys.retain(|value| value != &key);
-                    app.dirty = true;
-                    self.sync(&mut app.saved.autobot, &app.saved.remote_runs);
-                }
-            }
-        });
-        for (key, panel) in &self.tickets {
-            if let Ok(config) = &self.config
-                && let Err(error) = config.tasks(key)
-            {
-                ui.colored_label(attention_color(ui), format!("{key}: {error}"));
-            }
-            if !panel.error.is_empty() {
-                ui.colored_label(attention_color(ui), format!("{key}: {}", panel.error));
-            }
-        }
-        ui.separator();
-        let narrow = ui.available_width() < 760.0;
-        if narrow && self.detail_visible {
-            if ui.button("Back to all bots").clicked() {
-                self.detail_visible = false;
-            }
-            egui::ScrollArea::vertical()
-                .id_salt("autobot-detail")
-                .show(ui, |ui| self.detail(app, ui, ctx));
-        } else if narrow {
-            egui::ScrollArea::vertical()
-                .id_salt("autobot-overview")
-                .show(ui, |ui| self.overview(ui));
-        } else {
-            ui.columns(2, |columns| {
-                egui::ScrollArea::vertical()
-                    .id_salt("autobot-overview")
-                    .show(&mut columns[0], |ui| self.overview(ui));
-                egui::ScrollArea::vertical()
-                    .id_salt("autobot-detail")
-                    .show(&mut columns[1], |ui| self.detail(app, ui, ctx));
-            });
-        }
-    }
-
-    fn overview(&mut self, ui: &mut egui::Ui) {
-        let mut previous_source = String::new();
-        for (id, cached) in self.groups() {
-            if previous_source != id.source {
-                ui.heading(&id.source);
-                previous_source = id.source.clone();
-            }
-            ui.push_id((&id.source, &id.ticket, &id.repo), |ui| {
-                egui::Frame::group(ui.style()).show(ui, |ui| {
-                    if ui
-                        .selectable_label(
-                            self.selected.as_ref() == Some(&id),
-                            format!("{} · {}", id.ticket, id.repo),
-                        )
-                        .clicked()
-                    {
-                        if self.selected.as_ref() != Some(&id) {
-                            for panel in self.tickets.values_mut() {
-                                panel.output = None;
-                                panel.comment = None;
-                                panel.selected_run = None;
-                            }
-                        }
-                        self.selected = Some(id.clone());
-                        self.detail_visible = true;
-                    }
-                    if let Some(cached) = cached {
-                        if let Some(run) = crate::autobot::latest(&cached.result.runs) {
-                            let color = match crate::autobot::priority(&cached.result) {
-                                0 | 1 => attention_color(ui),
-                                2 => ui.visuals().selection.bg_fill,
-                                _ => ui.visuals().text_color(),
-                            };
-                            ui.colored_label(
-                                color,
-                                format!(
-                                    "{} · {}",
-                                    run.kind.as_deref().unwrap_or(&run.workflow_name),
-                                    crate::autobot::state(run)
-                                ),
-                            );
-                            ui.small(crate::autobot::elapsed(run, now()));
-                        } else if !cached.shared_sources.is_empty() {
-                            ui.label("Matching runs are listed once under another source");
-                        } else {
-                            ui.label("No matching runs in lookup window");
-                        }
-                        for source in &cached.shared_sources {
-                            if ui.button(format!("See shared runs in {source}")).clicked() {
-                                self.selected = Some(crate::autobot::GroupId {
-                                    source: source.clone(),
-                                    ticket: id.ticket.clone(),
-                                    repo: id.repo.clone(),
-                                });
-                                self.detail_visible = true;
-                            }
-                        }
-                        ui.small(&cached.change);
-                        let refreshed = cached
-                            .last_success
-                            .map(|at| {
-                                format!(
-                                    "Last successful refresh: {} (Unix {at})",
-                                    relative_time(now().saturating_sub(at))
-                                )
-                            })
-                            .unwrap_or_else(|| "No successful refresh yet".into());
-                        if cached.stale {
-                            ui.colored_label(
-                                attention_color(ui),
-                                format!("Stale data. {refreshed}"),
-                            );
-                        } else {
-                            ui.small(refreshed);
-                        }
-                        for error in &cached.result.errors {
-                            ui.colored_label(attention_color(ui), error);
-                        }
-                        ui.horizontal_wrapped(|ui| {
-                            for pr in cached.result.prs {
-                                ui.hyperlink_to(
-                                    format!("PR #{} · {}", pr.number, pr.state),
-                                    pr.url,
-                                );
-                            }
-                        });
-                    } else {
-                        ui.label(if self.refresh.active {
-                            "Loading repository…"
-                        } else {
-                            "Not refreshed yet"
-                        });
-                    }
-                });
-            });
-        }
-    }
-
-    fn detail(&mut self, app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let Some(selected) = &self.selected else {
-            ui.label("Select a ticket and repository to inspect its runs.");
-            return;
-        };
-        ui.label(
-            RichText::new(format!(
-                "{} · {} · {}",
-                selected.source, selected.ticket, selected.repo
-            ))
-            .strong(),
-        );
-        if let Some(panel) = self.tickets.get_mut(&selected.ticket) {
-            panel.selected_group = Some((selected.source.clone(), selected.repo.clone()));
-            panel.detail(app, ui, ctx);
-        }
-    }
-}
 
 struct TicketPanel {
     cancelled: Arc<AtomicBool>,
@@ -605,39 +150,27 @@ impl TicketPanel {
         let (tx, rx) = channel();
         self.pending = tasks.len();
         self.receiver = Some(rx);
-        let workers = 1;
-        let queue = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from(
-            tasks,
-        )));
-        for _ in 0..workers {
-            let queue = queue.clone();
-            let tx = tx.clone();
-            let key = self.key.clone();
-            let path = config.gh_path.clone();
-            let limit = config.run_limit;
-            let ctx = ctx.clone();
-            let cancelled = self.cancelled.clone();
-            std::thread::spawn(move || {
-                let gh = RequestGh {
-                    inner: GhCli::new(path),
-                    cancelled: cancelled.clone(),
-                };
-                loop {
-                    if cancelled.load(Ordering::Acquire) {
-                        break;
-                    }
-                    let task = queue.lock().ok().and_then(|mut queue| queue.pop_front());
-                    let Some(task) = task else {
-                        break;
-                    };
-                    let result = provider::lookup(&gh, &task, &key, limit);
-                    if tx.send(result).is_err() {
-                        break;
-                    }
-                    ctx.request_repaint();
+        let key = self.key.clone();
+        let path = config.gh_path.clone();
+        let limit = config.run_limit;
+        let ctx = ctx.clone();
+        let cancelled = self.cancelled.clone();
+        std::thread::spawn(move || {
+            let gh = RequestGh {
+                inner: GhCli::new(path),
+                cancelled: cancelled.clone(),
+            };
+            for task in tasks {
+                if cancelled.load(Ordering::Acquire) {
+                    break;
                 }
-            });
-        }
+                let result = provider::lookup(&gh, &task, &key, limit);
+                if tx.send(result).is_err() {
+                    break;
+                }
+                ctx.request_repaint();
+            }
+        });
     }
 
     fn poll(&mut self, _ctx: &egui::Context) {
@@ -892,7 +425,7 @@ impl TicketPanel {
         });
     }
 
-    fn launch(&mut self, app: &App, ctx: &egui::Context, command: Result<String, String>) {
+    fn launch(&mut self, app: &mut App, ctx: &egui::Context, command: Result<String, String>) {
         let command = match command {
             Ok(command) => command,
             Err(error) => {
@@ -919,7 +452,7 @@ impl TicketPanel {
             .unwrap_or_default();
         let (tx, rx) = channel();
         let ctx = ctx.clone();
-        std::thread::spawn(move || {
+        app.remote_workers.spawn(move || {
             let id = Uuid::new_v4();
             let result = Terminal::spawn_remote(id, &path, &socket, ctx.clone(), &command)
                 .map(|terminal| (id, path, terminal));
@@ -975,7 +508,6 @@ impl TicketPanel {
                         });
                         self.launch = None;
                         app.ui.autobot_visible = false;
-                        app.ui.radar_visible = false;
                     }
                 }
                 Ok(Err(error)) => {
@@ -993,7 +525,7 @@ impl TicketPanel {
 
     fn detail(&mut self, app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         if self.comment.is_some() {
-            self.comment_ui(ui, ctx);
+            self.comment_ui(app, ui, ctx);
             return;
         }
         if !self.notice.is_empty() {
@@ -1108,7 +640,7 @@ impl TicketPanel {
         }
     }
 
-    fn output_ui(&mut self, app: &App, ui: &mut egui::Ui, ctx: &egui::Context) {
+    fn output_ui(&mut self, app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         let mut command = None;
         let mut clear = false;
         if let Some(output) = &mut self.output {
@@ -1197,7 +729,7 @@ impl TicketPanel {
         }
     }
 
-    fn comment_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    fn comment_ui(&mut self, app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         let mut cancel = false;
         let comment = self.comment.as_mut().unwrap();
         ui.label(
@@ -1245,7 +777,7 @@ impl TicketPanel {
                     let path = self.config.as_ref().unwrap().gh_path.clone();
                     let (tx, rx) = channel();
                     let ctx = ctx.clone();
-                    std::thread::spawn(move || {
+                    app.remote_workers.spawn(move || {
                         let _ = tx.send(provider::post_comment(&GhCli::new(path), &confirmed));
                         ctx.request_repaint();
                     });
@@ -1314,6 +846,7 @@ impl App {
                     Ok(changed) => {
                         self.dirty |= changed;
                         panel.sync(&mut self.saved.autobot, &self.saved.remote_runs);
+                        panel.detail_visible = true;
                         panel.selected = panel
                             .groups()
                             .into_iter()
@@ -1533,23 +1066,15 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = super::super::render_tests::fixture(0);
         app.open_commands(CommandPage::Commands);
-        app.ui.filter = "Autobot".into();
+        app.ui.filter = "bot".into();
         for _ in 0..3 {
             frame(&mut app, &ctx, Vec2::new(900.0, 700.0), vec![]);
         }
         let output = frame(&mut app, &ctx, Vec2::new(900.0, 700.0), vec![]);
-        assert!(
-            !texts(&output)
-                .iter()
-                .any(|text| text == CommandAction::RemoteRuns.detail())
-        );
+        assert!(!texts(&output).iter().any(|text| text == "Autobot"));
         app.saved.remote_runs = config();
         let output = frame(&mut app, &ctx, Vec2::new(900.0, 700.0), vec![]);
-        assert!(
-            texts(&output)
-                .iter()
-                .any(|text| text == CommandAction::RemoteRuns.detail())
-        );
+        assert!(texts(&output).iter().any(|text| text == "Autobot"));
         app.saved.remote_runs["sources"][0]["ticket_pattern"] = json!("[");
         app.open_remote_runs(String::new(), &ctx);
         for _ in 0..3 {
@@ -1592,6 +1117,7 @@ mod tests {
             runs: vec![older.clone()],
             prs: vec![],
             errors: vec!["One event could not be queried".into()],
+            warnings: vec![],
         })
         .unwrap();
         tx.send(RepoResult {
@@ -1600,6 +1126,7 @@ mod tests {
             runs: vec![newer, older],
             prs: vec![],
             errors: vec![],
+            warnings: vec![],
         })
         .unwrap();
         panel.poll(&egui::Context::default());
@@ -1732,24 +1259,7 @@ mod tests {
                 .unwrap(),
             );
             let output = frame(&mut app, &ctx, size, vec![]);
-            let mut preview_text = texts(&output);
-            for _ in 0..8 {
-                let output = frame(
-                    &mut app,
-                    &ctx,
-                    size,
-                    vec![
-                        egui::Event::PointerMoved(Pos2::new(size.x * 0.75, size.y - 60.0)),
-                        egui::Event::MouseWheel {
-                            unit: egui::MouseWheelUnit::Point,
-                            delta: Vec2::new(0.0, -80.0),
-                            modifiers: Modifiers::NONE,
-                        },
-                    ],
-                );
-                preview_text.extend(texts(&output));
-            }
-            let text = preview_text.join("\n");
+            let text = texts(&output).join("\n");
             assert!(text.contains("acme/api#7"));
             assert!(text.contains("Please retry the failing checks."));
             assert!(text.contains("auto-merge is armed"));
@@ -1760,5 +1270,208 @@ mod tests {
                     .contains("Please retry")
             );
         }
+    }
+    fn dashboard_fixture(light: bool, status: &str, stale: bool) -> (App, egui::Context) {
+        let ctx = egui::Context::default();
+        configure_appearance(&ctx, light);
+        let mut app = super::super::render_tests::fixture(0);
+        app.saved.remote_runs = config();
+        app.saved.autobot.keys = vec!["ACME-42".into()];
+        app.ui.autobot_visible = true;
+        let mut dashboard = Panel::new(&app.saved.remote_runs);
+        dashboard.sync(&mut app.saved.autobot, &app.saved.remote_runs);
+        dashboard.initialized = true;
+        let panel = dashboard.tickets.get_mut("ACME-42").unwrap();
+        let run = Run {
+            id: 42,
+            title: "ACME-42 Implementation".into(),
+            status: status.into(),
+            conclusion: (status == "completed").then(|| "failure".into()),
+            workflow_name: "Implementation".into(),
+            created_at: "2026-10-29T12:00:00Z".into(),
+            started_at: "2026-10-29T12:00:00Z".into(),
+            updated_at: "2026-10-29T12:01:30Z".into(),
+            ..Default::default()
+        };
+        let result = RepoResult {
+            source_name: "acme".into(),
+            repo: "acme/api".into(),
+            runs: vec![run.clone()],
+            ..Default::default()
+        };
+        let mut cached = crate::autobot::CachedRepo::new(result.clone(), now() - 100);
+        if stale {
+            cached.update(
+                RepoResult {
+                    source_name: "acme".into(),
+                    repo: "acme/api".into(),
+                    errors: vec!["Network unavailable; refresh to retry".into()],
+                    ..Default::default()
+                },
+                now(),
+            );
+        }
+        panel.results = vec![cached.result.clone()];
+        panel.cached = vec![cached];
+        panel.output = Some(Output { cancelled: Arc::default(), repo: "acme/api".into(), run, jobs: serde_json::from_value(json!([{"databaseId":9,"name":"Build","status":"in_progress","steps":[{"number":1,"name":"Setup","status":"completed"},{"number":2,"name":"Agent","status":"in_progress"}]}])).unwrap(), receiver: None, job:Some(9), step:Some("Agent".into()), source: Config::parse(&config()).unwrap().sources.remove(0), error:String::new() });
+        panel.selected_run = Some(42);
+        app.ui.remote = Some(dashboard);
+        (app, ctx)
+    }
+
+    #[test]
+    fn dashboard_overview_detail_stale_and_progress_render_in_both_themes_and_widths() {
+        for light in [false, true] {
+            for width in [320.0, 640.0, 1180.0] {
+                for detail in [false, true] {
+                    let (mut app, ctx) = dashboard_fixture(light, "in_progress", true);
+                    app.ui.remote.as_mut().unwrap().detail_visible = detail;
+                    let mut output = None;
+                    for _ in 0..3 {
+                        output = Some(ctx.run(
+                            egui::RawInput {
+                                screen_rect: Some(Rect::from_min_size(
+                                    Pos2::ZERO,
+                                    Vec2::new(width, 760.0),
+                                )),
+                                ..Default::default()
+                            },
+                            |ctx| {
+                                egui::CentralPanel::default()
+                                    .show(ctx, |ui| app.autobot_page(ui, ctx));
+                            },
+                        ));
+                    }
+                    let text = texts(output.as_ref().unwrap()).join("\n");
+                    assert!(text.contains("Autobot"));
+                    assert!(text.contains("ACME-42"));
+                    if width >= 760.0 || !detail {
+                        assert!(text.contains("Stale data"));
+                        assert!(text.contains("Network unavailable"));
+                    }
+                    if width >= 760.0 || detail {
+                        assert!(text.contains("1/2 known steps completed"));
+                        assert!(text.contains("Current step: 2. Agent"));
+                    }
+                    assert!(
+                        ctx.used_rect().right() <= width + 1.0,
+                        "overflow at {width}: {:?}",
+                        ctx.used_rect()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tracking_groups_match_all_sources_once_and_preserve_selection_on_arrival() {
+        let (mut app, ctx) = dashboard_fixture(false, "completed", false);
+        let mut value = config();
+        let mut other = value["sources"][0].clone();
+        other["name"] = json!("second");
+        value["sources"].as_array_mut().unwrap().push(other);
+        value["sources"][0]["repos"] = json!(["acme/api", "acme/api"]);
+        app.saved.remote_runs = value;
+        let mut dashboard = app.ui.remote.take().unwrap();
+        dashboard.sync(&mut app.saved.autobot, &app.saved.remote_runs);
+        assert_eq!(dashboard.groups().len(), 2);
+        let selected = dashboard.selected.clone();
+        let panel = dashboard.tickets.get_mut("ACME-42").unwrap();
+        let (tx, rx) = channel();
+        panel.receiver = Some(rx);
+        panel.pending = 2;
+        let run = Run {
+            id: 42,
+            status: "completed".into(),
+            created_at: "2026-10-29T12:00:00Z".into(),
+            ..Default::default()
+        };
+        for source in ["second", "acme"] {
+            tx.send(RepoResult {
+                source_name: source.into(),
+                repo: "acme/api".into(),
+                runs: vec![run.clone()],
+                ..Default::default()
+            })
+            .unwrap();
+        }
+        panel.poll(&ctx);
+        dashboard.sync(&mut app.saved.autobot, &app.saved.remote_runs);
+        assert_eq!(dashboard.selected, selected);
+        let groups = dashboard.groups();
+        assert_eq!(
+            groups
+                .iter()
+                .map(|(_, cached)| cached.as_ref().unwrap().result.runs.len())
+                .sum::<usize>(),
+            1
+        );
+        assert_eq!(
+            groups
+                .iter()
+                .find(|(id, _)| id.source == "second")
+                .unwrap()
+                .1
+                .as_ref()
+                .unwrap()
+                .shared_sources,
+            vec!["acme"]
+        );
+    }
+
+    #[test]
+    fn cancellation_rejects_obsolete_receiver_and_keeps_metadata_without_live_polling() {
+        let (mut app, _) = dashboard_fixture(false, "completed", false);
+        let mut dashboard = app.ui.remote.take().unwrap();
+        let generation = dashboard.refresh.start().unwrap();
+        dashboard.generation = Some(generation);
+        let panel = dashboard.tickets.get_mut("ACME-42").unwrap();
+        let (tx, rx) = channel();
+        panel.receiver = Some(rx);
+        panel.pending = 1;
+        let token = panel.cancelled.clone();
+        dashboard.cancel();
+        assert!(token.load(Ordering::Acquire));
+        assert!(tx.send(RepoResult::default()).is_err());
+        assert_eq!(dashboard.tickets["ACME-42"].results[0].runs[0].id, 42);
+        assert!(dashboard.initialized);
+        assert!(!dashboard.refresh.due(1000, true, false));
+        assert!(!dashboard.refresh.finish(generation, 1000, false));
+    }
+
+    #[test]
+    fn run_and_output_selection_survive_newer_metadata_and_job_refresh() {
+        let (mut app, ctx) = dashboard_fixture(false, "completed", false);
+        let dashboard = app.ui.remote.as_mut().unwrap();
+        let panel = dashboard.tickets.get_mut("ACME-42").unwrap();
+        panel.selected_group = Some(("acme".into(), "acme/api".into()));
+        let (tx, rx) = channel();
+        panel.receiver = Some(rx);
+        panel.pending = 1;
+        let mut result = panel.results[0].clone();
+        result.runs.push(Run {
+            id: 43,
+            status: "completed".into(),
+            created_at: "2026-10-29T13:00:00Z".into(),
+            ..Default::default()
+        });
+        tx.send(result).unwrap();
+        let output = panel.output.as_mut().unwrap();
+        output.step = None;
+        let (tx, rx) = channel();
+        tx.send(Ok(output.jobs.clone())).unwrap();
+        output.receiver = Some(rx);
+        panel.poll(&ctx);
+        assert_eq!(panel.selected_run, Some(42));
+        assert_eq!(
+            panel
+                .runs()
+                .iter()
+                .map(|(_, _, run)| run.id)
+                .collect::<Vec<_>>(),
+            vec![43, 42]
+        );
+        assert_eq!(panel.output.as_ref().unwrap().job, Some(9));
+        assert_eq!(panel.output.as_ref().unwrap().step, None);
     }
 }

@@ -6,9 +6,9 @@
 
 See which task needs a decision, keep related agent sessions together, and carry specifications and work stages beyond a single terminal session. Tessera brings that context into a native terminal workspace, so you can return to the CLI to review, approve, and act.
 
-[Download](https://github.com/JeremySomsouk/tessera/releases) · [Getting started](#install) · [Documentation](docs/usage.md) · [Release notes](docs/releases/0.13.0.md)
+[Download](https://github.com/JeremySomsouk/tessera/releases) · [Getting started](#install) · [Documentation](docs/usage.md) · [Release notes](docs/releases/0.14.0.md)
 
-Tessera runs on **macOS and Linux**, on Intel/AMD and ARM64. Built with Rust, with no browser runtime. Current version: **0.13.0 (alpha)**.
+Tessera runs on **macOS and Linux**, on Intel/AMD and ARM64. Built with Rust, with no browser runtime. Current version: **0.14.0 (alpha)**.
 
 ## A look inside
 
@@ -71,9 +71,7 @@ Open local agents also appear before hooks arrive, labelled **Untracked** until 
 
 ## Everyday use
 
-Use **Terminal** for shells, **Work** for task context, **Merge Radar** for your GitHub pull requests, and **Autobot** for configured GitHub Actions sources. **+ Workspace** opens a directory. **Commands** finds workspaces and actions; **Pane** groups split and maximize controls. **Settings** holds appearance, folder search roots, terminal behavior, Autobot sources, and updates.
-
-**Merge Radar** brings incoming reviews, merge blockers, waiting PRs, and ready changes into Tessera. It reads through your authenticated `gh` CLI, with saved filters, optional repository/team review scopes, bot grouping, copy actions, and 24-hour snoozes. Open **Radar settings** on the page to configure it. [Merge Radar controls](docs/usage.md#merge-radar)
+Use **Terminal** for shells, **Work** for task context, and **Autobot** for configured GitHub Actions sources. **+ Workspace** opens a directory. **Commands** finds workspaces and actions; **Pane** groups split and maximize controls. **Settings** holds appearance, folder search roots, terminal behavior, Autobot sources, and updates.
 
 Configure an Autobot source in Settings, then track ticket keys such as `ACME-42`. The page groups recent runs and linked pull requests by source and ticket, surfaces failures, and opens a run timeline with job/step progress. Refresh manually or enable optional live refresh while the page is visible. Autobot stays hidden until a source is configured. Authentication remains with your installed `gh` CLI. [Autobot setup and controls](docs/usage.md#autobot)
 

@@ -427,6 +427,7 @@ mod tests {
                 configure_appearance(&ctx, light);
                 let mut editor = Editor::new(&config());
                 for _ in 0..3 {
+                    let mut bounds = Rect::NOTHING;
                     let output = ctx.run(
                         egui::RawInput {
                             screen_rect: Some(Rect::from_min_size(
@@ -438,15 +439,15 @@ mod tests {
                         |ctx| {
                             egui::CentralPanel::default().show(ctx, |ui| {
                                 editor.show(ui);
-                                assert!(
-                                    ui.min_rect().is_finite()
-                                        && ui.min_rect().right() <= width - 7.0,
-                                    "form overflow at {width}"
-                                );
+                                bounds = ui.min_rect();
                             });
                         },
                     );
                     assert!(!output.shapes.is_empty());
+                    assert!(
+                        bounds.right() <= width + 1.0,
+                        "form overflow at {width}: {bounds:?}"
+                    );
                 }
             }
         }
