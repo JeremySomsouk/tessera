@@ -1,0 +1,6 @@
+[
+ {"number":7,"title":"Implement ATL-42","url":"https://github.com/fiction/atlas/pull/7","headRefName":"feature/widgets","state":"OPEN","autoMergeRequest":null},
+ {"number":8,"title":"Widget work","url":"https://github.com/fiction/atlas/pull/8","headRefName":"feature/ATL-42_widgets","state":"OPEN","autoMergeRequest":{"enabledAt":"2026-10-29T11:00:00Z"}},
+ {"number":9,"title":"ATL-420 follow up","url":"https://github.com/fiction/atlas/pull/9","headRefName":"ATL-420","state":"CLOSED","autoMergeRequest":null},
+ {"number":10,"title":"ATL-42 previous work","url":"https://github.com/fiction/atlas/pull/10","headRefName":"previous","state":"MERGED","autoMergeRequest":null}
+]

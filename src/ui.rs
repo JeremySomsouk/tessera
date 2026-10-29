@@ -25,6 +25,7 @@ use std::{
     time::{Duration, Instant},
 };
 use uuid::Uuid;
+mod remote_runs;
 mod restoration;
 mod windows;
 const ACCENT: Color32 = Color32::from_rgb(130, 198, 180);
@@ -257,6 +258,8 @@ struct Saved {
     folder_search_roots: Vec<String>,
     #[serde(default)]
     recent_folders: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    remote_runs: serde_json::Value,
 }
 
 impl Default for Saved {
@@ -276,6 +279,7 @@ impl Default for Saved {
             clickable_codex_choices: default_clickable_choices(),
             folder_search_roots: crate::folders::default_roots(),
             recent_folders: Vec::new(),
+            remote_runs: serde_json::Value::Null,
         }
     }
 }
@@ -449,6 +453,7 @@ struct WorkspaceRename {
 }
 
 struct WindowUi {
+    remote: Option<remote_runs::Panel>,
     active: usize,
     overview: bool,
     specifications_view: bool,
@@ -488,6 +493,7 @@ impl Default for WindowUi {
     fn default() -> Self {
         Self {
             active: 0,
+            remote: None,
             overview: false,
             specifications_view: false,
             selected_spec: None,
@@ -544,6 +550,7 @@ pub struct App {
     folder_launch: Option<FolderLaunch>,
     deferred_hooks: Vec<crate::model::HookEvent>,
     direct_launches: HashMap<Uuid, Option<u32>>,
+    remote_panes: std::collections::HashSet<Uuid>,
 }
 fn state_override(value: Option<std::ffi::OsString>) -> Option<PathBuf> {
     value.map(PathBuf::from).filter(|p| p.is_absolute())
@@ -624,6 +631,7 @@ impl App {
             folder_launch: None,
             deferred_hooks: Vec::new(),
             direct_launches: HashMap::new(),
+            remote_panes: Default::default(),
             restoration: Default::default(),
         };
         match endpoint {
@@ -868,6 +876,7 @@ impl App {
         }
     }
     fn stop_terminal(&mut self, id: Uuid) {
+        self.remote_panes.remove(&id);
         self.saved.restoration.panes.remove(&id);
         self.restoration.pending.remove(&id);
         self.restoration.resumed.remove(&id);
@@ -1101,6 +1110,7 @@ impl App {
             }
             // Agent launches retain their output until explicitly closed.
             if !linked
+                && !self.remote_panes.contains(&id)
                 && !self.restoration.pending.contains_key(&id)
                 && !self.restoration.resumed.contains(&id)
             {
@@ -1226,7 +1236,7 @@ impl App {
         } else {
             Modifiers::CTRL | Modifiers::ALT
         };
-        if self.ui.rename.is_some() || self.ui.closing.is_some() {
+        if self.ui.rename.is_some() || self.ui.closing.is_some() || self.ui.remote.is_some() {
             return;
         }
         if ctx.input_mut(|i| i.consume_key(command | Modifiers::SHIFT, Key::L)) {
@@ -1930,6 +1940,7 @@ impl App {
             self.open_work_specification(index);
         }
         ui.add_space(10.0);
+        self.remote_work(index, ui);
         section_label(ui, "LINKED SESSIONS");
         let sessions: Vec<_> = self
             .saved
@@ -2648,6 +2659,7 @@ impl App {
             }
         }
         for action in [
+            CommandAction::RemoteRuns,
             CommandAction::Folders,
             CommandAction::Create,
             CommandAction::NewWindow,
@@ -2658,7 +2670,9 @@ impl App {
             CommandAction::Rename,
             CommandAction::Settings,
         ] {
-            if action.label().to_lowercase().contains(&query) {
+            if action.label().to_lowercase().contains(&query)
+                && (action != CommandAction::RemoteRuns || self.remote_available())
+            {
                 results.push(action);
             }
         }
@@ -2785,6 +2799,7 @@ impl App {
                     self.ui.palette = false;
                 }
                 CommandAction::Rename => self.begin_rename(),
+                CommandAction::RemoteRuns => self.open_remote_runs(String::new(), ctx),
             }
         }
     }
@@ -3054,6 +3069,14 @@ impl App {
     }
 
     fn settings(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if !self.saved.remote_runs.is_null()
+            && let Err(error) = crate::remote_runs::Config::parse(&self.saved.remote_runs)
+        {
+            ui.colored_label(
+                attention_color(ui),
+                format!("Remote runs configuration: {error}"),
+            );
+        }
         section_label(ui, "APPEARANCE");
         ui.add_space(8.0);
         ui.horizontal(|ui| {
@@ -3644,7 +3667,7 @@ impl App {
                     w.layout.rects(ui, rect, &mut rects);
                 }
                 let mut focused = w.focus;
-                if !self.ui.palette && self.ui.rename.is_none() && self.ui.closing.is_none() {
+                if !self.ui.palette && self.ui.rename.is_none() && self.ui.closing.is_none() && self.ui.remote.is_none() {
                     let dropped = ctx.input_mut(|i| std::mem::take(&mut i.raw.dropped_files));
                     if !dropped.is_empty() {
                         let pointer = ctx.input(|i| i.pointer.latest_pos());
@@ -3694,12 +3717,15 @@ impl App {
                                     && !self.restoration.pending.contains_key(&id)
                                     && !self.ui.palette
                                     && self.ui.rename.is_none()
-                                    && self.ui.closing.is_none(),
+                                    && self.ui.closing.is_none()
+                                    && self.ui.remote.is_none(),
+
                                 self.font_size,
                                 self.saved.clickable_codex_choices
                                     && !self.ui.palette
                                     && self.ui.rename.is_none()
-                                    && self.ui.closing.is_none(),
+                                    && self.ui.closing.is_none()
+                                    && self.ui.remote.is_none(),
                             );
                             if let Some(text) = new_tab {
                                 selection_tab = Some((id, text));
@@ -3727,6 +3753,7 @@ impl App {
         }
         self.rename_dialog(ctx);
         self.close_dialog(ctx);
+        self.remote_dialog(ctx);
         if let Some(workspace) = self.saved.workspaces.get(self.ui.active) {
             self.saved.restoration.active = Some(workspace.task.id);
         }
@@ -3768,6 +3795,7 @@ impl eframe::App for App {
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CommandAction {
+    RemoteRuns,
     Workspace(usize),
     Folders,
     Create,
@@ -3783,6 +3811,7 @@ impl CommandAction {
     fn label(self) -> &'static str {
         match self {
             Self::Workspace(_) => "Workspace",
+            Self::RemoteRuns => "Remote runs for ticket…",
             Self::Folders => "Claude in folder",
             Self::Create => "New workspace",
             Self::NewWindow => "New terminal window",
@@ -3797,6 +3826,7 @@ impl CommandAction {
     fn detail(self) -> &'static str {
         match self {
             Self::Workspace(_) => "",
+            Self::RemoteRuns => "Follow configured GitHub Actions runs and linked pull requests",
             Self::Folders => "Search local folders and launch Claude Code",
             Self::Create => "Choose a directory and an optional name",
             Self::NewWindow => "Open a shell in a new window in the current directory",
@@ -5300,6 +5330,19 @@ fn encode_key(key: Key, m: Modifiers, mode: TermMode) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn remote_preferences_and_ticket_keys_survive_history_roundtrip() {
+        let mut value = serde_json::to_value(Saved::default()).unwrap();
+        value["remote_runs"] = serde_json::json!({"sources": "invalid, but isolated"});
+        let mut work = serde_json::to_value(WorkItem::new("Task".into(), "/tmp".into())).unwrap();
+        work["ticket_key"] = serde_json::json!("ACME-42");
+        value["work_items"] = serde_json::json!([work]);
+        let saved: Saved = serde_json::from_value(value).unwrap();
+        let restored = serde_json::to_value(saved).unwrap();
+        assert_eq!(restored["remote_runs"]["sources"], "invalid, but isolated");
+        assert_eq!(restored["work_items"][0]["ticket_key"], "ACME-42");
+    }
+
+    #[test]
     fn command_enter_encodes_newline_and_preserves_other_shortcuts() {
         for mode in [TermMode::NONE, TermMode::APP_CURSOR, TermMode::ALT_SCREEN] {
             assert_eq!(
@@ -6343,6 +6386,7 @@ mod render_tests {
             folder_launch: None,
             deferred_hooks: Vec::new(),
             direct_launches: HashMap::new(),
+            remote_panes: Default::default(),
             restoration: Default::default(),
         }
     }

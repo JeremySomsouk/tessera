@@ -1,0 +1,5 @@
+[
+ {"databaseId":102,"displayTitle":"Review ATL-42","status":"completed","conclusion":"success","createdAt":"2026-10-29T12:00:00Z","url":"https://github.com/fiction/atlas/actions/runs/102","workflowName":"Remote review","event":"workflow_dispatch"},
+ {"databaseId":101,"displayTitle":"Implement ATL-42","status":"in_progress","conclusion":null,"createdAt":"2026-10-29T11:00:00Z","url":"https://github.com/fiction/atlas/actions/runs/101","workflowName":"Remote implementation","event":"workflow_dispatch"},
+ {"databaseId":103,"displayTitle":"Implement ATL-420","status":"queued","conclusion":null,"createdAt":"2026-10-29T13:00:00Z","url":"https://github.com/fiction/atlas/actions/runs/103","workflowName":"Remote implementation","event":"workflow_dispatch"}
+]

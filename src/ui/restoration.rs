@@ -62,15 +62,29 @@ impl App {
     }
     pub(super) fn capture_restoration_with(&mut self, wait: bool) {
         self.capture_windows();
-        let mut ids = Vec::new();
+        let mut directories = HashMap::new();
         for workspace in &self.saved.workspaces {
+            let mut ids = Vec::new();
             workspace.layout.ids(&mut ids);
+            for id in ids {
+                directories.insert(id, workspace.task.directory.clone());
+            }
         }
         self.saved
             .restoration
             .panes
-            .retain(|id, _| ids.contains(id));
-        for id in ids {
+            .retain(|id, _| directories.contains_key(id));
+        for (id, directory) in directories {
+            if self.remote_panes.contains(&id) {
+                self.saved.restoration.panes.insert(
+                    id,
+                    SavedPane {
+                        directory,
+                        ..Default::default()
+                    },
+                );
+                continue;
+            }
             let conversation = self.pane_conversation(id);
             let saved = self.saved.restoration.panes.entry(id).or_default();
             // A failed resume remains retryable even after discovery marks it disconnected.
@@ -361,6 +375,94 @@ mod tests {
         app.capture_restoration();
         crate::snapshot::save(path, &app.saved).unwrap();
         crate::snapshot::load(path).unwrap().unwrap()
+    }
+
+    #[test]
+    fn remote_output_never_enters_snapshots_and_reopens_as_a_fresh_shell() {
+        let ctx = egui::Context::default();
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().canonicalize().unwrap();
+        let private_directory = directory.join("remote-private-directory");
+        std::fs::create_dir(&private_directory).unwrap();
+        let mut app = fixture(0);
+        assert!(app.add_workspace_in(&ctx, directory.to_string_lossy().into_owned()));
+        let ordinary = app.saved.workspaces[0].focus;
+        app.split(&ctx, true);
+        let remote = app.saved.workspaces[0].focus;
+        app.remote_panes.insert(remote);
+        app.panes[&ordinary]
+            .terminal
+            .input(b"printf 'ORDINARY_%s\\n' OUTPUT\n".to_vec())
+            .unwrap();
+        app.panes[&remote]
+            .terminal
+            .input(
+                format!(
+                    "cd '{}'; PRIVATE_COMMAND_BODY=private-command; printf 'REMOTE_%s\\n' PRIVATE_OUTPUT\n",
+                    private_directory.display()
+                )
+                .into_bytes(),
+            )
+            .unwrap();
+        wait_for(|| {
+            app.panes[&remote]
+                .terminal
+                .snapshot_output()
+                .contains("REMOTE_PRIVATE_OUTPUT")
+                && app.panes[&ordinary]
+                    .terminal
+                    .snapshot_output()
+                    .contains("ORDINARY_OUTPUT")
+        });
+        app.saved.restoration.panes.insert(
+            remote,
+            SavedPane {
+                directory: private_directory.to_string_lossy().into_owned(),
+                output: "REMOTE_STALE_OUTPUT".into(),
+                conversation: Some((Agent::Codex, "REMOTE_PRIVATE_CONVERSATION".into())),
+                resume_directory: Some(private_directory.to_string_lossy().into_owned()),
+            },
+        );
+        app.restoration
+            .history
+            .insert(remote, "REMOTE_PRIVATE_HISTORY".into());
+        for wait in [false, true, false] {
+            app.capture_restoration_with(wait);
+            let serialized = serde_json::to_string(&app.saved).unwrap();
+            for private in [
+                "REMOTE_PRIVATE",
+                "REMOTE_STALE",
+                "PRIVATE_COMMAND_BODY",
+                "private-command",
+                "remote-private-directory",
+            ] {
+                assert!(!serialized.contains(private), "snapshot leaked {private}");
+            }
+            assert!(serialized.contains("ORDINARY_OUTPUT"));
+            let saved = &app.saved.restoration.panes[&remote];
+            assert_eq!(saved.directory, directory.to_string_lossy());
+            assert!(saved.output.is_empty());
+            assert!(saved.conversation.is_none());
+            assert!(saved.resume_directory.is_none());
+        }
+        app.panes.remove(&remote);
+        app.capture_restoration_with(true);
+        assert!(app.saved.restoration.panes[&remote].output.is_empty());
+        let saved = round_trip(&mut app, &directory.join("state.json"));
+        drop(app);
+        let mut reopened = fixture(0);
+        reopened.saved = saved;
+        reopened.restore_workspace(&ctx);
+        assert!(reopened.remote_panes.is_empty());
+        assert!(reopened.restoration.pending.is_empty());
+        assert!(reopened.restoration.history[&remote].is_empty());
+        assert!(reopened.panes.contains_key(&remote));
+        assert!(
+            !reopened.panes[&remote]
+                .terminal
+                .snapshot_output()
+                .contains("REMOTE_")
+        );
     }
 
     #[test]

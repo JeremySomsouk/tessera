@@ -212,6 +212,8 @@ pub struct WorkItem {
     pub title: String,
     pub directory: String,
     pub stage: WorkStage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ticket_key: Option<String>,
     #[serde(default)]
     pub disposition: WorkDisposition,
     pub specification: Option<Uuid>,
@@ -229,6 +231,7 @@ impl WorkItem {
             title,
             directory,
             stage: WorkStage::Build,
+            ticket_key: None,
             disposition: WorkDisposition::Active,
             specification: None,
             had_sessions: false,

@@ -206,6 +206,32 @@ struct ProcessLifecycle {
     exit_code: Option<u32>,
 }
 
+struct RemoteCache {
+    path: PathBuf,
+}
+
+impl RemoteCache {
+    fn new() -> Result<Self> {
+        let path = std::env::temp_dir().join(format!("tessera-remote-cache-{}", Uuid::new_v4()));
+        let mut directory = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            directory.mode(0o700);
+        }
+        directory
+            .create(&path)
+            .context("Cannot create a private cache for remote logs")?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for RemoteCache {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
 const CLAUDE_LAUNCH: &str = "if ! command -v claude >/dev/null 2>&1; then printf '%s\\n' 'Claude Code was not found in your login shell PATH. Make sure the claude command runs in your usual terminal, then retry.' >&2; exit 127; fi; exec claude";
 
 fn agent_script(directory: &Path, launch: &str) -> Result<String> {
@@ -299,6 +325,28 @@ impl Terminal {
         Self::spawn_command(id, directory, socket, ctx, command)
     }
 
+    pub fn spawn_remote(
+        id: Uuid,
+        directory: &Path,
+        socket: &Path,
+        ctx: Context,
+        launch: &str,
+    ) -> Result<Self> {
+        let cache = RemoteCache::new()?;
+        let cache_path = cache
+            .path
+            .to_str()
+            .context("Remote cache path is not valid UTF-8")?
+            .replace('\'', "'\\''");
+        let mut command = agent_command(
+            directory,
+            &format!("export HISTFILE=/dev/null XDG_CACHE_HOME='{cache_path}'; {launch}"),
+        )?;
+        command.env("HISTFILE", "/dev/null");
+        command.env("XDG_CACHE_HOME", &cache.path);
+        Self::spawn_command_with_cache(id, directory, socket, ctx, command, Some(cache))
+    }
+
     pub fn spawn_claude(id: Uuid, directory: &Path, socket: &Path, ctx: Context) -> Result<Self> {
         let command = agent_command(directory, CLAUDE_LAUNCH)?;
         let metadata = std::fs::metadata(directory).with_context(|| {
@@ -363,7 +411,18 @@ impl Terminal {
         directory: &Path,
         socket: &Path,
         ctx: Context,
+        command: CommandBuilder,
+    ) -> Result<Self> {
+        Self::spawn_command_with_cache(id, directory, socket, ctx, command, None)
+    }
+
+    fn spawn_command_with_cache(
+        id: Uuid,
+        directory: &Path,
+        socket: &Path,
+        ctx: Context,
         mut command: CommandBuilder,
+        cache: Option<RemoteCache>,
     ) -> Result<Self> {
         let size = Size {
             cols: 100,
@@ -552,6 +611,7 @@ impl Terminal {
                     break;
                 }
             }
+            drop(cache);
             host_alive.store(false, Ordering::Release);
             ctx.request_repaint();
         });
@@ -1086,6 +1146,161 @@ mod pty_tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn remote_launch_runs_grouped_pipeline_with_private_history_and_hook_environment() {
+        let directory = tempfile::tempdir().unwrap();
+        let directory = directory.path().canonicalize().unwrap();
+        let id = Uuid::new_v4();
+        let socket = directory.join("remote.sock");
+        let terminal = Terminal::spawn_remote(
+            id,
+            &directory,
+            &socket,
+            Context::default(),
+            "{ printf 'REMOTE_READY:%s:%s\\n' \"$TESSERA_PANE\" \"$HISTFILE\"; printf 'SOCKET:%s\\n' \"$TESSERA_SOCKET\"; printf 'DIRECTORY:%s\\n' \"$PWD\"; } | cat; exit 7",
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !terminal.has_exited() || terminal.alive.load(Ordering::Acquire) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "remote launch did not exit"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let output = terminal.snapshot_output();
+        assert!(
+            output.contains(&format!("REMOTE_READY:{id}:/dev/null")),
+            "{output}"
+        );
+        assert!(
+            output.contains(&format!("SOCKET:{}", socket.display())),
+            "{output}"
+        );
+        assert!(
+            output.contains(&format!("DIRECTORY:{}", directory.display())),
+            "{output}"
+        );
+        assert_eq!(terminal.exit_code(), Some(7));
+    }
+
+    fn remote_with_cached_log() -> (tempfile::TempDir, Terminal, PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let terminal = Terminal::spawn_remote(
+            Uuid::new_v4(),
+            directory.path(),
+            &directory.path().join("remote.sock"),
+            Context::default(),
+            "printf '%s' \"${XDG_CACHE_HOME-}\" > cache-path; printf '%s' \"${GH_CONFIG_DIR-}\" > gh-config; printf '%s' \"${XDG_CONFIG_HOME-}\" > xdg-config; printf 'CACHE_WAITING\\n'; read action; mkdir -p \"$XDG_CACHE_HOME/gh\"; printf 'PRIVATE_CACHED_LOG' > \"$XDG_CACHE_HOME/gh/log.zip\"; printf 'CACHE_READY\\n'; read action",
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !terminal.snapshot_output().contains("CACHE_WAITING") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "remote launch did not become ready"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let cache = std::fs::read_to_string(directory.path().join("cache-path")).unwrap();
+        assert!(
+            !cache.is_empty(),
+            "remote logs need a private cache directory"
+        );
+        let cache = PathBuf::from(cache);
+        assert!(cache.starts_with(std::env::temp_dir()));
+        assert_ne!(
+            Some(cache.clone()),
+            std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from)
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&cache).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        for (file, variable) in [
+            ("gh-config", "GH_CONFIG_DIR"),
+            ("xdg-config", "XDG_CONFIG_HOME"),
+        ] {
+            assert_eq!(
+                std::fs::read_to_string(directory.path().join(file)).unwrap(),
+                std::env::var(variable).unwrap_or_default(),
+                "remote launch changed credential configuration",
+            );
+        }
+        terminal.input(b"continue\n".to_vec()).unwrap();
+        while !terminal.snapshot_output().contains("CACHE_READY") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "remote cache was not written"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            std::fs::read_to_string(cache.join("gh/log.zip")).unwrap(),
+            "PRIVATE_CACHED_LOG"
+        );
+        (directory, terminal, cache)
+    }
+
+    #[test]
+    fn remote_cache_is_removed_after_process_exit_while_terminal_is_retained() {
+        let (_directory, terminal, cache) = remote_with_cached_log();
+        terminal.input(b"exit\n".to_vec()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !terminal.has_exited() || cache.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "exited remote process retained cached logs"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(terminal.snapshot_output().contains("CACHE_READY"));
+    }
+
+    #[test]
+    fn remote_cache_is_removed_when_a_running_terminal_is_closed() {
+        let (_directory, terminal, cache) = remote_with_cached_log();
+        let (_second_directory, second_terminal, second_cache) = remote_with_cached_log();
+        assert_ne!(cache, second_cache);
+        assert!(!terminal.has_exited());
+        drop(terminal);
+        assert!(
+            !cache.exists(),
+            "closed remote terminal retained cached logs"
+        );
+        assert!(
+            second_cache.exists(),
+            "closing a pane removed another pane's cache"
+        );
+        drop(second_terminal);
+        assert!(!second_cache.exists());
+    }
+
+    #[test]
+    fn remote_cache_is_removed_when_process_launch_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = RemoteCache::new().unwrap();
+        let cache_path = cache.path.clone();
+        let command = CommandBuilder::new(directory.path().join("missing-command"));
+        let result = Terminal::spawn_command_with_cache(
+            Uuid::new_v4(),
+            directory.path(),
+            &directory.path().join("remote.sock"),
+            Context::default(),
+            command,
+            Some(cache),
+        );
+        assert!(result.is_err());
+        assert!(
+            !cache_path.exists(),
+            "failed launch retained its private cache"
+        );
     }
 
     use super::*;

@@ -5,6 +5,7 @@ mod folders;
 mod fonts;
 mod integration;
 mod model;
+mod remote_runs;
 mod resume;
 mod search;
 mod selection;
