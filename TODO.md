@@ -35,7 +35,9 @@
 
 ## Connectors and release
 - [ ] Jira/GitHub read/import, project configuration and Keychain credential adapter (partial: configured GitHub Actions run lookup and pull request comment posting; no Jira or issue import, project connector, or credential adapter).
-- [x] Configured Remote runs view for bounded GitHub Actions and pull request lookup, run output, and confirmed pull request comments.
+- [x] Native Autobot page for multiple tracked tickets, configured GitHub Actions sources, run timelines, job/step progress, and confirmed pull request comments.
+- [x] Settings source editor and optional visible-page live refresh with backoff, cancellation, and stale data timestamps.
+- [ ] Native Autobot acceptance with authenticated GitHub repositories, live run transitions, and both themes on narrow windows.
 - [ ] Reviewed publish with conflict re-fetch and rich-content preservation.
 - [ ] Verification receipts, staleness, criterion-linked change requests and handoff.
 - [x] One-command macOS/Linux installer and x86-64/ARM64 release packaging.

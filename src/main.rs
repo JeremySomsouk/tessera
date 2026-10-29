@@ -1,9 +1,11 @@
+mod autobot;
 mod choices;
 mod directories;
 mod discovery;
 mod folders;
 mod fonts;
 mod integration;
+mod merge_radar;
 mod model;
 mod remote_runs;
 mod resume;

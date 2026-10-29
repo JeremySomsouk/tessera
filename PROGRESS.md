@@ -1,5 +1,11 @@
 # Progress
 
+2026-10-29: 0.13.0 native Autobot page.
+
+Promoted configured Remote runs into Autobot alongside Terminal and Work. Added multiple tracked ticket keys, source/repository overview, run timeline and job/step progress, stale metadata timestamps, optional visible-page live refresh, and a validated Settings source editor. Configuration and tracking preferences use existing local persistence; fetched metadata, logs, and comment drafts stay ephemeral. GitHub run completion does not advance or accept work. Existing terminal output privacy and explicit pull request comment confirmation remain in place.
+
+Validation is pending completion of the implementation. Native acceptance still needs authenticated source setup, multiple matching sources/tickets, running and failed workflow transitions, offline recovery, visible-only refresh, output/watch panes, and the comment preview/cancel flow in both themes and narrow windows. No live comment or release has been published.
+
 2026-10-29: 0.12.0 Remote runs release preparation.
 
 Added an optional GitHub Actions Remote runs view with configured source/ticket matching, bounded run and pull request lookup, run watching, output selection, and confirmed pull request comments. Lookup metadata and comment previews remain in memory; comment bodies use private temporary files during posting. Local configuration, privacy behavior, lookup limits, and comment-triggered workflow effects are documented. Native UI and live GitHub acceptance remain pending. Local validation passed: 259 Rust unit tests (including headless UI and local socket checks), three CLI integration tests, 18 Python tests, formatting, warnings-denied Clippy, shell syntax checks, ShellCheck, and the optimized 0.12.0 build. Independent review found no remaining actionable issues after cache-lifetime and lookup-cancellation fixes. GitHub log caches use private temporary directories removed on exit, pane close or launch failure; queued and subsequent metadata requests cancel when the panel closes. No live PR comment was posted.

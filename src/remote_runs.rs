@@ -166,7 +166,11 @@ impl Config {
                     .as_ref()
                     .is_some_and(|pattern| pattern.is_match(key))
                 {
+                    let mut repos = HashSet::new();
                     for repo in &source.repos {
+                        if !repos.insert(repo) {
+                            continue;
+                        }
                         tasks.push(LookupTask {
                             repo: repo.clone(),
                             source: source.clone(),
@@ -398,6 +402,10 @@ pub struct Run {
     pub conclusion: Option<String>,
     #[serde(rename = "createdAt")]
     pub created_at: String,
+    #[serde(rename = "startedAt")]
+    pub started_at: String,
+    #[serde(rename = "updatedAt")]
+    pub updated_at: String,
     pub url: String,
     #[serde(rename = "workflowName")]
     pub workflow_name: String,
@@ -470,7 +478,7 @@ pub fn lookup(gh: &dyn Gh, task: &LookupTask, key: &str, limit: usize) -> RepoRe
             "--limit",
             &limit.clamp(1, 1000).to_string(),
             "--json",
-            "databaseId,displayTitle,status,conclusion,createdAt,url,workflowName,event",
+            "databaseId,displayTitle,status,conclusion,createdAt,startedAt,updatedAt,url,workflowName,event",
         ]);
         if let Some(event) = event {
             args.extend(strings(&["--event", event]));

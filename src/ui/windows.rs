@@ -220,11 +220,15 @@ impl App {
         if owner == self.current_window {
             self.record_workspace_folder(index);
             self.ui.active = index;
+            self.ui.autobot_visible = false;
+            self.ui.radar_visible = false;
             self.ui.overview = false;
             self.ui.specifications_view = false;
             self.ui.maximized = false;
         } else if let Some(window) = self.windows.get_mut(&owner) {
             window.active = Some(id);
+            window.ui.autobot_visible = false;
+            window.ui.radar_visible = false;
             window.ui.overview = false;
             window.ui.specifications_view = false;
             window.ui.maximized = false;
