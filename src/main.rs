@@ -1,3 +1,4 @@
+mod autobot;
 mod choices;
 mod directories;
 mod discovery;

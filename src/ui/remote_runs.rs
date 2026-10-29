@@ -1,5 +1,7 @@
 use super::*;
+mod dashboard;
 use crate::remote_runs::{self as provider, Config, GhCli, Job, PullRequest, RepoResult, Run};
+pub(super) use dashboard::Panel;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -44,7 +46,7 @@ impl<G: provider::Gh> provider::Gh for RequestGh<G> {
 
 type LaunchResult = anyhow::Result<(Uuid, PathBuf, Terminal)>;
 
-pub(super) struct Panel {
+struct TicketPanel {
     cancelled: Arc<AtomicBool>,
     query: String,
     key: String,
@@ -52,9 +54,12 @@ pub(super) struct Panel {
     pending: usize,
     receiver: Option<Receiver<RepoResult>>,
     results: Vec<RepoResult>,
+    cached: Vec<crate::autobot::CachedRepo>,
+    selected_group: Option<(String, String)>,
+    selected_run: Option<u64>,
+    refresh_requested: bool,
     error: String,
     notice: String,
-    focus: bool,
     output: Option<Output>,
     comment: Option<Comment>,
     launch: Option<Receiver<LaunchResult>>,
@@ -92,7 +97,7 @@ fn available(value: &serde_json::Value) -> bool {
     }
 }
 
-impl Drop for Panel {
+impl Drop for TicketPanel {
     fn drop(&mut self) {
         self.cancelled.store(true, Ordering::Release);
     }
@@ -103,7 +108,7 @@ impl Drop for Output {
     }
 }
 
-impl Panel {
+impl TicketPanel {
     fn new(query: String, value: &serde_json::Value) -> Self {
         Self {
             cancelled: Arc::default(),
@@ -113,9 +118,12 @@ impl Panel {
             pending: 0,
             receiver: None,
             results: Vec::new(),
+            cached: Vec::new(),
+            selected_group: None,
+            selected_run: None,
+            refresh_requested: false,
             error: String::new(),
             notice: String::new(),
-            focus: true,
             output: None,
             comment: None,
             launch: None,
@@ -137,53 +145,53 @@ impl Panel {
         let config = self.config.as_ref().unwrap();
         std::mem::take(&mut self.cancelled).store(true, Ordering::Release);
         self.key = self.query.trim().to_owned();
-        self.results.clear();
-        self.output = None;
+
         self.error.clear();
         let (tx, rx) = channel();
         self.pending = tasks.len();
         self.receiver = Some(rx);
-        let workers = tasks.len().min(8);
-        let queue = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from(
-            tasks,
-        )));
-        for _ in 0..workers {
-            let queue = queue.clone();
-            let tx = tx.clone();
-            let key = self.key.clone();
-            let path = config.gh_path.clone();
-            let limit = config.run_limit;
-            let ctx = ctx.clone();
-            let cancelled = self.cancelled.clone();
-            std::thread::spawn(move || {
-                let gh = RequestGh {
-                    inner: GhCli::new(path),
-                    cancelled: cancelled.clone(),
-                };
-                loop {
-                    if cancelled.load(Ordering::Acquire) {
-                        break;
-                    }
-                    let task = queue.lock().ok().and_then(|mut queue| queue.pop_front());
-                    let Some(task) = task else {
-                        break;
-                    };
-                    let result = provider::lookup(&gh, &task, &key, limit);
-                    if tx.send(result).is_err() {
-                        break;
-                    }
-                    ctx.request_repaint();
+        let key = self.key.clone();
+        let path = config.gh_path.clone();
+        let limit = config.run_limit;
+        let ctx = ctx.clone();
+        let cancelled = self.cancelled.clone();
+        std::thread::spawn(move || {
+            let gh = RequestGh {
+                inner: GhCli::new(path),
+                cancelled: cancelled.clone(),
+            };
+            for task in tasks {
+                if cancelled.load(Ordering::Acquire) {
+                    break;
                 }
-            });
-        }
+                let result = provider::lookup(&gh, &task, &key, limit);
+                if tx.send(result).is_err() {
+                    break;
+                }
+                ctx.request_repaint();
+            }
+        });
     }
 
-    fn poll(&mut self, ctx: &egui::Context) {
+    fn poll(&mut self, _ctx: &egui::Context) {
         if let Some(receiver) = &self.receiver {
             loop {
                 match receiver.try_recv() {
                     Ok(result) => {
-                        self.results.push(result);
+                        if let Some(cached) = self.cached.iter_mut().find(|cached| {
+                            cached.result.repo == result.repo
+                                && cached.result.source_name == result.source_name
+                        }) {
+                            cached.update(result, now());
+                        } else {
+                            self.cached
+                                .push(crate::autobot::CachedRepo::new(result, now()));
+                        }
+                        self.results = self
+                            .cached
+                            .iter()
+                            .map(|cached| cached.result.clone())
+                            .collect();
                         self.pending = self.pending.saturating_sub(1);
                     }
                     Err(TryRecvError::Empty) => break,
@@ -202,6 +210,8 @@ impl Panel {
         {
             match receiver.try_recv() {
                 Ok(Ok(jobs)) => {
+                    let selected =
+                        (!output.jobs.is_empty()).then(|| (output.job, output.step.clone()));
                     output.jobs = jobs;
                     output.job = output
                         .source
@@ -237,6 +247,16 @@ impl Panel {
                                     .map(|step| step.name.clone())
                             })
                         });
+                    if let Some((job, step)) = selected {
+                        output.job = job.filter(|id| output.jobs.iter().any(|job| job.id == *id));
+                        output.step = step.filter(|name| {
+                            output
+                                .jobs
+                                .iter()
+                                .find(|job| Some(job.id) == output.job)
+                                .is_some_and(|job| job.steps.iter().any(|step| step.name == *name))
+                        });
+                    }
                     if output.source.output_job.is_some() && output.job.is_none() {
                         output.error = "Configured output job was not found. Choose a job or open the full log.".into();
                     } else if output.source.output_step.is_some() && output.step.is_none() {
@@ -273,7 +293,7 @@ impl Panel {
                     self.comment = None;
                     self.notice =
                         "Comment posted. Refresh again when the follow-up run starts.".into();
-                    self.lookup(ctx);
+                    self.refresh_requested = true;
                 }
                 Err(error) => {
                     let comment = self.comment.as_mut().unwrap();
@@ -284,7 +304,7 @@ impl Panel {
         }
     }
 
-    fn runs(&self) -> Vec<(String, String, Run)> {
+    fn all_runs(&self) -> Vec<(String, String, Run)> {
         let mut rows: Vec<_> = self
             .results
             .iter()
@@ -301,17 +321,46 @@ impl Panel {
                 .cmp(&a.2.created_at)
                 .then_with(|| a.0.cmp(&b.0))
                 .then_with(|| b.2.id.cmp(&a.2.id))
-                .then_with(|| a.1.cmp(&b.1))
+                .then_with(|| {
+                    let rank = |source: &str| {
+                        self.config
+                            .as_ref()
+                            .ok()
+                            .and_then(|config| {
+                                config.sources.iter().position(|entry| entry.name == source)
+                            })
+                            .unwrap_or(usize::MAX)
+                    };
+                    rank(&a.1).cmp(&rank(&b.1)).then_with(|| a.1.cmp(&b.1))
+                })
         });
         let mut seen = std::collections::HashSet::new();
         rows.retain(|(repo, _, run)| seen.insert((repo.clone(), run.id)));
         rows
     }
 
+    fn runs(&self) -> Vec<(String, String, Run)> {
+        self.all_runs()
+            .into_iter()
+            .filter(|(repo, source, _)| {
+                self.selected_group
+                    .as_ref()
+                    .is_none_or(|(selected_source, selected_repo)| {
+                        source == selected_source && repo == selected_repo
+                    })
+            })
+            .collect()
+    }
+
     fn prs(&self) -> Vec<(String, PullRequest)> {
         let mut seen = std::collections::HashSet::new();
         self.results
             .iter()
+            .filter(|result| {
+                self.selected_group.as_ref().is_none_or(|(source, repo)| {
+                    result.source_name == *source && result.repo == *repo
+                })
+            })
             .flat_map(|result| {
                 result
                     .prs
@@ -351,20 +400,32 @@ impl Panel {
             ));
             ctx.request_repaint();
         });
+        let previous_selection = self
+            .output
+            .as_ref()
+            .filter(|output| output.repo == repo && output.run.id == run.id)
+            .map(|output| (output.job, output.step.clone()))
+            .unwrap_or_default();
+        let previous_jobs = self
+            .output
+            .as_ref()
+            .filter(|output| output.repo == repo && output.run.id == run.id)
+            .map(|output| output.jobs.clone())
+            .unwrap_or_default();
         self.output = Some(Output {
             cancelled,
             repo,
             run,
-            jobs: Vec::new(),
+            jobs: previous_jobs,
             receiver: Some(receiver),
-            job: None,
-            step: None,
+            job: previous_selection.0,
+            step: previous_selection.1,
             source,
             error: String::new(),
         });
     }
 
-    fn launch(&mut self, app: &App, ctx: &egui::Context, command: Result<String, String>) {
+    fn launch(&mut self, app: &mut App, ctx: &egui::Context, command: Result<String, String>) {
         let command = match command {
             Ok(command) => command,
             Err(error) => {
@@ -391,7 +452,7 @@ impl Panel {
             .unwrap_or_default();
         let (tx, rx) = channel();
         let ctx = ctx.clone();
-        std::thread::spawn(move || {
+        app.remote_workers.spawn(move || {
             let id = Uuid::new_v4();
             let result = Terminal::spawn_remote(id, &path, &socket, ctx.clone(), &command)
                 .map(|terminal| (id, path, terminal));
@@ -401,7 +462,7 @@ impl Panel {
         self.launch = Some(rx);
     }
 
-    fn show(&mut self, app: &mut App, ctx: &egui::Context) -> bool {
+    fn poll_launch(&mut self, app: &mut App, ctx: &egui::Context) {
         self.poll(ctx);
         if let Some(receiver) = &self.launch {
             match receiver.try_recv() {
@@ -445,7 +506,8 @@ impl Panel {
                                 memory.surrender_focus(id);
                             }
                         });
-                        return true;
+                        self.launch = None;
+                        app.ui.autobot_visible = false;
                     }
                 }
                 Ok(Err(error)) => {
@@ -459,170 +521,126 @@ impl Panel {
                 Err(TryRecvError::Empty) => {}
             }
         }
-        let mut close = false;
-        let response = egui::Modal::new(egui::Id::new("remote-runs")).show(ctx, |ui| {
-            ui.set_width((ctx.content_rect().width() - 64.0).clamp(220.0, 760.0));
-            ui.horizontal(|ui| {
-                ui.heading("Remote runs");
-                close = ui.button("Close").clicked();
-            });
-            egui::ScrollArea::vertical()
-                .max_height((ctx.content_rect().height() - 120.0).max(80.0))
-                .show(ui, |ui| {
-                    if self.comment.is_some() {
-                        self.comment_ui(ui, ctx);
-                        return;
-                    }
-                    ui.label("Ticket key");
-                    let field = ui.add(
-                        egui::TextEdit::singleline(&mut self.query)
-                            .id_salt("remote-ticket")
-                            .desired_width(f32::INFINITY),
-                    );
-                    if self.focus {
-                        field.request_focus();
-                        self.focus = false;
-                    }
-                    let busy = self.pending != 0 || self.launch.is_some();
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add_enabled(
-                                !busy && !self.query.trim().is_empty(),
-                                egui::Button::new("Look up / Refresh"),
-                            )
-                            .clicked()
-                            || (!busy
-                                && field.lost_focus()
-                                && ui.input(|input| input.key_pressed(Key::Enter)))
-                        {
-                            self.lookup(ctx);
-                        }
-                        if self.pending != 0 {
-                            ui.spinner();
-                            ui.label(format!("Loading {} repository queries…", self.pending));
-                        }
-                        if self.launch.is_some() {
-                            ui.spinner();
-                            ui.label("Opening terminal…");
-                        }
-                    });
-                    if let Err(error) = &self.config {
-                        ui.colored_label(
-                            attention_color(ui),
-                            format!("Remote runs configuration: {error}"),
-                        );
-                    }
-                    if !self.error.is_empty() {
-                        ui.colored_label(attention_color(ui), &self.error);
-                    }
-                    if !self.notice.is_empty() {
-                        ui.label(&self.notice);
-                    }
-                    if !self.key.is_empty() {
-                        ui.small(format!(
-                            "Results for {}. Refresh manually to check for new runs.",
-                            self.key
-                        ));
-                    }
-                    for result in &self.results {
-                        for error in &result.errors {
-                            ui.colored_label(
-                                attention_color(ui),
-                                format!("{} / {}: {error}", result.repo, result.source_name),
-                            );
-                        }
-                    }
-                    if !self.key.is_empty() && self.pending == 0 && self.runs().is_empty() {
-                        ui.label("No matching runs in the configured lookup window.");
-                    }
-                    self.output_ui(app, ui, ctx);
-                    for (repo, source, run) in self.runs() {
-                        egui::Frame::group(ui.style()).show(ui, |ui| {
-                            ui.label(RichText::new(&run.title).strong());
-                            ui.label(format!(
-                                "{} · {} · {}{}",
-                                repo,
-                                run.kind.as_deref().unwrap_or("run"),
-                                run.status,
-                                run.conclusion
-                                    .as_ref()
-                                    .filter(|s| !s.is_empty())
-                                    .map(|s| format!(" / {s}"))
-                                    .unwrap_or_default()
-                            ));
-                            ui.small(format!(
-                                "{} · {}",
-                                run.workflow_name,
-                                timestamp_age(&run.created_at)
-                            ));
-                            ui.horizontal_wrapped(|ui| {
-                                ui.hyperlink_to("Open run in browser", &run.url);
-                                let path = self.config.as_ref().unwrap().gh_path.clone();
-                                if run.status != "completed" {
-                                    if ui.button("Watch run").clicked() {
-                                        self.launch(
-                                            app,
-                                            ctx,
-                                            provider::watch_command(&path, &repo, run.id),
-                                        );
-                                    }
-                                } else {
-                                    if ui.button("Output…").clicked() {
-                                        self.open_output(repo.clone(), source, run.clone(), ctx);
-                                    }
-                                    if ui.button("Full log").clicked() {
-                                        self.launch(
-                                            app,
-                                            ctx,
-                                            provider::log_command(&path, &repo, run.id, None, None),
-                                        );
-                                    }
-                                }
-                            });
-                            ui.horizontal_wrapped(|ui| {
-                                for (pr_repo, pr) in self
-                                    .prs()
-                                    .into_iter()
-                                    .filter(|(pr_repo, _)| *pr_repo == repo)
-                                {
-                                    ui.hyperlink_to(
-                                        format!("Ticket PR {}#{}", pr_repo, pr.number),
-                                        pr.url,
-                                    );
-                                }
-                            });
-                        });
-                    }
-                    if !self.prs().is_empty() {
-                        ui.separator();
-                        ui.heading("Linked pull requests");
-                    }
-                    for (repo, pr) in self.prs() {
-                        ui.label(format!(
-                            "{}#{} · {} · {}",
-                            repo, pr.number, pr.title, pr.state
-                        ));
-                        ui.small(format!("Branch: {}", pr.head_ref_name));
-                        ui.horizontal_wrapped(|ui| {
-                            ui.hyperlink_to("Open PR in browser", &pr.url);
-                            if ui.button("Write comment…").clicked() {
-                                self.comment = Some(Comment {
-                                    repo,
-                                    pr,
-                                    body: String::new(),
-                                    preview: None,
-                                    posting: None,
-                                    error: String::new(),
-                                });
-                            }
-                        });
-                    }
-                });
-        });
-        close || response.should_close()
     }
 
-    fn output_ui(&mut self, app: &App, ui: &mut egui::Ui, ctx: &egui::Context) {
+    fn detail(&mut self, app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if self.comment.is_some() {
+            self.comment_ui(app, ui, ctx);
+            return;
+        }
+        if !self.notice.is_empty() {
+            ui.label(&self.notice);
+        }
+        if !self.error.is_empty() {
+            ui.colored_label(attention_color(ui), &self.error);
+        }
+        ui.heading("Run timeline");
+        let runs = self.runs();
+        if runs.is_empty() {
+            ui.label("No matching runs in the configured lookup window.");
+        }
+        if !self
+            .selected_run
+            .is_some_and(|id| runs.iter().any(|(_, _, run)| run.id == id))
+        {
+            self.selected_run = runs.first().map(|(_, _, run)| run.id);
+            self.output = None;
+        }
+        for (repo, source, run) in runs {
+            let selected = self.selected_run == Some(run.id);
+            let label = format!(
+                "{} · {} · {}",
+                run.title,
+                run.kind.as_deref().unwrap_or(&run.workflow_name),
+                crate::autobot::state(&run)
+            );
+            if ui.selectable_label(selected, label).clicked() {
+                self.selected_run = Some(run.id);
+                self.output = None;
+            }
+            ui.small(format!(
+                "{} · {}",
+                timestamp_age(&run.created_at),
+                crate::autobot::elapsed(&run, now())
+            ));
+            if self.selected_run == Some(run.id) {
+                if run.status != "completed"
+                    && self
+                        .output
+                        .as_ref()
+                        .is_none_or(|output| output.run.id != run.id || output.repo != repo)
+                {
+                    self.open_output(repo.clone(), source.clone(), run.clone(), ctx);
+                }
+                ui.horizontal_wrapped(|ui| {
+                    ui.hyperlink_to("Open run in browser", &run.url);
+                    let path = self.config.as_ref().unwrap().gh_path.clone();
+                    if run.status != "completed" && ui.button("Watch run").clicked() {
+                        self.launch(app, ctx, provider::watch_command(&path, &repo, run.id));
+                    }
+                    if ui.button("Output…").clicked() {
+                        self.open_output(repo.clone(), source, run.clone(), ctx);
+                    }
+                    if ui.button("Full log").clicked() {
+                        self.launch(
+                            app,
+                            ctx,
+                            provider::log_command(&path, &repo, run.id, None, None),
+                        );
+                    }
+                });
+                if let Some(output) = &self.output
+                    && output.run.id == run.id
+                {
+                    for job in &output.jobs {
+                        let completed = job
+                            .steps
+                            .iter()
+                            .filter(|step| step.status == "completed")
+                            .count();
+                        ui.label(format!(
+                            "{} · {} / {} · {}/{} known steps completed",
+                            job.name,
+                            job.status,
+                            job.conclusion.as_deref().unwrap_or("pending"),
+                            completed,
+                            job.steps.len()
+                        ));
+                        for step in job.steps.iter().filter(|step| step.status == "in_progress") {
+                            ui.label(format!("Current step: {}. {}", step.number, step.name));
+                        }
+                    }
+                }
+                self.output_ui(app, ui, ctx);
+            }
+            ui.separator();
+        }
+        if !self.prs().is_empty() {
+            ui.heading("Linked pull requests");
+        }
+        for (repo, pr) in self.prs() {
+            ui.label(format!(
+                "{}#{} · {} · {}",
+                repo, pr.number, pr.title, pr.state
+            ));
+            ui.small(format!("Branch: {}", pr.head_ref_name));
+            ui.horizontal_wrapped(|ui| {
+                ui.hyperlink_to("Open PR in browser", &pr.url);
+                if ui.button("Write comment…").clicked() {
+                    self.comment = Some(Comment {
+                        repo,
+                        pr,
+                        body: String::new(),
+                        preview: None,
+                        posting: None,
+                        error: String::new(),
+                    });
+                }
+            });
+        }
+    }
+
+    fn output_ui(&mut self, app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         let mut command = None;
         let mut clear = false;
         if let Some(output) = &mut self.output {
@@ -711,7 +729,7 @@ impl Panel {
         }
     }
 
-    fn comment_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    fn comment_ui(&mut self, app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) {
         let mut cancel = false;
         let comment = self.comment.as_mut().unwrap();
         ui.label(
@@ -759,7 +777,7 @@ impl Panel {
                     let path = self.config.as_ref().unwrap().gh_path.clone();
                     let (tx, rx) = channel();
                     let ctx = ctx.clone();
-                    std::thread::spawn(move || {
+                    app.remote_workers.spawn(move || {
                         let _ = tx.send(provider::post_comment(&GhCli::new(path), &confirmed));
                         ctx.request_repaint();
                     });
@@ -816,20 +834,56 @@ impl App {
     }
 
     pub(super) fn open_remote_runs(&mut self, key: String, ctx: &egui::Context) {
-        let mut panel = Panel::new(key, &self.saved.remote_runs);
-        if !panel.query.is_empty() {
-            panel.lookup(ctx);
+        let mut panel = self
+            .ui
+            .remote
+            .take()
+            .unwrap_or_else(|| Panel::new(&self.saved.remote_runs));
+        panel.sync(&mut self.saved.autobot, &self.saved.remote_runs);
+        if !key.trim().is_empty() {
+            match &panel.config {
+                Ok(config) => match self.saved.autobot.add(&key, config) {
+                    Ok(changed) => {
+                        self.dirty |= changed;
+                        panel.sync(&mut self.saved.autobot, &self.saved.remote_runs);
+                        panel.detail_visible = true;
+                        panel.selected = panel
+                            .groups()
+                            .into_iter()
+                            .find(|(id, _)| id.ticket == key.trim())
+                            .map(|(id, _)| id);
+                        if changed {
+                            panel.cancel();
+                            panel.refresh(ctx);
+                        }
+                    }
+                    Err(error) => panel.error = error,
+                },
+                Err(error) => panel.error = error.clone(),
+            }
         }
         self.ui.remote = Some(panel);
         self.ui.palette = false;
+        self.ui.autobot_visible = true;
+        self.ui.overview = false;
+        self.ui.specifications_view = false;
     }
 
-    pub(super) fn remote_dialog(&mut self, ctx: &egui::Context) {
-        if let Some(mut panel) = self.ui.remote.take()
-            && !panel.show(self, ctx)
-        {
-            self.ui.remote = Some(panel);
+    pub(super) fn suspend_autobot(&mut self) {
+        if let Some(panel) = &mut self.ui.remote {
+            panel.cancel();
         }
+    }
+
+    pub(super) fn autobot_page(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let mut panel = self
+            .ui
+            .remote
+            .take()
+            .unwrap_or_else(|| Panel::new(&self.saved.remote_runs));
+        panel.sync(&mut self.saved.autobot, &self.saved.remote_runs);
+        panel.show(self, ui, ctx);
+        self.ui.remote = Some(panel);
     }
 
     pub(super) fn remote_work(&mut self, index: usize, ui: &mut egui::Ui) {
@@ -853,7 +907,7 @@ impl App {
         if ui
             .add_enabled(
                 !key.trim().is_empty(),
-                egui::Button::new("Remote runs for this ticket"),
+                egui::Button::new("Open ticket in Autobot"),
             )
             .clicked()
         {
@@ -900,7 +954,7 @@ mod tests {
 
     #[test]
     fn closing_panel_and_output_cancels_their_metadata_requests() {
-        let panel = Panel::new(String::new(), &config());
+        let panel = TicketPanel::new(String::new(), &config());
         let cancelled = panel.cancelled.clone();
         drop(panel);
         assert!(cancelled.load(Ordering::Acquire));
@@ -1011,23 +1065,15 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = super::super::render_tests::fixture(0);
         app.open_commands(CommandPage::Commands);
-        app.ui.filter = "Remote runs".into();
+        app.ui.filter = "bot".into();
         for _ in 0..3 {
             frame(&mut app, &ctx, Vec2::new(900.0, 700.0), vec![]);
         }
         let output = frame(&mut app, &ctx, Vec2::new(900.0, 700.0), vec![]);
-        assert!(
-            !texts(&output)
-                .iter()
-                .any(|text| text == "Remote runs for ticket…")
-        );
+        assert!(!texts(&output).iter().any(|text| text == "Autobot"));
         app.saved.remote_runs = config();
         let output = frame(&mut app, &ctx, Vec2::new(900.0, 700.0), vec![]);
-        assert!(
-            texts(&output)
-                .iter()
-                .any(|text| text == "Remote runs for ticket…")
-        );
+        assert!(texts(&output).iter().any(|text| text == "Autobot"));
         app.saved.remote_runs["sources"][0]["ticket_pattern"] = json!("[");
         app.open_remote_runs(String::new(), &ctx);
         for _ in 0..3 {
@@ -1052,7 +1098,7 @@ mod tests {
 
     #[test]
     fn result_arrival_order_never_changes_newest_first_or_duplicates_runs() {
-        let mut panel = Panel::new(String::new(), &config());
+        let mut panel = TicketPanel::new(String::new(), &config());
         let older: Run = serde_json::from_value(
             json!({"databaseId":1,"displayTitle":"ACME-42","createdAt":"2026-10-28T00:00:00Z"}),
         )
@@ -1070,6 +1116,7 @@ mod tests {
             runs: vec![older.clone()],
             prs: vec![],
             errors: vec!["One event could not be queried".into()],
+            warnings: vec![],
         })
         .unwrap();
         tx.send(RepoResult {
@@ -1078,6 +1125,7 @@ mod tests {
             runs: vec![newer, older],
             prs: vec![],
             errors: vec![],
+            warnings: vec![],
         })
         .unwrap();
         panel.poll(&egui::Context::default());
@@ -1095,7 +1143,7 @@ mod tests {
 
     #[test]
     fn step_only_configuration_selects_its_job() {
-        let mut panel = Panel::new(String::new(), &config());
+        let mut panel = TicketPanel::new(String::new(), &config());
         let run = serde_json::from_value(json!({"databaseId":1})).unwrap();
         let jobs = serde_json::from_value(
             json!([{"databaseId":9,"name":"Build","steps":[{"number":1,"name":"Agent"}]}]),
@@ -1130,7 +1178,7 @@ mod tests {
             configure_appearance(&ctx, light);
             let mut app = super::super::render_tests::fixture(0);
             app.saved.remote_runs = config();
-            let mut panel = Panel::new(String::new(), &app.saved.remote_runs);
+            let mut panel = TicketPanel::new(String::new(), &app.saved.remote_runs);
             let pr = PullRequest {
                 number: 7,
                 title: "ACME-42 Agent changes".into(),
@@ -1147,7 +1195,20 @@ mod tests {
                 posting: None,
                 error: String::new(),
             });
-            app.ui.remote = Some(panel);
+            let mut dashboard = Panel::new(&app.saved.remote_runs);
+            panel.key = "ACME-42".into();
+            panel.query = "ACME-42".into();
+            dashboard.tickets.insert("ACME-42".into(), panel);
+            dashboard.selected = Some(crate::autobot::GroupId {
+                source: "acme".into(),
+                ticket: "ACME-42".into(),
+                repo: "acme/api".into(),
+            });
+            dashboard.detail_visible = true;
+            dashboard.initialized = true;
+            app.saved.autobot.keys = vec!["ACME-42".into()];
+            app.ui.autobot_visible = true;
+            app.ui.remote = Some(dashboard);
             for _ in 0..3 {
                 frame(&mut app, &ctx, size, vec![]);
             }
@@ -1165,7 +1226,10 @@ mod tests {
                         modifiers,
                     }],
                 );
-                let comment = app.ui.remote.as_ref().unwrap().comment.as_ref().unwrap();
+                let comment = app.ui.remote.as_ref().unwrap().tickets["ACME-42"]
+                    .comment
+                    .as_ref()
+                    .unwrap();
                 assert!(comment.preview.is_none());
                 assert!(comment.posting.is_none());
                 assert!(
@@ -1174,7 +1238,17 @@ mod tests {
                         .any(|text| text == "Confirm and post comment")
                 );
             }
-            let comment = app.ui.remote.as_mut().unwrap().comment.as_mut().unwrap();
+            let comment = app
+                .ui
+                .remote
+                .as_mut()
+                .unwrap()
+                .tickets
+                .get_mut("ACME-42")
+                .unwrap()
+                .comment
+                .as_mut()
+                .unwrap();
             comment.preview = Some(
                 provider::CommentPreview::new(
                     &comment.repo,
@@ -1195,5 +1269,208 @@ mod tests {
                     .contains("Please retry")
             );
         }
+    }
+    fn dashboard_fixture(light: bool, status: &str, stale: bool) -> (App, egui::Context) {
+        let ctx = egui::Context::default();
+        configure_appearance(&ctx, light);
+        let mut app = super::super::render_tests::fixture(0);
+        app.saved.remote_runs = config();
+        app.saved.autobot.keys = vec!["ACME-42".into()];
+        app.ui.autobot_visible = true;
+        let mut dashboard = Panel::new(&app.saved.remote_runs);
+        dashboard.sync(&mut app.saved.autobot, &app.saved.remote_runs);
+        dashboard.initialized = true;
+        let panel = dashboard.tickets.get_mut("ACME-42").unwrap();
+        let run = Run {
+            id: 42,
+            title: "ACME-42 Implementation".into(),
+            status: status.into(),
+            conclusion: (status == "completed").then(|| "failure".into()),
+            workflow_name: "Implementation".into(),
+            created_at: "2026-10-29T12:00:00Z".into(),
+            started_at: "2026-10-29T12:00:00Z".into(),
+            updated_at: "2026-10-29T12:01:30Z".into(),
+            ..Default::default()
+        };
+        let result = RepoResult {
+            source_name: "acme".into(),
+            repo: "acme/api".into(),
+            runs: vec![run.clone()],
+            ..Default::default()
+        };
+        let mut cached = crate::autobot::CachedRepo::new(result.clone(), now() - 100);
+        if stale {
+            cached.update(
+                RepoResult {
+                    source_name: "acme".into(),
+                    repo: "acme/api".into(),
+                    errors: vec!["Network unavailable; refresh to retry".into()],
+                    ..Default::default()
+                },
+                now(),
+            );
+        }
+        panel.results = vec![cached.result.clone()];
+        panel.cached = vec![cached];
+        panel.output = Some(Output { cancelled: Arc::default(), repo: "acme/api".into(), run, jobs: serde_json::from_value(json!([{"databaseId":9,"name":"Build","status":"in_progress","steps":[{"number":1,"name":"Setup","status":"completed"},{"number":2,"name":"Agent","status":"in_progress"}]}])).unwrap(), receiver: None, job:Some(9), step:Some("Agent".into()), source: Config::parse(&config()).unwrap().sources.remove(0), error:String::new() });
+        panel.selected_run = Some(42);
+        app.ui.remote = Some(dashboard);
+        (app, ctx)
+    }
+
+    #[test]
+    fn dashboard_overview_detail_stale_and_progress_render_in_both_themes_and_widths() {
+        for light in [false, true] {
+            for width in [320.0, 640.0, 1180.0] {
+                for detail in [false, true] {
+                    let (mut app, ctx) = dashboard_fixture(light, "in_progress", true);
+                    app.ui.remote.as_mut().unwrap().detail_visible = detail;
+                    let mut output = None;
+                    for _ in 0..3 {
+                        output = Some(ctx.run(
+                            egui::RawInput {
+                                screen_rect: Some(Rect::from_min_size(
+                                    Pos2::ZERO,
+                                    Vec2::new(width, 760.0),
+                                )),
+                                ..Default::default()
+                            },
+                            |ctx| {
+                                egui::CentralPanel::default()
+                                    .show(ctx, |ui| app.autobot_page(ui, ctx));
+                            },
+                        ));
+                    }
+                    let text = texts(output.as_ref().unwrap()).join("\n");
+                    assert!(text.contains("Autobot"));
+                    assert!(text.contains("ACME-42"));
+                    if width >= 760.0 || !detail {
+                        assert!(text.contains("Stale data"));
+                        assert!(text.contains("Network unavailable"));
+                    }
+                    if width >= 760.0 || detail {
+                        assert!(text.contains("1/2 known steps completed"));
+                        assert!(text.contains("Current step: 2. Agent"));
+                    }
+                    assert!(
+                        ctx.used_rect().right() <= width + 1.0,
+                        "overflow at {width}: {:?}",
+                        ctx.used_rect()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tracking_groups_match_all_sources_once_and_preserve_selection_on_arrival() {
+        let (mut app, ctx) = dashboard_fixture(false, "completed", false);
+        let mut value = config();
+        let mut other = value["sources"][0].clone();
+        other["name"] = json!("second");
+        value["sources"].as_array_mut().unwrap().push(other);
+        value["sources"][0]["repos"] = json!(["acme/api", "acme/api"]);
+        app.saved.remote_runs = value;
+        let mut dashboard = app.ui.remote.take().unwrap();
+        dashboard.sync(&mut app.saved.autobot, &app.saved.remote_runs);
+        assert_eq!(dashboard.groups().len(), 2);
+        let selected = dashboard.selected.clone();
+        let panel = dashboard.tickets.get_mut("ACME-42").unwrap();
+        let (tx, rx) = channel();
+        panel.receiver = Some(rx);
+        panel.pending = 2;
+        let run = Run {
+            id: 42,
+            status: "completed".into(),
+            created_at: "2026-10-29T12:00:00Z".into(),
+            ..Default::default()
+        };
+        for source in ["second", "acme"] {
+            tx.send(RepoResult {
+                source_name: source.into(),
+                repo: "acme/api".into(),
+                runs: vec![run.clone()],
+                ..Default::default()
+            })
+            .unwrap();
+        }
+        panel.poll(&ctx);
+        dashboard.sync(&mut app.saved.autobot, &app.saved.remote_runs);
+        assert_eq!(dashboard.selected, selected);
+        let groups = dashboard.groups();
+        assert_eq!(
+            groups
+                .iter()
+                .map(|(_, cached)| cached.as_ref().unwrap().result.runs.len())
+                .sum::<usize>(),
+            1
+        );
+        assert_eq!(
+            groups
+                .iter()
+                .find(|(id, _)| id.source == "second")
+                .unwrap()
+                .1
+                .as_ref()
+                .unwrap()
+                .shared_sources,
+            vec!["acme"]
+        );
+    }
+
+    #[test]
+    fn cancellation_rejects_obsolete_receiver_and_keeps_metadata_without_live_polling() {
+        let (mut app, _) = dashboard_fixture(false, "completed", false);
+        let mut dashboard = app.ui.remote.take().unwrap();
+        let generation = dashboard.refresh.start().unwrap();
+        dashboard.generation = Some(generation);
+        let panel = dashboard.tickets.get_mut("ACME-42").unwrap();
+        let (tx, rx) = channel();
+        panel.receiver = Some(rx);
+        panel.pending = 1;
+        let token = panel.cancelled.clone();
+        dashboard.cancel();
+        assert!(token.load(Ordering::Acquire));
+        assert!(tx.send(RepoResult::default()).is_err());
+        assert_eq!(dashboard.tickets["ACME-42"].results[0].runs[0].id, 42);
+        assert!(dashboard.initialized);
+        assert!(!dashboard.refresh.due(1000, true, false));
+        assert!(!dashboard.refresh.finish(generation, 1000, false));
+    }
+
+    #[test]
+    fn run_and_output_selection_survive_newer_metadata_and_job_refresh() {
+        let (mut app, ctx) = dashboard_fixture(false, "completed", false);
+        let dashboard = app.ui.remote.as_mut().unwrap();
+        let panel = dashboard.tickets.get_mut("ACME-42").unwrap();
+        panel.selected_group = Some(("acme".into(), "acme/api".into()));
+        let (tx, rx) = channel();
+        panel.receiver = Some(rx);
+        panel.pending = 1;
+        let mut result = panel.results[0].clone();
+        result.runs.push(Run {
+            id: 43,
+            status: "completed".into(),
+            created_at: "2026-10-29T13:00:00Z".into(),
+            ..Default::default()
+        });
+        tx.send(result).unwrap();
+        let output = panel.output.as_mut().unwrap();
+        output.step = None;
+        let (tx, rx) = channel();
+        tx.send(Ok(output.jobs.clone())).unwrap();
+        output.receiver = Some(rx);
+        panel.poll(&ctx);
+        assert_eq!(panel.selected_run, Some(42));
+        assert_eq!(
+            panel
+                .runs()
+                .iter()
+                .map(|(_, _, run)| run.id)
+                .collect::<Vec<_>>(),
+            vec![43, 42]
+        );
+        assert_eq!(panel.output.as_ref().unwrap().job, Some(9));
+        assert_eq!(panel.output.as_ref().unwrap().step, None);
     }
 }
