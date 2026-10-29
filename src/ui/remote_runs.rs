@@ -4,17 +4,9 @@ use crate::remote_runs::{self as provider, Config, GhCli, Job, PullRequest, Repo
 pub(super) use dashboard::Panel;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicBool, Ordering},
     mpsc::{Receiver, TryRecvError, channel},
 };
-
-static ACTIVE_REQUESTS: AtomicUsize = AtomicUsize::new(0);
-struct RequestPermit;
-impl Drop for RequestPermit {
-    fn drop(&mut self) {
-        ACTIVE_REQUESTS.fetch_sub(1, Ordering::AcqRel);
-    }
-}
 
 struct RequestGh<G> {
     inner: G,
@@ -22,25 +14,16 @@ struct RequestGh<G> {
 }
 
 impl<G: provider::Gh> provider::Gh for RequestGh<G> {
+    fn cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
     fn run(&self, args: &[String]) -> Result<String, String> {
-        loop {
-            if self.cancelled.load(Ordering::Acquire) {
-                return Err("Lookup cancelled".into());
-            }
-            let active = ACTIVE_REQUESTS.load(Ordering::Acquire);
-            if active < 8
-                && ACTIVE_REQUESTS
-                    .compare_exchange(active, active + 1, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-            {
-                let _permit = RequestPermit;
-                if self.cancelled.load(Ordering::Acquire) {
-                    return Err("Lookup cancelled".into());
-                }
-                return self.inner.run(args);
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        self.run_detailed(args).map_err(|error| error.message())
+    }
+
+    fn run_detailed(&self, args: &[String]) -> Result<String, provider::GhFailure> {
+        self.inner.run_detailed_cancelled(args, &self.cancelled)
     }
 }
 
@@ -130,7 +113,7 @@ impl TicketPanel {
         }
     }
 
-    fn lookup(&mut self, ctx: &egui::Context) {
+    fn lookup_at(&mut self, ctx: &egui::Context, fresh_since: Instant) {
         let tasks = match &self.config {
             Ok(config) => config.tasks(self.query.trim()),
             Err(error) => Err(error.clone()),
@@ -157,27 +140,52 @@ impl TicketPanel {
         let cancelled = self.cancelled.clone();
         std::thread::spawn(move || {
             let gh = RequestGh {
-                inner: GhCli::new(path),
+                inner: GhCli::fresh(path, fresh_since),
                 cancelled: cancelled.clone(),
             };
-            for task in tasks {
+            let started = Instant::now();
+            provider::parallel_map(&tasks, |task| {
                 if cancelled.load(Ordering::Acquire) {
-                    break;
+                    return;
                 }
-                let result = provider::lookup(&gh, &task, &key, limit);
-                if tx.send(result).is_err() {
-                    break;
+                let result = provider::lookup(&gh, task, &key, limit);
+                if !cancelled.load(Ordering::Acquire) && tx.send(result).is_ok() {
+                    ctx.request_repaint();
                 }
-                ctx.request_repaint();
-            }
+            });
+            log::debug!(
+                "remote refresh repos={} elapsed_ms={}",
+                tasks.len(),
+                started.elapsed().as_millis()
+            );
         });
     }
 
-    fn poll(&mut self, _ctx: &egui::Context) {
+    fn poll(&mut self, ctx: &egui::Context) {
+        let mut refresh_output = None;
         if let Some(receiver) = &self.receiver {
             loop {
                 match receiver.try_recv() {
                     Ok(result) => {
+                        if let Some(output) = &mut self.output
+                            && output.repo == result.repo
+                            && output.source.name == result.source_name
+                            && let Some(run) =
+                                result.runs.iter().find(|run| run.id == output.run.id)
+                        {
+                            let active = output.run.status != "completed"
+                                || run.status != "completed"
+                                || output.run.updated_at != run.updated_at
+                                || output.run.conclusion != run.conclusion;
+                            output.run = run.clone();
+                            if active {
+                                refresh_output = Some((
+                                    output.repo.clone(),
+                                    output.source.name.clone(),
+                                    run.clone(),
+                                ));
+                            }
+                        }
                         if let Some(cached) = self.cached.iter_mut().find(|cached| {
                             cached.result.repo == result.repo
                                 && cached.result.source_name == result.source_name
@@ -204,6 +212,9 @@ impl TicketPanel {
                     }
                 }
             }
+        }
+        if let Some((repo, source, run)) = refresh_output {
+            self.open_output(repo, source, run, ctx);
         }
         if let Some(output) = &mut self.output
             && let Some(receiver) = &output.receiver
@@ -247,8 +258,10 @@ impl TicketPanel {
                                     .map(|step| step.name.clone())
                             })
                         });
-                    if let Some((job, step)) = selected {
-                        output.job = job.filter(|id| output.jobs.iter().any(|job| job.id == *id));
+                    if let Some((job, step)) = selected
+                        && job.is_none_or(|id| output.jobs.iter().any(|job| job.id == id))
+                    {
+                        output.job = job;
                         output.step = step.filter(|name| {
                             output
                                 .jobs
@@ -862,6 +875,15 @@ impl App {
                 Err(error) => panel.error = error.clone(),
             }
         }
+        if !self.ui.autobot_visible
+            && !panel.tickets.is_empty()
+            && (!panel.initialized
+                || panel
+                    .refresh
+                    .due(panel.clock.elapsed().as_secs(), true, true))
+        {
+            panel.refresh(ctx);
+        }
         self.ui.remote = Some(panel);
         self.ui.palette = false;
         self.ui.autobot_visible = true;
@@ -976,52 +998,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_requests_share_a_global_limit_and_release_slots_on_error() {
-        struct Observed {
-            active: Arc<AtomicUsize>,
-            peak: Arc<AtomicUsize>,
-        }
-        impl provider::Gh for Observed {
-            fn run(&self, _args: &[String]) -> Result<String, String> {
-                let active = self.active.fetch_add(1, Ordering::AcqRel) + 1;
-                self.peak.fetch_max(active, Ordering::AcqRel);
-                std::thread::sleep(Duration::from_millis(40));
-                self.active.fetch_sub(1, Ordering::AcqRel);
-                Err("Remote failure".into())
-            }
-        }
-        let active = Arc::new(AtomicUsize::new(0));
-        let peak = Arc::new(AtomicUsize::new(0));
-        let handles: Vec<_> = (0..16)
-            .map(|_| {
-                let gh = RequestGh {
-                    inner: Observed {
-                        active: active.clone(),
-                        peak: peak.clone(),
-                    },
-                    cancelled: Arc::default(),
-                };
-                std::thread::spawn(move || {
-                    assert!(provider::Gh::run(&gh, &[]).is_err());
-                })
-            })
-            .collect();
-        for handle in handles {
-            handle.join().unwrap();
-        }
-        assert_eq!(active.load(Ordering::Acquire), 0);
-        assert!(
-            peak.load(Ordering::Acquire) <= 8,
-            "global request limit exceeded"
-        );
-        assert!(
-            peak.load(Ordering::Acquire) > 1,
-            "independent requests ran serially"
-        );
-    }
-
-    #[test]
-    fn cancelling_a_lookup_stops_requests_between_events_and_repositories() {
+    fn cancelling_a_lookup_stops_queued_requests_between_events_and_repositories() {
         use std::sync::{
             Arc,
             atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -1047,17 +1024,21 @@ mod tests {
             cancelled,
         };
         let mut value = config();
-        value["sources"][0]["events"] = json!(["repository_dispatch", "workflow_dispatch"]);
+        value["sources"][0]["events"] = json!(
+            (0..16)
+                .map(|index| format!("event{index}"))
+                .collect::<Vec<_>>()
+        );
         let task = Config::parse(&value)
             .unwrap()
             .tasks("ACME-42")
             .unwrap()
             .remove(0);
         provider::lookup(&gh, &task, "ACME-42", 200);
-        assert_eq!(
-            calls.load(Ordering::Acquire),
-            1,
-            "cancelled lookup continued making remote requests"
+        assert!(calls.load(Ordering::Acquire) > 0);
+        assert!(
+            calls.load(Ordering::Acquire) <= 4,
+            "cancelled lookup continued starting queued requests"
         );
     }
 
@@ -1118,6 +1099,7 @@ mod tests {
             prs: vec![],
             errors: vec!["One event could not be queried".into()],
             warnings: vec![],
+            ..Default::default()
         })
         .unwrap();
         tx.send(RepoResult {
@@ -1127,6 +1109,7 @@ mod tests {
             prs: vec![],
             errors: vec![],
             warnings: vec![],
+            ..Default::default()
         })
         .unwrap();
         panel.poll(&egui::Context::default());
@@ -1437,6 +1420,202 @@ mod tests {
         assert!(dashboard.initialized);
         assert!(!dashboard.refresh.due(1000, true, false));
         assert!(!dashboard.refresh.finish(generation, 1000, false));
+    }
+
+    #[test]
+    fn one_pr_failure_does_not_back_off_healthy_run_updates_for_every_ticket() {
+        let (mut app, ctx) = dashboard_fixture(false, "completed", false);
+        let mut dashboard = app.ui.remote.take().unwrap();
+        let generation = dashboard.refresh.start().unwrap();
+        dashboard.generation = Some(generation);
+        let panel = dashboard.tickets.get_mut("ACME-42").unwrap();
+        let mut result = panel.results[0].clone();
+        result.failed_prs = true;
+        result.errors.push("Cannot list pull requests".into());
+        panel.cached[0].update(result, now());
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| dashboard.show(&mut app, ui, ctx));
+        });
+        assert!(!dashboard.refresh.active);
+        assert!(
+            dashboard.refresh.next_at <= 61,
+            "healthy runs were delayed by a PR-only failure"
+        );
+    }
+
+    #[test]
+    fn complete_outage_keeps_dashboard_retry_backoff() {
+        let (mut app, ctx) = dashboard_fixture(false, "completed", false);
+        let mut dashboard = app.ui.remote.take().unwrap();
+        let generation = dashboard.refresh.start().unwrap();
+        dashboard.generation = Some(generation);
+        let panel = dashboard.tickets.get_mut("ACME-42").unwrap();
+        let mut result = panel.results[0].clone();
+        result.failed_runs = true;
+        result.failed_prs = true;
+        result.errors.push("Network unavailable".into());
+        panel.cached[0].update(result, now());
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| dashboard.show(&mut app, ui, ctx));
+        });
+        assert!(!dashboard.refresh.active);
+        assert!(dashboard.refresh.next_at >= 120);
+    }
+
+    #[test]
+    fn partial_pr_failure_is_labelled_without_calling_fresh_runs_stale() {
+        let (mut app, ctx) = dashboard_fixture(false, "completed", false);
+        let panel = app
+            .ui
+            .remote
+            .as_mut()
+            .unwrap()
+            .tickets
+            .get_mut("ACME-42")
+            .unwrap();
+        let mut result = panel.results[0].clone();
+        result.failed_prs = true;
+        result.errors.push("PR access denied".into());
+        panel.cached[0].update(result, now());
+        let mut output = frame(&mut app, &ctx, Vec2::new(1180.0, 760.0), vec![]);
+        for _ in 0..2 {
+            output = frame(&mut app, &ctx, Vec2::new(1180.0, 760.0), vec![]);
+        }
+        let text = texts(&output).join("\n");
+        assert!(text.contains("Stale pull requests. Runs refreshed"));
+        assert!(!text.contains("Stale data."));
+    }
+
+    #[test]
+    fn reopening_autobot_refreshes_due_data_even_with_live_refresh_off() {
+        let (mut app, ctx) = dashboard_fixture(false, "completed", false);
+        app.ui.autobot_visible = false;
+        app.saved.remote_runs["gh_path"] = json!("/nonexistent/tessera-gh");
+        let dashboard = app.ui.remote.as_mut().unwrap();
+        dashboard.config_value = app.saved.remote_runs.clone();
+        dashboard.config = Config::parse(&app.saved.remote_runs);
+        dashboard.tickets.get_mut("ACME-42").unwrap().config =
+            Config::parse(&app.saved.remote_runs);
+        app.open_remote_runs(String::new(), &ctx);
+        let dashboard = app.ui.remote.as_ref().unwrap();
+        assert!(!app.saved.autobot.live);
+        assert!(dashboard.refresh.active);
+        assert_eq!(dashboard.tickets["ACME-42"].pending, 1);
+    }
+
+    #[test]
+    fn reopening_autobot_respects_the_existing_freshness_window() {
+        let (mut app, ctx) = dashboard_fixture(false, "completed", false);
+        app.ui.autobot_visible = false;
+        app.ui.remote.as_mut().unwrap().refresh.next_at = 60;
+        app.open_remote_runs(String::new(), &ctx);
+        assert!(!app.ui.remote.as_ref().unwrap().refresh.active);
+    }
+
+    #[test]
+    fn refreshed_jobs_choose_the_new_configured_job_when_the_old_job_disappears() {
+        let (mut app, ctx) = dashboard_fixture(false, "completed", false);
+        let panel = app
+            .ui
+            .remote
+            .as_mut()
+            .unwrap()
+            .tickets
+            .get_mut("ACME-42")
+            .unwrap();
+        let output = panel.output.as_mut().unwrap();
+        let (tx, rx) = channel();
+        tx.send(Ok(vec![Job {
+            id: 10,
+            name: "Build".into(),
+            steps: vec![provider::Step {
+                name: "Agent".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }]))
+        .unwrap();
+        output.receiver = Some(rx);
+        panel.poll(&ctx);
+        let output = panel.output.as_ref().unwrap();
+        assert_eq!(output.job, Some(10));
+        assert_eq!(output.step.as_deref(), Some("Agent"));
+        assert!(output.error.is_empty());
+    }
+
+    #[test]
+    fn a_completed_rerun_detected_between_polls_refreshes_its_jobs() {
+        let (mut app, ctx) = dashboard_fixture(false, "completed", false);
+        let panel = app
+            .ui
+            .remote
+            .as_mut()
+            .unwrap()
+            .tickets
+            .get_mut("ACME-42")
+            .unwrap();
+        panel.config.as_mut().unwrap().gh_path = "/nonexistent/tessera-gh".into();
+        let previous_jobs = panel.output.as_ref().unwrap().cancelled.clone();
+        let (tx, rx) = channel();
+        panel.receiver = Some(rx);
+        panel.pending = 1;
+        let mut result = panel.results[0].clone();
+        result.runs[0].updated_at = "2026-10-29T12:02:30Z".into();
+        result.runs[0].conclusion = Some("success".into());
+        tx.send(result).unwrap();
+        panel.poll(&ctx);
+        assert!(previous_jobs.load(Ordering::Acquire));
+        assert_eq!(
+            panel.output.as_ref().unwrap().run.conclusion.as_deref(),
+            Some("success")
+        );
+    }
+
+    #[test]
+    fn a_rerun_of_a_completed_selected_run_refreshes_its_jobs() {
+        let (mut app, ctx) = dashboard_fixture(false, "completed", false);
+        let panel = app
+            .ui
+            .remote
+            .as_mut()
+            .unwrap()
+            .tickets
+            .get_mut("ACME-42")
+            .unwrap();
+        panel.config.as_mut().unwrap().gh_path = "/nonexistent/tessera-gh".into();
+        let previous_jobs = panel.output.as_ref().unwrap().cancelled.clone();
+        let (tx, rx) = channel();
+        panel.receiver = Some(rx);
+        panel.pending = 1;
+        let mut result = panel.results[0].clone();
+        result.runs[0].status = "in_progress".into();
+        result.runs[0].conclusion = None;
+        tx.send(result).unwrap();
+        panel.poll(&ctx);
+        assert_eq!(panel.output.as_ref().unwrap().run.status, "in_progress");
+        assert!(previous_jobs.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn selected_run_progress_updates_before_other_repositories_finish() {
+        let (mut app, ctx) = dashboard_fixture(false, "in_progress", false);
+        let dashboard = app.ui.remote.as_mut().unwrap();
+        let panel = dashboard.tickets.get_mut("ACME-42").unwrap();
+        panel.config.as_mut().unwrap().gh_path = "/nonexistent/tessera-gh".into();
+        let (tx, rx) = channel();
+        panel.receiver = Some(rx);
+        panel.pending = 2;
+        let mut result = panel.results[0].clone();
+        result.runs[0].status = "completed".into();
+        result.runs[0].conclusion = Some("success".into());
+        tx.send(result).unwrap();
+        panel.poll(&ctx);
+        assert_eq!(panel.pending, 1);
+        assert_eq!(panel.output.as_ref().unwrap().run.status, "completed");
+        assert_eq!(
+            panel.output.as_ref().unwrap().run.conclusion.as_deref(),
+            Some("success")
+        );
     }
 
     #[test]

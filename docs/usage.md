@@ -126,9 +126,9 @@ Lookup is bounded: `run_limit` defaults to 30 per configured event, with a maxim
 
 ### Refresh and stale data
 
-**Refresh** updates tracked tickets in one cycle. **Live refresh** is optional and off by default. When enabled, it runs only while the page is visible, 60 seconds after a successful cycle. Consecutive errors extend the delay to 120, 240, 480, then at most 600 seconds; a successful cycle resets it. Refresh cycles do not overlap. Leaving the page cancels queued and subsequent metadata requests; an already running GitHub CLI call may finish before its 20-second timeout. Obsolete results are discarded. All panels share the existing limit of eight concurrent metadata requests.
+**Refresh** updates tracked tickets in one cycle. **Live refresh** is optional and off by default. When enabled, it runs only while the page is visible, 60 seconds after a successful cycle. If every metadata stream fails, consecutive failures extend the delay to 120, 240, 480, then at most 600 seconds. A healthy stream keeps the regular refresh interval for the other data. Refresh cycles do not overlap. Leaving the page cancels queued metadata requests and stops running GitHub CLI lookups. Obsolete results are discarded. All GitHub metadata requests share a limit of four concurrent CLI calls.
 
-Refresh preserves the selected item. If a source/repository refresh fails, its prior metadata remains visible as stale, with the last successful refresh timestamp and the current error. A stale running row is an old observation, not proof that the run is still active. Lookup-limit warnings describe bounded coverage without marking a successful refresh stale or delaying the next refresh. Retry with **Refresh** after correcting authentication, permissions, configuration, or network problems.
+Refresh preserves the selected item. If a source/repository refresh fails, its prior metadata remains visible as stale, with the last successful refresh timestamp and the current error. Run and PR freshness are tracked separately, so a failed PR query does not make successfully refreshed runs stale. A stale running row is an old observation, not proof that the run is still active. Lookup-limit warnings describe bounded coverage without marking a successful refresh stale or delaying the next refresh. Retry with **Refresh** after correcting authentication, permissions, configuration, or network problems.
 
 ### Output and pull request comments
 
@@ -137,5 +137,22 @@ Completed runs retain **Full log** and **Output…** actions. Output opens job/s
 Remote output never enters saved terminal snapshots. GitHub log caches use private temporary directories cleaned up on command exit, pane closure, or launch failure. Closing a remote terminal discards its retained output. Metadata and tracking views do not store full logs.
 
 The optional PR comment editor keeps the full body in memory. Choose **Preview comment** to inspect the target repository, pull request, full body, and warnings, then separately choose **Confirm and post comment** to publish. Posting can start a paid agent run, create commits, or cause a merge when auto-merge is armed. The preview warns about armed auto-merge and closed PRs. Leaving Autobot discards unposted drafts and previews. Comment bodies use private temporary files removed after normal success or failure; normal exit waits for any confirmed post or pending log launch to finish cleanup. An in-flight GitHub CLI post can delay exit by up to its 20-second timeout. Force-quitting during posting can leave a temporary file behind. Tessera refreshes after a successful post.
+
+GitHub CLI requests reuse the login-shell environment resolved once per process. Run and PR list responses stay in memory for 45 seconds. Each refresh bypasses data from earlier cycles; tickets in the same cycle share identical requests, including concurrent requests. Configured lookup limits remain unchanged. A rate-limit response stops new requests for at least 60 seconds, without automatic retries.
+
+Merge Radar searches review requests on GitHub instead of downloading every open PR. Repository review cards retain checks, conflicts, and unresolved threads. Their overall review decision and branch readiness remain unconfirmed unless the same PR was also loaded as assigned or authored; those calculations can exceed GitHub's resource limits on large repositories. Failed scopes appear alongside successful results. A complete refresh failure retains the previous result.
+
+Start Tessera with `RUST_LOG=tessera=debug` to print CLI-call and refresh timings to stderr. Merge Radar queries always fetch fresh data.
+
+### GitHub CLI diagnostics
+
+Request errors identify the source, repository, and command. Rate limits, GitHub server errors, SSO authorization, and incompatible CLI versions have specific recovery messages. Unclassified failures include the exit code and up to 200 characters from the first useful stderr line, with shell noise removed and GitHub token prefixes redacted. Other repositories and sources continue to render.
+
+Failed CLI requests save command arguments, the exit code, and full token-redacted stderr in private diagnostic files:
+
+- macOS: `~/Library/Logs/Tessera/remote-runs/`
+- Linux: `~/.local/state/tessera/remote-runs/`
+
+Attach the relevant `.log` files to a bug report. Successful requests discard their diagnostic files. Logging is best effort if the directory cannot be written. Diagnostic files do not contain workflow log output or comment bodies; review stderr before sharing because it may contain repository names or other account details. You can delete these files after troubleshooting.
 
 Autobot cannot approve or merge a pull request or change its auto-merge settings. A comment is an explicit external action, even when the text looks like an ordinary conversation reply.

@@ -1,6 +1,6 @@
 [package]
 name = "tessera"
-version = "0.12.1"
+version = "0.12.2"
 edition = "2024"
 license = "MIT"
 description = "A terminal workspace for durable work with Claude Code and Codex"
@@ -13,6 +13,7 @@ eframe = { version = "0.33", default-features = false, features = ["default_font
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 regex = "1"
+log = "0.4"
 uuid = { version = "1", features = ["v4", "serde"] }
 fontdb = "0.23"
 ttf-parser = "0.25"

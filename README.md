@@ -6,9 +6,9 @@
 
 See which task needs a decision, keep related agent sessions together, and carry specifications and work stages beyond a single terminal session. Tessera brings that context into a native terminal workspace, so you can return to the CLI to review, approve, and act.
 
-[Download](https://github.com/JeremySomsouk/tessera/releases) · [Getting started](#install) · [Documentation](docs/usage.md) · [Release notes](docs/releases/0.12.1.md)
+[Download](https://github.com/JeremySomsouk/tessera/releases) · [Getting started](#install) · [Documentation](docs/usage.md) · [Release notes](docs/releases/0.12.2.md)
 
-Tessera runs on **macOS and Linux**, on Intel/AMD and ARM64. Built with Rust, with no browser runtime. Current version: **0.12.1 (alpha)**.
+Tessera runs on **macOS and Linux**, on Intel/AMD and ARM64. Built with Rust, with no browser runtime. Current version: **0.12.2 (alpha)**.
 
 ## A look inside
 
@@ -105,7 +105,7 @@ Stages are yours to change. Launching an agent does not advance a stage, and a f
 
 ## Local data and current limits
 
-Preferences, work items, specifications, and bounded session histories are saved locally. Autobot saves source configuration, tracked ticket keys, and tracking preferences; fetched metadata, logs, and comment bodies are not saved. Lifecycle tracking records events and tool names, not prompts or transcripts. Specification text is sent to the selected agent when you launch it.
+Preferences, work items, specifications, and bounded session histories are saved locally. Autobot saves source configuration, tracked ticket keys, and tracking preferences; fetched metadata, workflow logs, and comment bodies are not saved. Failed GitHub CLI requests save private, token-redacted diagnostic logs; see [Autobot diagnostics](docs/usage.md#github-cli-diagnostics). Lifecycle tracking records events and tool names, not prompts or transcripts. Specification text is sent to the selected agent when you launch it.
 
 Tessera restores open workspaces, tabs, split ratios, focused panes, and their latest recorded directories automatically. Quitting or closing the final window saves the workspace and stops hosted processes. Explicitly stopped panes and workspaces stay closed. Closing a window while other windows remain open stops that window's terminals. Separate windows reopen with their original tabs, tab order, active tab, position, and size. Use Cmd+Q (Ctrl+Shift+Q on Linux) to quit while keeping all windows for the next launch. Older snapshots without window metadata open in one main window. Window placement may be adjusted by the operating system when the display setup changes.
 

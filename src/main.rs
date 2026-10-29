@@ -4,6 +4,7 @@ mod directories;
 mod discovery;
 mod folders;
 mod fonts;
+mod github_debug;
 mod integration;
 mod merge_radar;
 mod model;
@@ -17,6 +18,7 @@ mod terminal;
 mod ui;
 mod updater;
 fn main() -> anyhow::Result<()> {
+    github_debug::init();
     let args: Vec<_> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("hook" | "codex-hook") => {

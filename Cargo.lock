@@ -2437,13 +2437,14 @@ dependencies = [
 
 [[package]]
 name = "tessera"
-version = "0.12.1"
+version = "0.12.2"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
  "eframe",
  "fontdb",
  "libc",
+ "log",
  "objc2 0.6.4",
  "objc2-foundation 0.3.2",
  "plist",

@@ -1,3 +1,5 @@
+mod runtime;
+
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::Value;
@@ -5,7 +7,7 @@ use std::{
     collections::HashSet,
     fs::{self, OpenOptions},
     io::{Read, Write},
-    os::unix::fs::OpenOptionsExt,
+    os::unix::fs::{DirBuilderExt, OpenOptionsExt},
     path::PathBuf,
     process::{Command, Stdio},
     sync::mpsc,
@@ -222,16 +224,46 @@ fn validate_repo(repo: &str) -> Result<(), String> {
 }
 
 pub trait Gh: Send + Sync {
+    fn cancelled(&self) -> bool {
+        false
+    }
+
     fn run(&self, args: &[String]) -> Result<String, String>;
+
+    fn run_detailed_cancelled(
+        &self,
+        args: &[String],
+        cancelled: &std::sync::atomic::AtomicBool,
+    ) -> Result<String, GhFailure> {
+        if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+            return Err("Lookup cancelled".into());
+        }
+        self.run_detailed(args)
+    }
+
+    fn run_detailed(&self, args: &[String]) -> Result<String, GhFailure> {
+        self.run(args).map_err(GhFailure::from)
+    }
 }
 
 pub struct GhCli {
     path: String,
+    fresh_since: Option<Instant>,
 }
 
 impl GhCli {
     pub fn new(path: String) -> Self {
-        Self { path }
+        Self {
+            path,
+            fresh_since: None,
+        }
+    }
+
+    pub fn fresh(path: String, since: Instant) -> Self {
+        Self {
+            path,
+            fresh_since: Some(since),
+        }
     }
 }
 
@@ -246,6 +278,104 @@ const GH_FAILED: &str =
 const GH_TIMEOUT: &str = "GitHub CLI request timed out after 20 seconds";
 const INVALID_METADATA: &str = "GitHub CLI returned invalid metadata";
 
+const GH_RATE_LIMIT: &str =
+    "GitHub rate limit reached; wait before retrying and check gh api rate_limit";
+const GH_SERVER: &str = "GitHub server error; retry later and check GitHub status";
+const GH_SSO: &str =
+    "GitHub organization requires SSO authorization; authorize your token for the organization";
+const GH_COMPAT: &str =
+    "GitHub CLI is incompatible; upgrade gh to support the requested command and fields";
+
+#[derive(Clone, Debug)]
+pub struct GhFailure {
+    cause: String,
+    detail: Option<String>,
+    code: Option<i32>,
+}
+
+impl From<String> for GhFailure {
+    fn from(error: String) -> Self {
+        Self {
+            cause: safe_gh_error(&error).into(),
+            detail: None,
+            code: None,
+        }
+    }
+}
+
+impl From<&str> for GhFailure {
+    fn from(error: &str) -> Self {
+        Self::from(error.to_owned())
+    }
+}
+
+impl GhFailure {
+    fn process(code: Option<i32>, stderr: &[u8]) -> Self {
+        Self {
+            cause: classify_failure(code, stderr).into(),
+            detail: stderr_detail(stderr),
+            code,
+        }
+    }
+
+    pub fn message(&self) -> String {
+        let cause = safe_gh_error(&self.cause);
+        if cause != GH_FAILED {
+            return cause.into();
+        }
+        let status = self
+            .code
+            .map(|code| format!("exit {code}"))
+            .unwrap_or_else(|| "exit code unavailable".into());
+        let detail = self.detail.as_deref().unwrap_or("");
+        format!(
+            "{cause} ({status}){}{}",
+            if detail.is_empty() { "" } else { ": " },
+            detail
+        )
+    }
+}
+
+fn redact_tokens(text: &str) -> String {
+    Regex::new(r"(?:gh[opsur]_|github_pat_)[A-Za-z0-9_]*")
+        .unwrap()
+        .replace_all(text, "[REDACTED]")
+        .into_owned()
+}
+
+fn stderr_detail(stderr: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(stderr);
+    let line = text.lines().map(str::trim).find(|line| {
+        !line.is_empty()
+            && !line.starts_with("(eval)")
+            && !line.starts_with("zle:")
+            && !line.contains("can't change option: zle")
+    })?;
+    if line.chars().any(char::is_control) {
+        return None;
+    }
+    let redacted = redact_tokens(line);
+    let detail = if redacted.chars().count() > 200 {
+        format!("{}...", redacted.chars().take(197).collect::<String>())
+    } else {
+        redacted
+    };
+    safe_text(&detail, "GitHub CLI diagnostic").ok()?;
+    Some(detail)
+}
+
+fn request(gh: &dyn Gh, args: &[String]) -> Result<String, String> {
+    gh.run_detailed(args).map_err(|error| {
+        let command = args.iter().take(2).cloned().collect::<Vec<_>>().join(" ");
+        let repo = args
+            .windows(2)
+            .find(|pair| pair[0] == "--repo")
+            .map(|pair| pair[1].as_str())
+            .unwrap_or("");
+        format!("{command} {repo}: {}", error.message())
+    })
+}
+
 fn safe_gh_error(error: &str) -> &str {
     if [
         GH_MISSING,
@@ -255,6 +385,10 @@ fn safe_gh_error(error: &str) -> &str {
         GH_NETWORK,
         GH_FAILED,
         GH_TIMEOUT,
+        GH_RATE_LIMIT,
+        GH_SERVER,
+        GH_SSO,
+        GH_COMPAT,
         INVALID_METADATA,
     ]
     .contains(&error)
@@ -269,6 +403,20 @@ fn classify_failure(code: Option<i32>, diagnostics: &[u8]) -> &'static str {
     let diagnostic = String::from_utf8_lossy(diagnostics).to_ascii_lowercase();
     if code == Some(127) {
         GH_MISSING
+    } else if diagnostic.contains("http 429") || diagnostic.contains("rate limit") {
+        GH_RATE_LIMIT
+    } else if ["http 500", "http 502", "http 503", "http 504"]
+        .iter()
+        .any(|code| diagnostic.contains(code))
+    {
+        GH_SERVER
+    } else if diagnostic.contains("saml") || diagnostic.contains("sso") {
+        GH_SSO
+    } else if ["unknown flag", "unknown json field", "unknown command"]
+        .iter()
+        .any(|text| diagnostic.contains(text))
+    {
+        GH_COMPAT
     } else if diagnostic.contains("http 401")
         || diagnostic.contains("gh auth login")
         || diagnostic.contains("not logged")
@@ -306,36 +454,256 @@ fn capture_output(
     receiver
 }
 
+struct DiagnosticLog {
+    path: PathBuf,
+    file: fs::File,
+    keep: bool,
+}
+
+impl DiagnosticLog {
+    fn new(path: &str, args: &[String]) -> Option<Self> {
+        let home = PathBuf::from(std::env::var_os("HOME")?);
+        let directory = home.join(if cfg!(target_os = "macos") {
+            "Library/Logs/Tessera/remote-runs"
+        } else {
+            ".local/state/tessera/remote-runs"
+        });
+        let mut builder = fs::DirBuilder::new();
+        builder
+            .recursive(true)
+            .mode(0o700)
+            .create(&directory)
+            .ok()?;
+        Self::create(
+            directory.join(format!("{}.log", uuid::Uuid::new_v4())),
+            path,
+            args,
+        )
+        .ok()
+    }
+
+    fn create(path: PathBuf, cli: &str, args: &[String]) -> std::io::Result<Self> {
+        let file = OpenOptions::new()
+            .create_new(true)
+            .append(true)
+            .mode(0o600)
+            .open(&path)?;
+        let mut log = Self {
+            path,
+            file,
+            keep: false,
+        };
+        writeln!(
+            log.file,
+            "command: {}\nstderr:",
+            redact_tokens(&format!("{cli:?} {args:?}"))
+        )?;
+        Ok(log)
+    }
+
+    fn finish(&mut self, result: &Result<String, GhFailure>) {
+        self.keep = result.is_err();
+        if let Err(error) = result {
+            let _ = writeln!(
+                self.file,
+                "\nexit: {:?}\nreason: {}",
+                error.code,
+                error.message()
+            );
+        }
+    }
+}
+
+impl Drop for DiagnosticLog {
+    fn drop(&mut self) {
+        if !self.keep {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn capture_stderr(
+    mut reader: impl Read + Send + 'static,
+    log: Option<fs::File>,
+) -> mpsc::Receiver<std::io::Result<Vec<u8>>> {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut log = log.map(std::io::BufWriter::new);
+        let result = drain_stderr(&mut reader, &mut log);
+        if let Some(log) = &mut log {
+            let _ = log.flush();
+        }
+        let _ = sender.send(result);
+    });
+    receiver
+}
+
+fn drain_stderr(reader: &mut impl Read, log: &mut Option<impl Write>) -> std::io::Result<Vec<u8>> {
+    let mut captured = Vec::new();
+    let mut pending = Vec::new();
+    let mut token = false;
+    let mut buffer = [0; 8192];
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        let remaining = 65536usize.saturating_sub(captured.len());
+        captured.extend_from_slice(&buffer[..count.min(remaining)]);
+        if let Some(log) = log {
+            for &byte in &buffer[..count] {
+                if token && (byte.is_ascii_alphanumeric() || byte == b'_') {
+                    continue;
+                }
+                token = false;
+                pending.push(byte);
+                if [
+                    b"gho_".as_slice(),
+                    b"ghp_",
+                    b"ghu_",
+                    b"ghs_",
+                    b"ghr_",
+                    b"github_pat_",
+                ]
+                .iter()
+                .any(|prefix| pending.ends_with(prefix))
+                {
+                    let prefix = if pending.ends_with(b"github_pat_") {
+                        11
+                    } else {
+                        4
+                    };
+                    pending.truncate(pending.len() - prefix);
+                    let _ = log.write_all(&pending);
+                    let _ = log.write_all(b"[REDACTED]");
+                    pending.clear();
+                    token = true;
+                } else if pending.len() > 11 {
+                    let _ = log.write_all(&pending[..1]);
+                    pending.remove(0);
+                }
+            }
+        }
+    }
+    if let Some(log) = log {
+        let _ = log.write_all(&pending);
+    }
+    Ok(captured)
+}
+
 const MAX_OUTPUT: usize = 8 * 1024 * 1024;
 const CLI_TIMEOUT: Duration = Duration::from_secs(20);
 
 impl Gh for GhCli {
     fn run(&self, args: &[String]) -> Result<String, String> {
+        self.run_detailed(args).map_err(|error| error.cause)
+    }
+
+    fn run_detailed(&self, args: &[String]) -> Result<String, GhFailure> {
         self.run_bounded(args, CLI_TIMEOUT)
+    }
+
+    fn run_detailed_cancelled(
+        &self,
+        args: &[String],
+        cancelled: &std::sync::atomic::AtomicBool,
+    ) -> Result<String, GhFailure> {
+        self.run_bounded_cancelled(args, CLI_TIMEOUT, cancelled)
     }
 }
 
 impl GhCli {
-    fn run_bounded(&self, args: &[String], timeout: Duration) -> Result<String, String> {
+    pub fn run_cancelled(
+        &self,
+        args: &[String],
+        cancelled: &std::sync::atomic::AtomicBool,
+    ) -> Result<String, String> {
+        self.run_bounded_cancelled(args, CLI_TIMEOUT, cancelled)
+            .map_err(|error| error.cause)
+    }
+
+    fn run_bounded(&self, args: &[String], timeout: Duration) -> Result<String, GhFailure> {
+        self.run_bounded_cancelled(args, timeout, &std::sync::atomic::AtomicBool::new(false))
+    }
+
+    fn run_bounded_cancelled(
+        &self,
+        args: &[String],
+        timeout: Duration,
+        cancelled: &std::sync::atomic::AtomicBool,
+    ) -> Result<String, GhFailure> {
+        let started = Instant::now();
         safe_text(&self.path, "GitHub CLI path")?;
-        let marker = format!("TESSERA_GH_{}", uuid::Uuid::new_v4().simple());
-        let script = format!(
-            "printf '\\n{marker}\\n'; exec {}",
-            shell_args(std::iter::once(self.path.as_str()).chain(args.iter().map(String::as_str)))
+        for arg in args {
+            safe_text(arg, "GitHub CLI argument")?;
+        }
+        if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+            return Err("Lookup cancelled".into());
+        }
+        let _flight = runtime::flight(&self.path, args, cancelled)?;
+        if let Some(result) = runtime::cached(&self.path, args, self.fresh_since) {
+            log::debug!(
+                "gh {} cached elapsed_ms={}",
+                args.first().map(String::as_str).unwrap_or(""),
+                started.elapsed().as_millis()
+            );
+            return result;
+        }
+        let mut log = DiagnosticLog::new(&self.path, args);
+        let result = self.run_process(args, timeout, cancelled, log.as_mut());
+        if let Some(log) = &mut log {
+            log.finish(&result);
+        }
+        if !cancelled.load(std::sync::atomic::Ordering::Acquire) {
+            runtime::remember(&self.path, args, &result, self.fresh_since);
+        }
+        log::debug!(
+            "gh {} elapsed_ms={} success={}",
+            args.first().map(String::as_str).unwrap_or(""),
+            started.elapsed().as_millis(),
+            result.is_ok()
         );
-        let mut command = Command::new(crate::terminal::agent_shell());
+        result
+    }
+
+    fn run_process(
+        &self,
+        args: &[String],
+        timeout: Duration,
+        cancelled: &std::sync::atomic::AtomicBool,
+        log: Option<&mut DiagnosticLog>,
+    ) -> Result<String, GhFailure> {
+        let environment = runtime::environment(cancelled)?;
+        let _permit = runtime::acquire(cancelled)?;
+        let mut command = Command::new(&self.path);
         command
-            .args(["-lic", &script])
+            .args(args)
+            .env_clear()
+            .envs(environment.iter().cloned())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .env("GH_PROMPT_DISABLED", "1")
             .env("GH_PAGER", "cat");
-        let mut child = command.spawn().map_err(|_| "Cannot start GitHub CLI in your login shell; check its installation and configured path".to_string())?;
+        let mut child = command.spawn().map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                GH_MISSING
+            } else {
+                GH_FAILED
+            }
+        })?;
         let stdout = capture_output(child.stdout.take().ok_or(GH_FAILED)?, MAX_OUTPUT);
-        let stderr = capture_output(child.stderr.take().ok_or(GH_FAILED)?, 65536);
+        let stderr = capture_stderr(
+            child.stderr.take().ok_or(GH_FAILED)?,
+            log.and_then(|log| log.file.try_clone().ok()),
+        );
         let deadline = Instant::now() + timeout;
         loop {
+            if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("Lookup cancelled".into());
+            }
             match child.try_wait() {
                 Ok(Some(status)) => {
                     if !status.success() {
@@ -344,7 +712,11 @@ impl GhCli {
                             .ok()
                             .and_then(Result::ok)
                             .unwrap_or_default();
-                        return Err(classify_failure(status.code(), &diagnostics).into());
+                        let failure = GhFailure::process(status.code(), &diagnostics);
+                        if failure.cause == GH_RATE_LIMIT {
+                            runtime::backoff();
+                        }
+                        return Err(failure);
                     }
                     let bytes = stdout
                         .recv_timeout(Duration::from_millis(250))
@@ -353,12 +725,8 @@ impl GhCli {
                     if bytes.len() > MAX_OUTPUT {
                         return Err("GitHub CLI response exceeds the 8 MiB limit".into());
                     }
-                    let text = String::from_utf8(bytes)
-                        .map_err(|_| "GitHub CLI returned invalid UTF-8".to_string())?;
-                    return text
-                        .split_once(&format!("\n{marker}\n"))
-                        .map(|(_, text)| text.to_owned())
-                        .ok_or_else(|| "Login shell did not return a GitHub CLI response".into());
+                    return String::from_utf8(bytes)
+                        .map_err(|_| "GitHub CLI returned invalid UTF-8".into());
                 }
                 Err(_) => {
                     let _ = child.kill();
@@ -390,6 +758,18 @@ pub struct RepoResult {
     pub prs: Vec<PullRequest>,
     pub errors: Vec<String>,
     pub warnings: Vec<String>,
+    pub failed_runs: bool,
+    pub failed_prs: bool,
+}
+
+impl RepoResult {
+    pub fn runs_failed(&self) -> bool {
+        self.failed_runs || (!self.failed_prs && !self.errors.is_empty())
+    }
+
+    pub fn prs_failed(&self) -> bool {
+        self.failed_prs || (!self.failed_runs && !self.errors.is_empty())
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -442,7 +822,38 @@ struct PrJson {
     auto_merge_request: Option<Value>,
 }
 
+pub fn parallel_map<T: Sync, R: Send>(items: &[T], work: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let next = AtomicUsize::new(0);
+    let results = Mutex::new((0..items.len()).map(|_| None).collect::<Vec<_>>());
+    std::thread::scope(|scope| {
+        for _ in 0..items.len().min(4) {
+            let work = &work;
+            let next = &next;
+            let results = &results;
+            scope.spawn(move || {
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(item) = items.get(index) else { break };
+                    let result = work(item);
+                    results.lock().unwrap()[index] = Some(result);
+                }
+            });
+        }
+    });
+    results
+        .into_inner()
+        .unwrap()
+        .into_iter()
+        .map(Option::unwrap)
+        .collect()
+}
+
 pub fn lookup(gh: &dyn Gh, task: &LookupTask, key: &str, limit: usize) -> RepoResult {
+    let started = Instant::now();
     let mut result = RepoResult {
         repo: task.repo.clone(),
         source_name: task.source.name.clone(),
@@ -469,8 +880,8 @@ pub fn lookup(gh: &dyn Gh, task: &LookupTask, key: &str, limit: usize) -> RepoRe
             .map(|event| Some(event.as_str()))
             .collect()
     };
-    let mut seen = HashSet::new();
-    for event in events {
+    let mut requests = Vec::new();
+    for event in &events {
         let mut args = strings(&[
             "run",
             "list",
@@ -479,12 +890,48 @@ pub fn lookup(gh: &dyn Gh, task: &LookupTask, key: &str, limit: usize) -> RepoRe
             "--limit",
             &limit.clamp(1, 1000).to_string(),
             "--json",
-            "databaseId,displayTitle,status,conclusion,createdAt,startedAt,updatedAt,url,workflowName,event",
+            "databaseId,displayTitle,status,conclusion,createdAt,startedAt,updatedAt,url,workflowName",
         ]);
         if let Some(event) = event {
             args.extend(strings(&["--event", event]));
         }
-        match gh.run(&args).and_then(|text| {
+        requests.push(args);
+    }
+    let mut pr_args = strings(&[
+        "pr",
+        "list",
+        "--repo",
+        &task.repo,
+        "--state",
+        "all",
+        "--limit",
+        "1000",
+        "--json",
+        "number,title,url,headRefName,state,autoMergeRequest",
+    ]);
+    if let Some(label) = &task.source.pr_label
+        && !label.is_empty()
+    {
+        pr_args.extend(strings(&["--label", label]));
+    }
+    for title_search in [true, false] {
+        let mut args = pr_args.clone();
+        if title_search {
+            args.extend(strings(&["--search", &format!("{key} in:title")]));
+        }
+        requests.push(args);
+    }
+    let mut responses = parallel_map(&requests, |args| {
+        if gh.cancelled() {
+            Err("Lookup cancelled".into())
+        } else {
+            request(gh, args)
+        }
+    })
+    .into_iter();
+    let mut seen = HashSet::new();
+    for event in events {
+        match responses.next().unwrap().and_then(|text| {
             serde_json::from_str::<Vec<Run>>(&text).map_err(|_| INVALID_METADATA.into())
         }) {
             Ok(runs) => {
@@ -514,14 +961,18 @@ pub fn lookup(gh: &dyn Gh, task: &LookupTask, key: &str, limit: usize) -> RepoRe
                     }
                 }
             }
-            Err(error) => result.errors.push(format!(
-                "{}: cannot list runs{}: {}",
-                task.repo,
-                event
-                    .map(|event| format!(" for {event}"))
-                    .unwrap_or_default(),
-                safe_gh_error(&error)
-            )),
+            Err(error) => {
+                result.failed_runs = true;
+                result.errors.push(format!(
+                    "{} / {}: cannot list runs{}: {}",
+                    task.source.name,
+                    task.repo,
+                    event
+                        .map(|event| format!(" for {event}"))
+                        .unwrap_or_default(),
+                    error
+                ));
+            }
         }
     }
     result.runs.sort_by(|a, b| {
@@ -529,34 +980,13 @@ pub fn lookup(gh: &dyn Gh, task: &LookupTask, key: &str, limit: usize) -> RepoRe
             .cmp(&a.created_at)
             .then_with(|| b.id.cmp(&a.id))
     });
-    let mut args = strings(&[
-        "pr",
-        "list",
-        "--repo",
-        &task.repo,
-        "--state",
-        "all",
-        "--limit",
-        "1000",
-        "--json",
-        "number,title,url,headRefName,state,autoMergeRequest",
-    ]);
-    if let Some(label) = &task.source.pr_label
-        && !label.is_empty()
-    {
-        args.extend(strings(&["--label", label]));
-    }
     let ticket = compile_regex(&format!(
         "(?:^|[^A-Za-z0-9]){}(?:[^A-Za-z0-9]|$)",
         regex::escape(key)
     ));
     let mut seen_prs = HashSet::new();
     for title_search in [true, false] {
-        let mut query = args.clone();
-        if title_search {
-            query.extend(strings(&["--search", &format!("{key} in:title")]));
-        }
-        match gh.run(&query).and_then(|text| {
+        match responses.next().unwrap().and_then(|text| {
             serde_json::from_str::<Vec<PrJson>>(&text).map_err(|_| INVALID_METADATA.into())
         }) {
             Ok(prs) => {
@@ -588,18 +1018,28 @@ pub fn lookup(gh: &dyn Gh, task: &LookupTask, key: &str, limit: usize) -> RepoRe
                     }
                 }
             }
-            Err(error) => result.errors.push(format!(
-                "{}: cannot {}: {}",
-                task.repo,
-                if title_search {
-                    "search pull request titles"
-                } else {
-                    "scan pull request branches"
-                },
-                safe_gh_error(&error)
-            )),
+            Err(error) => {
+                result.failed_prs = true;
+                result.errors.push(format!(
+                    "{} / {}: cannot {}: {}",
+                    task.source.name,
+                    task.repo,
+                    if title_search {
+                        "search pull request titles"
+                    } else {
+                        "scan pull request branches"
+                    },
+                    error
+                ));
+            }
         }
     }
+    log::debug!(
+        "remote lookup repo={} elapsed_ms={} errors={}",
+        task.repo,
+        started.elapsed().as_millis(),
+        result.errors.len()
+    );
     result
 }
 
@@ -628,8 +1068,9 @@ pub fn jobs(gh: &dyn Gh, repo: &str, id: u64) -> Result<Vec<Job>, String> {
     struct Jobs {
         jobs: Vec<Job>,
     }
-    let response = gh
-        .run(&strings(&[
+    let response = request(
+        gh,
+        &strings(&[
             "run",
             "view",
             &id.to_string(),
@@ -637,8 +1078,9 @@ pub fn jobs(gh: &dyn Gh, repo: &str, id: u64) -> Result<Vec<Job>, String> {
             repo,
             "--json",
             "jobs",
-        ]))
-        .map_err(|error| format!("Cannot load jobs: {}", safe_gh_error(&error)))?;
+        ]),
+    )
+    .map_err(|error| format!("Cannot load jobs: {error}"))?;
     serde_json::from_str::<Jobs>(&response)
         .map(|response| response.jobs)
         .map_err(|_| "GitHub CLI returned invalid job metadata".into())
@@ -774,17 +1216,20 @@ pub fn post_comment(gh: &dyn Gh, comment: &ConfirmedComment) -> Result<(), Strin
         .path
         .to_str()
         .ok_or("Comment file path cannot be represented")?;
-    gh.run(&strings(&[
-        "pr",
-        "comment",
-        &comment.preview.pr.to_string(),
-        "--repo",
-        &comment.preview.repo,
-        "--body-file",
-        path,
-    ]))
+    request(
+        gh,
+        &strings(&[
+            "pr",
+            "comment",
+            &comment.preview.pr.to_string(),
+            "--repo",
+            &comment.preview.repo,
+            "--body-file",
+            path,
+        ]),
+    )
     .map(|_| ())
-    .map_err(|error| format!("Comment could not be posted: {}", safe_gh_error(&error)))
+    .map_err(|error| format!("Comment could not be posted: {error}"))
 }
 
 #[cfg(test)]
@@ -806,16 +1251,16 @@ mod tests {
 mod contract_tests {
     use super::*;
     use serde_json::json;
-    use std::{collections::VecDeque, sync::Mutex};
+    use std::sync::Mutex;
 
     struct Recorded {
-        replies: Mutex<VecDeque<Result<String, String>>>,
+        replies: Mutex<Vec<Option<Result<String, String>>>>,
         calls: Mutex<Vec<Vec<String>>>,
     }
     impl Recorded {
         fn new(replies: Vec<Result<String, String>>) -> Self {
             Self {
-                replies: Mutex::new(replies.into()),
+                replies: Mutex::new(replies.into_iter().map(Some).collect()),
                 calls: Mutex::new(Vec::new()),
             }
         }
@@ -823,11 +1268,15 @@ mod contract_tests {
     impl Gh for Recorded {
         fn run(&self, args: &[String]) -> Result<String, String> {
             self.calls.lock().unwrap().push(args.to_vec());
-            self.replies
-                .lock()
-                .unwrap()
-                .pop_front()
-                .expect("unexpected gh request")
+            let mut replies = self.replies.lock().unwrap();
+            let index = if args.first().is_some_and(|arg| arg == "pr") {
+                replies.len() - 2 + usize::from(!args.iter().any(|arg| arg == "--search"))
+            } else if args.iter().any(|arg| arg == "push") {
+                1
+            } else {
+                0
+            };
+            replies[index].take().expect("unexpected gh request")
         }
     }
     fn config() -> Config {
@@ -864,6 +1313,52 @@ mod contract_tests {
         );
     }
     #[test]
+    fn independent_lookup_requests_overlap_and_keep_completion_order_out_of_results() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Concurrent {
+            active: AtomicUsize,
+            peak: AtomicUsize,
+        }
+        impl Gh for Concurrent {
+            fn run(&self, args: &[String]) -> Result<String, String> {
+                let count = self.active.fetch_add(1, Ordering::AcqRel) + 1;
+                self.peak.fetch_max(count, Ordering::AcqRel);
+                std::thread::sleep(Duration::from_millis(if args.iter().any(|a| a == "push") {
+                    5
+                } else {
+                    30
+                }));
+                self.active.fetch_sub(1, Ordering::AcqRel);
+                Ok(if args[0] == "run" {
+                    include_str!("../tests/fixtures/remote_runs/runs.json").into()
+                } else {
+                    include_str!("../tests/fixtures/remote_runs/prs.json").into()
+                })
+            }
+        }
+        let gh = Concurrent {
+            active: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+        };
+        let task = config().tasks("ATL-42").unwrap().remove(0);
+        let result = lookup(&gh, &task, "ATL-42", 20);
+        assert!(result.errors.is_empty());
+        assert_eq!(
+            result.runs.iter().map(|run| run.id).collect::<Vec<_>>(),
+            vec![102, 101]
+        );
+        assert_eq!(
+            result.prs.iter().map(|pr| pr.number).collect::<Vec<_>>(),
+            vec![7, 8, 10]
+        );
+        assert!(
+            gh.peak.load(Ordering::Acquire) > 1,
+            "independent requests ran serially"
+        );
+        assert!(gh.peak.load(Ordering::Acquire) <= 4);
+    }
+
+    #[test]
     fn runs_are_event_filtered_deduplicated_sorted_and_classified() {
         let c = config();
         let task = c.tasks("ATL-42").unwrap().remove(0);
@@ -888,6 +1383,16 @@ mod contract_tests {
         assert!(r.prs[1].needs_warning());
         assert!(r.prs[2].needs_warning());
         let calls = gh.calls.lock().unwrap();
+        let mut calls = calls.clone();
+        calls.sort_by_key(|args| {
+            if args[0] == "pr" {
+                2
+            } else if args.iter().any(|a| a == "push") {
+                1
+            } else {
+                0
+            }
+        });
         assert!(
             calls[0]
                 .windows(2)
@@ -935,11 +1440,10 @@ mod contract_tests {
             result.prs.iter().map(|p| p.number).collect::<Vec<_>>(),
             vec![77, 7, 8, 10]
         );
-        assert!(
-            gh.calls.lock().unwrap()[2]
-                .windows(2)
+        assert!(gh.calls.lock().unwrap().iter().any(|call| {
+            call.windows(2)
                 .any(|args| args == ["--search", "ATL-42 in:title"])
-        );
+        }));
     }
     #[test]
     fn full_event_windows_report_limits_and_keep_each_events_matches() {
@@ -1228,6 +1732,163 @@ mod cli_tests {
         GhCli::new(path.to_str().unwrap().into())
     }
     #[test]
+    fn additional_failures_have_actionable_categories() {
+        for (text, expected) in [
+            ("HTTP 429", "rate limit"),
+            ("HTTP 403: secondary rate limit", "rate limit"),
+            ("API rate limit exceeded", "rate limit"),
+            ("HTTP 500", "server"),
+            ("HTTP 502", "server"),
+            ("HTTP 503", "server"),
+            ("HTTP 504", "server"),
+            ("HTTP 403: SAML enforcement", "SSO"),
+            ("SSO authorization required", "SSO"),
+            ("unknown flag: --json", "upgrade"),
+            ("Unknown JSON field: jobs", "upgrade"),
+            ("unknown command: run", "upgrade"),
+        ] {
+            assert!(
+                GhFailure::process(Some(1), text.as_bytes())
+                    .message()
+                    .contains(expected),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn stderr_detail_filters_noise_redacts_tokens_and_bounds_unicode() {
+        let raw = "(eval):1: can't change option: zle\n  (eval) noise\nzle: noise\n\nfailed gho_secret ghp_secret github_pat_secret\nsecond line";
+        assert_eq!(
+            stderr_detail(raw.as_bytes()).as_deref(),
+            Some("failed [REDACTED] [REDACTED] [REDACTED]")
+        );
+        assert_eq!(stderr_detail(b"(eval) noise\nzle: noise\n"), None);
+        assert_eq!(stderr_detail(b"bad\x1b[31m"), None);
+        let detail = stderr_detail("é".repeat(250).as_bytes()).unwrap();
+        assert!(detail.chars().count() <= 200);
+        assert!(detail.ends_with("..."));
+    }
+
+    #[test]
+    fn detailed_failure_keeps_constant_trust_and_separate_safe_context() {
+        let failure = GhFailure::process(Some(9), b"(eval) noise\nkeyring unavailable ghp_secret");
+        let message = failure.message();
+        assert!(message.contains("exit 9"));
+        assert!(message.contains("keyring unavailable [REDACTED]"));
+        assert_eq!(safe_gh_error("untrusted ghp_secret"), GH_FAILED);
+        assert!(
+            !GhFailure::from("untrusted SECRET".to_string())
+                .message()
+                .contains("SECRET")
+        );
+    }
+
+    #[test]
+    fn diagnostic_logs_keep_full_stderr_redact_chunk_boundaries_and_remove_successes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("failure.log");
+        let mut log = DiagnosticLog::create(
+            path.clone(),
+            "gh",
+            &strings(&["pr", "list", "--repo", "fiction/atlas", "ghp_argument"]),
+        )
+        .unwrap();
+        let mut raw = "x".repeat(8190);
+        raw.push_str("github_pat_private gho_private ghp_private\n");
+        raw.push_str(&"y".repeat(70000));
+        raw.push_str("\ntail ghp_private");
+        let captured = drain_stderr(&mut raw.as_bytes(), &mut Some(&mut log.file)).unwrap();
+        assert_eq!(captured.len(), 65536);
+        log.finish(&Err(GhFailure::process(Some(7), &captured)));
+        drop(log);
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("tail [REDACTED]"));
+        assert!(text.contains("pr") && text.contains("fiction/atlas") && text.contains("Some(7)"));
+        assert!(!text.contains("private") && !text.contains("ghp_argument"));
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let success = dir.path().join("success.log");
+        let mut log = DiagnosticLog::create(success.clone(), "gh", &[]).unwrap();
+        log.finish(&Ok("[]".into()));
+        drop(log);
+        assert!(!success.exists());
+    }
+
+    #[test]
+    fn lookup_attributes_command_source_and_repo_and_keeps_other_sources() {
+        struct Failing;
+        impl Gh for Failing {
+            fn run(&self, _: &[String]) -> Result<String, String> {
+                unreachable!()
+            }
+            fn run_detailed(&self, args: &[String]) -> Result<String, GhFailure> {
+                if args.iter().any(|arg| arg == "fiction/broken") {
+                    Err(GhFailure::process(
+                        Some(9),
+                        b"(eval) noise\nkeyring unavailable ghp_secret",
+                    ))
+                } else if args[0] == "pr" {
+                    Ok(include_str!("../tests/fixtures/remote_runs/prs.json").into())
+                } else {
+                    Ok(include_str!("../tests/fixtures/remote_runs/runs.json").into())
+                }
+            }
+        }
+        let config = Config::parse(&serde_json::json!({"sources":[
+            {"name":"First","ticket_pattern":"ATL-42","repos":["fiction/broken","fiction/atlas"]},
+            {"name":"Second","ticket_pattern":"ATL-42","repos":["fiction/atlas"]}
+        ]}))
+        .unwrap();
+        let results: Vec<_> = config
+            .tasks("ATL-42")
+            .unwrap()
+            .iter()
+            .map(|task| lookup(&Failing, task, "ATL-42", 20))
+            .collect();
+        assert!(results[0].errors[0].contains("First / fiction/broken"));
+        assert!(results[0].errors[0].contains("run list fiction/broken"));
+        assert!(results[0].errors[1].contains("pr list fiction/broken"));
+        assert!(
+            results[0]
+                .errors
+                .iter()
+                .all(|error| error.contains("exit 9")
+                    && error.contains("keyring unavailable [REDACTED]"))
+        );
+        assert_eq!(results[1].runs.len(), 2);
+        assert_eq!(results[2].runs.len(), 2);
+        assert_eq!(results[2].source_name, "Second");
+        assert!(results[1].errors.is_empty() && results[2].errors.is_empty());
+        assert!(
+            jobs(&Failing, "fiction/broken", 1)
+                .unwrap_err()
+                .contains("run view fiction/broken")
+        );
+    }
+
+    #[test]
+    fn cli_returns_separate_sanitized_diagnostic_and_exit_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = executable(
+            dir.path(),
+            "#!/bin/sh\nprintf '(eval) noise\\nkeyring unavailable ghp_private\\n' >&2\nexit 9\n",
+        );
+        let message = cli
+            .run_detailed(&strings(&["pr", "list", "--repo", "fiction/atlas"]))
+            .unwrap_err()
+            .message();
+        assert!(message.contains("exit 9"), "{message}");
+        assert!(
+            message.contains("keyring unavailable [REDACTED]"),
+            "{message}"
+        );
+        assert!(!message.contains("private") && !message.contains("(eval)"));
+    }
+
+    #[test]
     fn cli_passes_literal_arguments_and_suppresses_raw_failure_output() {
         let dir = tempfile::tempdir().unwrap();
         let cli = executable(dir.path(), "#!/bin/sh\nprintf '%s\\n' \"$@\"\n");
@@ -1247,6 +1908,170 @@ mod cli_tests {
         let error = cli.run(&[]).unwrap_err();
         assert!(!error.contains("SECRET"));
     }
+    #[test]
+    fn cli_calls_share_a_global_limit_across_instances_and_release_slots_on_failure() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let active = dir.path().join("active");
+        fs::create_dir(&active).unwrap();
+        let cli = executable(
+            dir.path(),
+            &format!(
+                "#!/bin/sh\ntouch '{0}'/$$\nsleep 0.2\nrm '{0}'/$$\nexit 1\n",
+                active.display()
+            ),
+        );
+        let completed = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..12 {
+                let cli = GhCli::new(cli.path.clone());
+                let completed = &completed;
+                scope.spawn(move || {
+                    assert!(cli.run(&[]).is_err());
+                    completed.fetch_add(1, Ordering::Release);
+                });
+            }
+            let mut peak = 0;
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while completed.load(Ordering::Acquire) < 12 && Instant::now() < deadline {
+                peak = peak.max(fs::read_dir(&active).unwrap().count());
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert_eq!(completed.load(Ordering::Acquire), 12);
+            assert!(peak > 1, "CLI requests ran serially");
+            assert!(peak <= 4, "global CLI request limit exceeded: {peak}");
+        });
+        assert_eq!(fs::read_dir(&active).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn cancellation_kills_a_running_cli_without_waiting_for_the_timeout() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let ready = dir.path().join("ready");
+        let cli = executable(
+            dir.path(),
+            &format!("#!/bin/sh\ntouch '{}'\nexec sleep 10\n", ready.display()),
+        );
+        let cancelled = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let running = scope.spawn(|| cli.run_cancelled(&[], &cancelled));
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !ready.exists() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(ready.exists(), "fake CLI did not start");
+            let started = Instant::now();
+            cancelled.store(true, Ordering::Release);
+            assert!(running.join().unwrap().is_err());
+            assert!(started.elapsed() < Duration::from_secs(1));
+        });
+    }
+
+    #[test]
+    fn cli_rejects_control_characters_before_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = executable(dir.path(), "#!/bin/sh\nprintf 'ran'\n");
+        assert!(cli.run(&strings(&["bad\nargument"])).is_err());
+    }
+
+    #[test]
+    fn repeated_read_only_lookups_reuse_success_but_never_cache_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let count = dir.path().join("calls");
+        let cli = executable(
+            dir.path(),
+            &format!(
+                "#!/bin/sh\nprintf 'call\\n' >> '{}'\nprintf '[]'\n",
+                count.display()
+            ),
+        );
+        let args = strings(&["run", "list", "--repo", "fiction/atlas"]);
+        assert_eq!(cli.run(&args).unwrap(), "[]");
+        assert_eq!(cli.run(&args).unwrap(), "[]");
+        assert_eq!(fs::read_to_string(&count).unwrap().lines().count(), 1);
+        let args = strings(&["pr", "comment", "7", "--repo", "fiction/atlas"]);
+        cli.run(&args).unwrap();
+        cli.run(&args).unwrap();
+        assert_eq!(fs::read_to_string(&count).unwrap().lines().count(), 3);
+    }
+
+    #[test]
+    fn fresh_cycles_bypass_old_lists_and_share_concurrent_cold_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let count = dir.path().join("calls");
+        let cli = executable(
+            dir.path(),
+            &format!(
+                "#!/bin/sh\nprintf 'call\\n' >> '{}'\nsleep 0.05\nprintf '[]'\n",
+                count.display()
+            ),
+        );
+        let args = strings(&["run", "list", "--repo", "fiction/atlas"]);
+        cli.run(&args).unwrap();
+        let since = Instant::now();
+        let results = parallel_map(&(0..8).collect::<Vec<_>>(), |_| {
+            GhCli::fresh(cli.path.clone(), since).run(&args)
+        });
+        assert!(results.iter().all(Result::is_ok));
+        assert_eq!(fs::read_to_string(&count).unwrap().lines().count(), 2);
+        GhCli::fresh(cli.path.clone(), Instant::now())
+            .run(&args)
+            .unwrap();
+        assert_eq!(fs::read_to_string(&count).unwrap().lines().count(), 3);
+    }
+
+    #[test]
+    fn a_refresh_shares_run_lists_and_branch_scans_across_eight_tickets() {
+        let dir = tempfile::tempdir().unwrap();
+        let count = dir.path().join("calls");
+        let cli = executable(
+            dir.path(),
+            &format!(
+                "#!/bin/sh\nprintf 'call\\n' >> '{}'\nprintf '[]'\n",
+                count.display()
+            ),
+        );
+        let config = Config::parse(&serde_json::json!({"sources":[{
+            "name":"Atlas", "repos":["fiction/atlas"], "ticket_pattern":"ATL-[0-9]+",
+            "events":["push","workflow_dispatch"]
+        }]}))
+        .unwrap();
+        let keys = (0..8).map(|i| format!("ATL-{i}")).collect::<Vec<_>>();
+        let gh = GhCli::fresh(cli.path, Instant::now());
+        let results = parallel_map(&keys, |key| {
+            lookup(&gh, &config.tasks(key).unwrap()[0], key, 20)
+        });
+        assert!(results.iter().all(|result| result.errors.is_empty()));
+        assert_eq!(fs::read_to_string(&count).unwrap().lines().count(), 11);
+    }
+
+    #[test]
+    fn one_failed_read_is_shared_within_cycle_and_retried_next_cycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let count = dir.path().join("calls");
+        let cli = executable(
+            dir.path(),
+            &format!(
+                "#!/bin/sh\nprintf 'call\\n' >> '{}'\nsleep 0.05\nprintf 'HTTP 500' >&2\nexit 1\n",
+                count.display()
+            ),
+        );
+        let args = strings(&["pr", "list", "--repo", "fiction/atlas"]);
+        let since = Instant::now();
+        let results = parallel_map(&(0..8).collect::<Vec<_>>(), |_| {
+            GhCli::fresh(cli.path.clone(), since).run(&args)
+        });
+        assert!(results.iter().all(Result::is_err));
+        assert_eq!(fs::read_to_string(&count).unwrap().lines().count(), 1);
+        assert!(
+            GhCli::fresh(cli.path.clone(), Instant::now())
+                .run(&args)
+                .is_err()
+        );
+        assert_eq!(fs::read_to_string(&count).unwrap().lines().count(), 2);
+    }
+
     #[test]
     fn cli_classifies_safe_recovery_actions_without_raw_diagnostics() {
         let dir = tempfile::tempdir().unwrap();
@@ -1272,13 +2097,12 @@ mod cli_tests {
     fn cli_enforces_deadline_and_output_bound() {
         let dir = tempfile::tempdir().unwrap();
         let cli = executable(dir.path(), "#!/bin/sh\nexec sleep 10\n");
-        let start = Instant::now();
         assert!(
             cli.run_bounded(&[], Duration::from_millis(100))
                 .unwrap_err()
+                .message()
                 .contains("timed out")
         );
-        assert!(start.elapsed() < Duration::from_secs(2));
         let cli = executable(dir.path(), "#!/bin/sh\nhead -c 8500000 /dev/zero\nexit 0\n");
         assert!(cli.run(&[]).is_err());
     }

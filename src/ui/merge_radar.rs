@@ -1,5 +1,7 @@
 use super::*;
-use crate::merge_radar::{self as provider, Config, Lane, PullRequest, ReviewSource};
+use crate::merge_radar::{
+    self as provider, Config, FetchError, FetchResult, Lane, PullRequest, ReviewSource,
+};
 use crate::remote_runs::{Gh, GhCli};
 use std::collections::BTreeMap;
 use std::sync::{
@@ -28,13 +30,13 @@ impl Preferences {
 }
 
 struct RefreshResult {
-    result: Result<Vec<PullRequest>, String>,
+    result: Result<FetchResult, String>,
     finished: Instant,
     timestamp: u64,
 }
 
 impl RefreshResult {
-    fn new(result: Result<Vec<PullRequest>, String>) -> Self {
+    fn new(result: Result<FetchResult, String>) -> Self {
         Self {
             result,
             finished: Instant::now(),
@@ -65,7 +67,15 @@ impl Gh for CancellableGh {
         if self.cancelled.load(Ordering::Acquire) {
             return Err("Refresh cancelled".into());
         }
-        self.cli.run(args)
+        self.cli.run_cancelled(args, &self.cancelled)
+    }
+
+    fn run_detailed(&self, args: &[String]) -> Result<String, crate::remote_runs::GhFailure> {
+        self.cli.run_detailed_cancelled(args, &self.cancelled)
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
     }
 }
 
@@ -83,6 +93,7 @@ pub(super) struct Panel {
     last_attempt: Option<Instant>,
     updated: Option<u64>,
     error: String,
+    failures: Vec<FetchError>,
     query: String,
     lane: Option<Lane>,
     editor: Option<Editor>,
@@ -100,6 +111,7 @@ impl Panel {
             self.updated = None;
             self.last_attempt = None;
             self.error.clear();
+            self.failures.clear();
         }
     }
 
@@ -120,12 +132,16 @@ impl Panel {
         }
         self.last_attempt = Some(result.finished);
         match result.result {
-            Ok(prs) => {
-                self.prs = prs;
+            Ok(outcome) => {
+                self.prs = outcome.prs;
+                self.failures = outcome.errors;
                 self.updated = Some(result.timestamp);
                 self.error.clear();
             }
-            Err(error) => self.error = error,
+            Err(error) => {
+                self.error = error;
+                self.failures.clear();
+            }
         }
     }
 
@@ -214,6 +230,18 @@ impl Panel {
             ui.colored_label(ui.visuals().error_fg_color, &self.error);
             if self.updated.is_some() {
                 ui.weak("Showing the last successful refresh. Status may have changed.");
+            }
+        }
+        if !self.failures.is_empty() {
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                "Some pull requests could not be refreshed:",
+            );
+            for failure in &self.failures {
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    format!("{}: {}", failure.scope, failure.message),
+                );
             }
         }
         ui.horizontal_wrapped(|ui| {
@@ -722,11 +750,39 @@ mod tests {
         };
         panel.sync(&config);
         sender
-            .send(RefreshResult::new(Ok(vec![pr(Lane::Ready, 99)])))
+            .send(RefreshResult::new(Ok(FetchResult {
+                prs: vec![pr(Lane::Ready, 99)],
+                errors: vec![],
+            })))
             .unwrap();
         panel.poll();
         assert!(panel.prs.is_empty() && panel.updated.is_none());
         assert!(panel.last_attempt.is_none());
+    }
+
+    #[test]
+    fn partial_refresh_updates_results_and_retains_failed_scopes() {
+        let mut panel = panel();
+        let (sender, receiver) = channel();
+        panel.lookup = Some(Lookup {
+            config: Config::default(),
+            receiver,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        });
+        sender
+            .send(RefreshResult::new(Ok(FetchResult {
+                prs: vec![pr(Lane::Review, 1)],
+                errors: vec![FetchError {
+                    scope: "acme/broken".into(),
+                    message: "Network unavailable".into(),
+                }],
+            })))
+            .unwrap();
+        panel.poll();
+        assert_eq!(panel.prs.len(), 1);
+        assert!(panel.error.is_empty());
+        assert_eq!(panel.failures[0].scope, "acme/broken");
+        assert!(panel.updated.is_some());
     }
 
     #[test]
@@ -742,7 +798,10 @@ mod tests {
         let timestamp = now().saturating_sub(600);
         sender
             .send(RefreshResult {
-                result: Ok(vec![pr(Lane::Ready, 1)]),
+                result: Ok(FetchResult {
+                    prs: vec![pr(Lane::Ready, 1)],
+                    errors: vec![],
+                }),
                 finished,
                 timestamp,
             })

@@ -162,8 +162,9 @@ impl Panel {
         self.generation = Some(generation);
         self.initialized = true;
         self.error.clear();
+        let fresh_since = Instant::now();
         for panel in self.tickets.values_mut() {
-            panel.lookup(ctx);
+            panel.lookup_at(ctx, fresh_since);
         }
     }
 
@@ -180,31 +181,16 @@ impl Panel {
         if let Some(generation) = self.generation
             && self.tickets.values().all(|panel| panel.pending == 0)
         {
-            let failed = self.tickets.values().any(|panel| {
-                !panel.error.is_empty() || panel.cached.iter().any(|cached| cached.stale)
+            let failed = !self.tickets.values().any(|panel| {
+                panel.error.is_empty()
+                    && panel
+                        .cached
+                        .iter()
+                        .any(|cached| !cached.result.runs_failed() || !cached.result.prs_failed())
             });
             self.refresh
                 .finish(generation, self.clock.elapsed().as_secs(), failed);
             self.generation = None;
-            // Re-fetch selected progress once per metadata cycle, retaining known jobs on failure.
-            for panel in self.tickets.values_mut() {
-                if let Some(output) = &panel.output
-                    && output.run.status != "completed"
-                {
-                    let repo = output.repo.clone();
-                    let source = output.source.name.clone();
-                    let run = panel
-                        .results
-                        .iter()
-                        .filter(|result| result.repo == repo && result.source_name == source)
-                        .flat_map(|result| &result.runs)
-                        .find(|run| run.id == output.run.id)
-                        .cloned();
-                    if let Some(run) = run {
-                        panel.open_output(repo, source, run, ctx);
-                    }
-                }
-            }
         }
         let posted = self
             .tickets
@@ -433,7 +419,23 @@ impl Panel {
                         if cached.stale {
                             ui.colored_label(
                                 attention_color(ui),
-                                format!("Stale data. {refreshed}"),
+                                match (cached.result.runs_failed(), cached.result.prs_failed()) {
+                                    (true, false) => format!(
+                                        "Stale runs. Pull requests refreshed {}.",
+                                        cached
+                                            .last_prs_success
+                                            .map(|at| relative_time(now().saturating_sub(at)))
+                                            .unwrap_or_else(|| "never".into())
+                                    ),
+                                    (false, true) => format!(
+                                        "Stale pull requests. Runs refreshed {}.",
+                                        cached
+                                            .last_runs_success
+                                            .map(|at| relative_time(now().saturating_sub(at)))
+                                            .unwrap_or_else(|| "never".into())
+                                    ),
+                                    _ => format!("Stale data. {refreshed}"),
+                                },
                             );
                         } else {
                             ui.small(refreshed);

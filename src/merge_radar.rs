@@ -1,4 +1,4 @@
-use crate::remote_runs::Gh;
+use crate::remote_runs::{Gh, parallel_map};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -128,7 +128,7 @@ pub struct PullRequest {
 }
 
 const PR_FIELDS: &str = r#"
-number title url state isDraft updatedAt mergeable reviewDecision mergeStateStatus
+number title url state isDraft createdAt updatedAt mergeable reviewDecision mergeStateStatus
 repository { nameWithOwner }
 author { __typename }
 commits(last: 1) { nodes { commit { statusCheckRollup { contexts(first: 100) {
@@ -321,12 +321,17 @@ fn graphql(gh: &impl Gh, query: String, variables: &[(&str, String)]) -> Result<
         "api".into(),
         "graphql".into(),
         "-f".into(),
-        format!("query={query}"),
+        format!(
+            "query={}",
+            query.split_whitespace().collect::<Vec<_>>().join(" ")
+        ),
     ];
     for (name, value) in variables {
         args.extend(["-f".into(), format!("{name}={value}")]);
     }
-    let response: Value = serde_json::from_str(&gh.run(&args)?).map_err(|_| INVALID)?;
+    let response: Value =
+        serde_json::from_str(&gh.run_detailed(&args).map_err(|error| error.message())?)
+            .map_err(|_| INVALID)?;
     if response.get("errors").is_some_and(|errors| {
         !errors.is_null() && errors.as_array().is_none_or(|items| !items.is_empty())
     }) || !response["data"].is_object()
@@ -350,9 +355,17 @@ fn search(gh: &impl Gh, config: &Config, filter: &str) -> Result<Vec<Value>, Str
         "is:open is:pr archived:false {title} sort:updated-desc {} {filter}",
         config.extra.trim()
     );
+    search_query(gh, &q)
+}
+
+fn search_query(gh: &impl Gh, q: &str) -> Result<Vec<Value>, String> {
+    search_fields(gh, q, PR_FIELDS)
+}
+
+fn search_fields(gh: &impl Gh, q: &str, fields: &str) -> Result<Vec<Value>, String> {
     let mut cursor = String::new();
     let mut results = Vec::new();
-    for _ in 0..20 {
+    for _ in 0..100 {
         let after = if cursor.is_empty() {
             ""
         } else {
@@ -364,11 +377,14 @@ fn search(gh: &impl Gh, config: &Config, filter: &str) -> Result<Vec<Value>, Str
             ", $cursor:String!"
         };
         let query = format!(
-            "query($q:String!{cursor_parameter}) {{ search(query:$q,type:ISSUE,first:50{after}) {{ issueCount pageInfo {{ hasNextPage endCursor }} nodes {{ ... on PullRequest {{ {PR_FIELDS} }} }} }} }}"
+            "query($q:String!{cursor_parameter}) {{ search(query:$q,type:ISSUE,first:10{after}) {{ issueCount pageInfo {{ hasNextPage endCursor }} nodes {{ ... on PullRequest {{ {fields} }} }} }} }}"
         );
-        let mut variables = vec![("q", q.clone())];
+        let mut variables = vec![("q", q.to_owned())];
         if !cursor.is_empty() {
             variables.push(("cursor", cursor.clone()));
+        }
+        if gh.cancelled() {
+            return Err("Refresh cancelled".into());
         }
         let data = graphql(gh, query, &variables)?;
         let total = data["search"]["issueCount"].as_u64().ok_or(INVALID)?;
@@ -426,119 +442,197 @@ fn scope_list(raw: &str) -> Result<Vec<String>, String> {
     Ok(values.into_iter().collect())
 }
 
-fn repository_targets_at(
-    gh: &impl Gh,
-    config: &Config,
-    now: u64,
-) -> Result<Vec<(String, u64)>, String> {
-    let username = gh
-        .run(&["api".into(), "user".into(), "--jq".into(), ".login".into()])?
-        .trim()
-        .to_ascii_lowercase();
-    if username.is_empty() {
-        return Err("Could not determine the GitHub CLI account; run gh auth status".into());
-    }
-    let teams = scope_list(&config.review_teams)?;
-    let prefixes: Vec<_> = config
-        .review_exclude_prefixes
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .collect();
-    let mut targets = Vec::new();
-    for repo in scope_list(&config.review_repos)? {
-        let output = gh.run(&[
-            "api".into(),
-            format!("repos/{repo}/pulls?state=open&per_page=100"),
-            "--paginate".into(),
-            "--slurp".into(),
-        ])?;
-        let pages: Vec<Vec<Value>> = serde_json::from_str(&output).map_err(|_| INVALID)?;
-        for pr in pages.iter().flatten() {
-            if pr["draft"].as_bool().ok_or(INVALID)?
-                || required(&pr["user"], "login")?.eq_ignore_ascii_case(&username)
-            {
-                continue;
-            }
-            let title = required(pr, "title")?;
-            if prefixes.iter().any(|prefix| title.starts_with(prefix)) {
-                continue;
-            }
-            let created = parse_timestamp(required(pr, "created_at")?).ok_or(INVALID)?;
-            if now.saturating_sub(created) / 86400 > config.review_max_age_days {
-                continue;
-            }
-            let reviewers = pr["requested_reviewers"].as_array().ok_or(INVALID)?;
-            let requested_teams = pr["requested_teams"].as_array().ok_or(INVALID)?;
-            let owner = repo.split('/').next().unwrap_or_default();
-            let direct = reviewers.iter().any(|r| {
-                r["login"]
-                    .as_str()
-                    .is_some_and(|name| name.eq_ignore_ascii_case(&username))
-            });
-            let team = requested_teams.iter().any(|t| {
-                t["slug"].as_str().is_some_and(|slug| {
-                    teams.contains(&format!("{owner}/{}", slug.to_ascii_lowercase()))
-                })
-            });
-            if direct || team {
-                targets.push((repo.clone(), pr["number"].as_u64().ok_or(INVALID)?));
-            }
-        }
-    }
-    Ok(targets)
+#[derive(Clone, Debug)]
+pub struct FetchError {
+    pub scope: String,
+    pub message: String,
 }
 
-pub fn fetch(gh: &impl Gh, config: &Config) -> Result<Vec<PullRequest>, String> {
+#[derive(Default)]
+pub struct FetchResult {
+    pub prs: Vec<PullRequest>,
+    pub errors: Vec<FetchError>,
+}
+
+fn review_since(now: u64, max_age_days: u64) -> String {
+    let mut days = now.saturating_sub((max_age_days + 1) * 86400) / 86400;
+    let leap = |year: u64| {
+        year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400))
+    };
+    let mut year = 1970;
+    while days >= 365 + u64::from(leap(year)) {
+        days -= 365 + u64::from(leap(year));
+        year += 1;
+    }
+    let months = [
+        31,
+        28 + u64::from(leap(year)),
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    let mut month = 0;
+    while days >= months[month] {
+        days -= months[month];
+        month += 1;
+    }
+    format!("{year:04}-{:02}-{:02}", month + 1, days + 1)
+}
+
+pub fn fetch(gh: &impl Gh, config: &Config) -> Result<FetchResult, String> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    fetch_at(gh, config, now)
+    let started = std::time::Instant::now();
+    let result = fetch_at(gh, config, now);
+    log::debug!(
+        "merge radar refresh elapsed_ms={} prs={} failures={}",
+        started.elapsed().as_millis(),
+        result.as_ref().map_or(0, |result| result.prs.len()),
+        result.as_ref().map_or(1, |result| result.errors.len())
+    );
+    result
 }
 
-fn fetch_at(gh: &impl Gh, config: &Config, now: u64) -> Result<Vec<PullRequest>, String> {
+fn fetch_at(gh: &impl Gh, config: &Config, now: u64) -> Result<FetchResult, String> {
     config.validate()?;
-    let assigned = search(gh, config, "assignee:@me")?;
-    let authored = search(gh, config, "author:@me")?;
-    let requested = match config.review_source {
-        ReviewSource::Github => search(gh, config, "user-review-requested:@me")?,
+    let mut queries = vec![
+        (
+            "Assigned pull requests".to_owned(),
+            "assignee:@me".to_owned(),
+            false,
+        ),
+        (
+            "Authored pull requests".to_owned(),
+            "author:@me".to_owned(),
+            false,
+        ),
+    ];
+    match config.review_source {
+        ReviewSource::Github => queries.push((
+            "Review requests".into(),
+            "user-review-requested:@me".into(),
+            true,
+        )),
         ReviewSource::Repositories => {
-            let mut requested = Vec::new();
-            for (repo, number) in repository_targets_at(gh, config, now)? {
-                if let Some(known) = assigned.iter().chain(&authored).find(|pr| {
-                    pr["number"] == number
-                        && pr["repository"]["nameWithOwner"]
-                            .as_str()
-                            .is_some_and(|name| name.eq_ignore_ascii_case(&repo))
-                }) {
-                    requested.push(known.clone());
-                } else {
-                    let (owner, name) = repo.split_once('/').ok_or(INVALID)?;
-                    let query = format!(
-                        "query($owner:String!,$repo:String!) {{ repository(owner:$owner,name:$repo) {{ pullRequest(number:{number}) {{ {PR_FIELDS} }} }} }}"
-                    );
-                    let data =
-                        graphql(gh, query, &[("owner", owner.into()), ("repo", name.into())])?;
-                    let pr = &data["repository"]["pullRequest"];
-                    if required(pr, "state")? == "OPEN"
-                        && !pr["isDraft"].as_bool().ok_or(INVALID)?
-                    {
-                        requested.push(pr.clone());
-                    }
+            let teams = scope_list(&config.review_teams)?;
+            let since = review_since(now, config.review_max_age_days);
+            for repo in scope_list(&config.review_repos)? {
+                let owner = repo.split('/').next().ok_or(INVALID)?;
+                let requesters = std::iter::once("user-review-requested:@me".to_owned()).chain(
+                    teams
+                        .iter()
+                        .filter(|team| team.split('/').next() == Some(owner))
+                        .map(|team| format!("team-review-requested:{team}")),
+                );
+                for requester in requesters {
+                    queries.push((repo.clone(), format!("is:open is:pr repo:{repo} draft:false -author:@me created:>={since} sort:updated-desc {requester}"), true));
                 }
             }
-            requested
         }
-    };
-    let review_urls: BTreeSet<_> = requested
-        .iter()
-        .map(|pr| required(pr, "url").map(str::to_ascii_lowercase))
-        .collect::<Result<_, _>>()?;
+    }
+    let responses = parallel_map(&queries, |(scope, query, review)| {
+        if gh.cancelled() {
+            return Err("Refresh cancelled".into());
+        }
+        let started = std::time::Instant::now();
+        let result = if *review && config.review_source == ReviewSource::Repositories {
+            search_fields(
+                gh,
+                query,
+                &PR_FIELDS.replace("reviewDecision mergeStateStatus", ""),
+            )
+        } else {
+            search(gh, config, query)
+        };
+        log::debug!(
+            "merge radar scope={} review={} elapsed_ms={} success={}",
+            scope,
+            review,
+            started.elapsed().as_millis(),
+            result.is_ok()
+        );
+        result
+    });
+    if gh.cancelled() {
+        return Err("Refresh cancelled".into());
+    }
+    let mut result = FetchResult::default();
     let mut unique = BTreeMap::new();
-    for pr in assigned.into_iter().chain(authored).chain(requested) {
-        if required(&pr, "state")? == "OPEN" {
-            unique.insert(required(&pr, "url")?.to_ascii_lowercase(), pr);
+    let mut review_urls = BTreeSet::new();
+    let mut successes = 0;
+    let prefixes: Vec<_> = config
+        .review_exclude_prefixes
+        .split(',')
+        .map(str::trim)
+        .filter(|prefix| !prefix.is_empty())
+        .collect();
+    for ((scope, _, requested), response) in queries.into_iter().zip(responses) {
+        let nodes = match response {
+            Ok(nodes) => {
+                successes += 1;
+                nodes
+            }
+            Err(message) => {
+                result.errors.push(FetchError { scope, message });
+                continue;
+            }
+        };
+        for mut pr in nodes {
+            let checked = (|| {
+                if required(&pr, "state")? != "OPEN" {
+                    return Ok(None);
+                }
+                if requested && config.review_source == ReviewSource::Repositories {
+                    if pr["isDraft"].as_bool().ok_or(INVALID)?
+                        || prefixes.iter().any(|prefix| {
+                            pr["title"]
+                                .as_str()
+                                .is_some_and(|title| title.starts_with(prefix))
+                        })
+                    {
+                        return Ok(None);
+                    }
+                    let created = parse_timestamp(required(&pr, "createdAt")?).ok_or(INVALID)?;
+                    if now.saturating_sub(created) / 86400 > config.review_max_age_days {
+                        return Ok(None);
+                    }
+                }
+                required(&pr, "url").map(|url| Some(url.to_ascii_lowercase()))
+            })();
+            match checked {
+                Ok(Some(url)) => {
+                    if requested {
+                        review_urls.insert(url.clone());
+                        if config.review_source == ReviewSource::Repositories {
+                            pr["reviewDecision"] = unique
+                                .get(&url)
+                                .map(|(_, known): &(String, Value)| known["reviewDecision"].clone())
+                                .unwrap_or(Value::Null);
+                            pr["mergeStateStatus"] = unique
+                                .get(&url)
+                                .map(|(_, known): &(String, Value)| {
+                                    known["mergeStateStatus"].clone()
+                                })
+                                .unwrap_or_else(|| Value::String("UNKNOWN".into()));
+                        }
+                    }
+                    unique.insert(url, (scope.clone(), pr));
+                }
+                Ok(None) => {}
+                Err(message) => result.errors.push(FetchError {
+                    scope: scope.clone(),
+                    message,
+                }),
+            }
         }
     }
     let ignored: Vec<_> = config
@@ -547,16 +641,34 @@ fn fetch_at(gh: &impl Gh, config: &Config, now: u64) -> Result<Vec<PullRequest>,
         .map(str::trim)
         .filter(|part| !part.is_empty())
         .collect();
-    let mut prs = unique
-        .into_iter()
-        .map(|(url, pr)| classify(&pr, &ignored, review_urls.contains(&url)))
-        .collect::<Result<Vec<_>, _>>()?;
-    prs.sort_by(|a, b| {
+    for (url, (scope, pr)) in unique {
+        match classify(&pr, &ignored, review_urls.contains(&url)) {
+            Ok(pr) => result.prs.push(pr),
+            Err(message) => result.errors.push(FetchError { scope, message }),
+        }
+    }
+    result.errors.sort_by(|a, b| {
+        a.scope
+            .cmp(&b.scope)
+            .then_with(|| a.message.cmp(&b.message))
+    });
+    result
+        .errors
+        .dedup_by(|a, b| a.scope == b.scope && a.message == b.message);
+    if successes == 0 {
+        return Err(result
+            .errors
+            .iter()
+            .map(|error| format!("{}: {}", error.scope, error.message))
+            .collect::<Vec<_>>()
+            .join("\n"));
+    }
+    result.prs.sort_by(|a, b| {
         b.updated_at
             .cmp(&a.updated_at)
             .then_with(|| a.url.cmp(&b.url))
     });
-    Ok(prs)
+    Ok(result)
 }
 
 pub use crate::remote_runs::created_at_seconds as parse_timestamp;
@@ -655,40 +767,98 @@ mod tests {
         json!({"data":{"search":{"issueCount":nodes.len(),"nodes":nodes,"pageInfo":{"hasNextPage":false,"endCursor":null}}}})
     }
 
-    #[test]
-    fn fetch_deduplicates_assignments_and_gives_direct_reviews_precedence() {
-        let gh = FakeGh::new(vec![
-            page(vec![pr(1)]),
-            page(vec![pr(1), pr(2)]),
-            page(vec![pr(1)]),
-        ]);
-        let config = Config {
-            keyword: "my\"keyword".into(),
-            extra: "repo:acme/app".into(),
-            ..Default::default()
-        };
-        let result = fetch(&gh, &config).unwrap();
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0].lane, Lane::Review);
-        assert_eq!(result[1].lane, Lane::Ready);
-        let calls = gh.calls.lock().unwrap();
-        assert!(
-            calls[2]
+    struct RoutedGh {
+        replies: Vec<(String, Result<Value, String>)>,
+        calls: Mutex<Vec<Vec<String>>>,
+        active: std::sync::atomic::AtomicUsize,
+        peak: std::sync::atomic::AtomicUsize,
+        reverse: bool,
+    }
+    impl RoutedGh {
+        fn new(replies: Vec<(&str, Result<Value, String>)>) -> Self {
+            Self {
+                replies: replies
+                    .into_iter()
+                    .map(|(key, reply)| (key.into(), reply))
+                    .collect(),
+                calls: Default::default(),
+                active: Default::default(),
+                peak: Default::default(),
+                reverse: false,
+            }
+        }
+    }
+    impl Gh for RoutedGh {
+        fn run(&self, args: &[String]) -> Result<String, String> {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.calls.lock().unwrap().push(args.to_vec());
+            let active = self.active.fetch_add(1, SeqCst) + 1;
+            self.peak.fetch_max(active, SeqCst);
+            let query = args
                 .iter()
-                .any(|arg| arg.contains("user-review-requested:@me"))
-        );
-        assert!(
-            calls[0]
-                .iter()
-                .any(|arg| arg.contains("\"mykeyword\" in:title") && arg.contains("repo:acme/app"))
-        );
+                .find_map(|arg| arg.strip_prefix("q="))
+                .unwrap_or("");
+            let reply = self.replies.iter().position(|(key, _)| query.contains(key));
+            let index = reply.unwrap_or(0);
+            let delay = if self.reverse {
+                self.replies.len() - index
+            } else {
+                index + 1
+            };
+            std::thread::sleep(std::time::Duration::from_millis(delay as u64 * 10));
+            self.active.fetch_sub(1, SeqCst);
+            reply
+                .map(|index| self.replies[index].1.clone().map(|value| value.to_string()))
+                .unwrap_or_else(|| Err("Unexpected request".into()))
+        }
     }
 
     #[test]
-    fn fetch_rejects_graphql_errors_instead_of_clearing_the_dashboard() {
-        let gh = FakeGh::new(vec![
-            json!({"data":{"search":{"nodes":[]}},"errors":[{"message":"denied"}]}),
-        ]);
+    fn concurrent_fetch_is_deterministic_and_preserves_lanes() {
+        let mut snapshots = Vec::new();
+        for reverse in [false, true] {
+            let mut gh = RoutedGh::new(vec![
+                ("assignee:@me", Ok(page(vec![pr(1)]))),
+                ("author:@me", Ok(page(vec![pr(1), pr(2)]))),
+                ("user-review-requested:@me", Ok(page(vec![pr(1)]))),
+            ]);
+            gh.reverse = reverse;
+            let result = fetch(
+                &gh,
+                &Config {
+                    keyword: "my\"keyword".into(),
+                    extra: "repo:acme/app".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(result.prs.len(), 2);
+            assert_eq!(result.prs[0].lane, Lane::Review);
+            assert_eq!(result.prs[1].lane, Lane::Ready);
+            assert!(gh.peak.load(std::sync::atomic::Ordering::SeqCst) > 1);
+            snapshots.push(
+                result
+                    .prs
+                    .iter()
+                    .map(|pr| (pr.url.clone(), pr.lane))
+                    .collect::<Vec<_>>(),
+            );
+            let calls = gh.calls.lock().unwrap();
+            assert!(
+                calls
+                    .iter()
+                    .flatten()
+                    .any(|arg| arg.contains("\"mykeyword\" in:title")
+                        && arg.contains("repo:acme/app"))
+            );
+        }
+        assert_eq!(snapshots[0], snapshots[1]);
+    }
+
+    #[test]
+    fn fetch_rejects_total_failure_instead_of_clearing_the_dashboard() {
+        let failed = json!({"data":{"search":{"nodes":[]}},"errors":[{"message":"denied"}]});
+        let gh = RoutedGh::new(vec![("q", Ok(failed))]);
         assert!(fetch(&gh, &Config::default()).is_err());
     }
 
@@ -705,49 +875,43 @@ mod tests {
         assert!(
             gh.calls.lock().unwrap()[0]
                 .iter()
-                .any(|arg| arg.contains("type:ISSUE,first:50"))
+                .any(|arg| arg.contains("type:ISSUE,first:10"))
         );
         let gh = FakeGh::new(vec![first.clone(), first]);
         assert!(search(&gh, &Config::default(), "author:@me").is_err());
     }
 
     #[test]
-    fn repository_reviews_match_organization_teams_and_ignore_owned_filters() {
-        let mut raw = json!({"number":3,"title":"Review this","created_at":"2026-10-29T00:00:00Z","draft":false,"user":{"login":"someone"},"requested_reviewers":[],"requested_teams":[{"slug":"platform"}]});
+    fn repository_reviews_filter_on_server_and_ignore_owned_filters() {
         let mut requested = pr(3);
-        requested["repository"]["nameWithOwner"] = json!("acme/app");
-        let mut own = raw.clone();
-        own["number"] = json!(4);
-        own["user"]["login"] = json!("myself");
-        let mut draft = raw.clone();
-        draft["number"] = json!(5);
-        draft["draft"] = json!(true);
-        let mut excluded = raw.clone();
-        excluded["number"] = json!(6);
+        requested["createdAt"] = json!("2026-10-29T00:00:00Z");
+        let mut draft = requested.clone();
+        draft["number"] = json!(4);
+        draft["isDraft"] = json!(true);
+        let mut excluded = requested.clone();
+        excluded["number"] = json!(5);
         excluded["title"] = json!("Skip: generated");
-        raw["number"] = json!(7);
-        raw["created_at"] = json!("2020-01-01T00:00:00Z");
-        let gh = FakeGh::new(vec![
-            page(vec![]),
-            page(vec![]),
-            json!("placeholder"),
-            json!([[
-                json!({"number":3,"title":"Review this","created_at":"2026-10-29T00:00:00Z","draft":false,"user":{"login":"someone"},"requested_reviewers":[],"requested_teams":[{"slug":"platform"}]}),
-                own,
-                draft,
-                excluded,
-                raw
-            ]]),
-            json!({"data":{"repository":{"pullRequest":requested}}}),
+        let mut old = requested.clone();
+        old["number"] = json!(6);
+        old["createdAt"] = json!("2020-01-01T00:00:00Z");
+        let gh = RoutedGh::new(vec![
+            ("assignee:@me", Ok(page(vec![]))),
+            (" author:@me", Ok(page(vec![]))),
+            (
+                "user-review-requested:@me",
+                Ok(page(vec![requested.clone(), draft, excluded, old])),
+            ),
+            (
+                "team-review-requested:acme/platform",
+                Ok(page(vec![requested])),
+            ),
         ]);
-        gh.outputs.lock().unwrap()[2] = "myself\n".into();
         let config = Config {
             review_source: ReviewSource::Repositories,
             review_repos: "Acme/app".into(),
-            review_teams: "acme/platform".into(),
+            review_teams: "acme/platform, other/platform".into(),
             review_exclude_prefixes: "Skip:".into(),
             keyword: "does not match".into(),
-            review_max_age_days: 60,
             ..Default::default()
         };
         let result = fetch_at(
@@ -756,27 +920,172 @@ mod tests {
             parse_timestamp("2026-10-29T10:00:00Z").unwrap(),
         )
         .unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].lane, Lane::Review);
-        assert!(gh.calls.lock().unwrap()[3].contains(&"--paginate".into()));
-        let gh = FakeGh::new(vec![
-            json!("placeholder"),
-            json!([[{"number":1,"title":"Review","created_at":"2026-10-29T00:00:00Z","draft":false,"user":{"login":"someone"},"requested_reviewers":[],"requested_teams":[{"slug":"platform"}]}]]),
-        ]);
-        gh.outputs.lock().unwrap()[0] = "myself".into();
-        let config = Config {
-            review_teams: "other/platform".into(),
-            ..config
-        };
+        assert_eq!(result.prs.len(), 1);
+        assert_eq!(result.prs[0].lane, Lane::Review);
+        assert!(result.errors.is_empty());
+        let calls = gh.calls.lock().unwrap();
+        assert_eq!(calls.len(), 4, "full PR fields eliminate per-PR requests");
+        for query in calls
+            .iter()
+            .flatten()
+            .filter_map(|arg| arg.strip_prefix("q="))
+            .filter(|q| q.contains("review-requested:"))
+        {
+            assert!(
+                query.contains("repo:acme/app")
+                    && query.contains("draft:false")
+                    && query.contains("-author:@me")
+                    && query.contains("created:>=2026-08-29")
+            );
+            assert!(!query.contains("does not match") && !query.contains("other/platform"));
+        }
         assert!(
-            repository_targets_at(
-                &gh,
-                &config,
-                parse_timestamp("2026-10-29T10:00:00Z").unwrap()
-            )
-            .unwrap()
-            .is_empty()
+            calls
+                .iter()
+                .flatten()
+                .any(|arg| arg.contains("reviewThreads(first: 100)"))
         );
+    }
+
+    #[test]
+    fn failing_repository_keeps_successes_and_identifies_failed_scope() {
+        let mut requested = pr(3);
+        requested["createdAt"] = json!("2026-10-29T00:00:00Z");
+        let gh = RoutedGh::new(vec![
+            ("assignee:@me", Ok(page(vec![pr(1)]))),
+            (" author:@me", Ok(page(vec![]))),
+            ("repo:acme/app", Ok(page(vec![requested]))),
+            ("repo:acme/broken", Err("network SECRET".into())),
+        ]);
+        let result = fetch_at(
+            &gh,
+            &Config {
+                review_source: ReviewSource::Repositories,
+                review_repos: "acme/app,acme/broken".into(),
+                ..Default::default()
+            },
+            parse_timestamp("2026-10-29T10:00:00Z").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(result.prs.len(), 2);
+        assert_eq!(result.prs[0].lane, Lane::Ready);
+        assert_eq!(result.prs[1].lane, Lane::Review);
+        assert_eq!(result.errors.len(), 1);
+        assert_eq!(result.errors[0].scope, "acme/broken");
+        assert!(!result.errors[0].message.contains("SECRET"));
+    }
+
+    #[test]
+    fn repository_reviews_reuse_known_readiness_and_mark_unknown_readiness() {
+        let mut known = pr(1);
+        known["mergeStateStatus"] = json!("BEHIND");
+        known["reviewDecision"] = json!("CHANGES_REQUESTED");
+        let mut first = pr(1);
+        first.as_object_mut().unwrap().remove("mergeStateStatus");
+        first.as_object_mut().unwrap().remove("reviewDecision");
+        first["createdAt"] = json!("2026-10-29T00:00:00Z");
+        let mut second = first.clone();
+        second["number"] = json!(2);
+        second["url"] = json!("https://github.com/acme/app/pull/2");
+        let gh = RoutedGh::new(vec![
+            ("assignee:@me", Ok(page(vec![known]))),
+            (" author:@me", Ok(page(vec![]))),
+            ("user-review-requested:@me", Ok(page(vec![first, second]))),
+        ]);
+        let result = fetch_at(
+            &gh,
+            &Config {
+                review_source: ReviewSource::Repositories,
+                review_repos: "acme/app".into(),
+                ..Default::default()
+            },
+            parse_timestamp("2026-10-29T10:00:00Z").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(result.prs.len(), 2);
+        assert!(result.errors.is_empty());
+        assert_eq!(result.prs[0].lane, Lane::Review);
+        assert_eq!(result.prs[0].blockers[0].label, "Changes requested");
+        assert_eq!(result.prs[0].blockers[1].label, "Branch is behind its base");
+        assert_eq!(result.prs[1].lane, Lane::Review);
+        assert_eq!(
+            result.prs[1].blockers[0].label,
+            "Merge readiness unconfirmed"
+        );
+        let calls = gh.calls.lock().unwrap();
+        let repository_call = calls
+            .iter()
+            .find(|args| args.iter().any(|arg| arg.contains("q=is:open is:pr repo:")))
+            .unwrap();
+        assert!(
+            !repository_call
+                .iter()
+                .any(|arg| arg.contains("mergeStateStatus"))
+        );
+    }
+
+    #[test]
+    fn cancellation_releases_active_requests_and_skips_queued_repositories() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        struct BlockingGh {
+            cancelled: AtomicBool,
+            calls: AtomicUsize,
+            started: std::sync::mpsc::Sender<()>,
+        }
+        impl Gh for BlockingGh {
+            fn cancelled(&self) -> bool {
+                self.cancelled.load(Ordering::Acquire)
+            }
+            fn run(&self, _: &[String]) -> Result<String, String> {
+                self.calls.fetch_add(1, Ordering::AcqRel);
+                self.started.send(()).unwrap();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                while !self.cancelled() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err("Cancelled".into())
+            }
+        }
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let gh = BlockingGh {
+            cancelled: AtomicBool::new(false),
+            calls: AtomicUsize::new(0),
+            started: sender,
+        };
+        let config = Config {
+            review_source: ReviewSource::Repositories,
+            review_repos: (0..12)
+                .map(|i| format!("acme/repo{i}"))
+                .collect::<Vec<_>>()
+                .join(","),
+            ..Default::default()
+        };
+        std::thread::scope(|scope| {
+            let refresh = scope.spawn(|| fetch(&gh, &config));
+            for _ in 0..4 {
+                receiver
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap();
+            }
+            gh.cancelled.store(true, Ordering::Release);
+            assert_eq!(
+                refresh.join().unwrap().err().as_deref(),
+                Some("Refresh cancelled")
+            );
+        });
+        assert_eq!(gh.calls.load(Ordering::Acquire), 4);
+    }
+
+    #[test]
+    fn server_age_filter_keeps_the_entire_last_eligible_day() {
+        let now = parse_timestamp("2026-10-29T10:00:00Z").unwrap();
+        assert_eq!(review_since(now, 20), "2026-10-08");
+        assert_eq!(review_since(now, 0), "2026-10-28");
+        assert_eq!(
+            review_since(parse_timestamp("2024-03-01T00:00:00Z").unwrap(), 0),
+            "2024-02-29"
+        );
+        assert_eq!(review_since(0, 3650), "1970-01-01");
     }
 
     #[test]

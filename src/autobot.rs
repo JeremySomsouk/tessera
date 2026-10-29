@@ -97,6 +97,8 @@ impl Refresh {
 pub struct CachedRepo {
     pub result: RepoResult,
     pub last_success: Option<u64>,
+    pub last_runs_success: Option<u64>,
+    pub last_prs_success: Option<u64>,
     pub stale: bool,
     pub change: String,
     pub shared_sources: Vec<String>,
@@ -106,29 +108,37 @@ impl CachedRepo {
     pub fn new(result: RepoResult, at: u64) -> Self {
         let stale = !result.errors.is_empty();
         Self {
-            result,
             last_success: (!stale).then_some(at),
+            last_runs_success: (!result.runs_failed()).then_some(at),
+            last_prs_success: (!result.prs_failed()).then_some(at),
             stale,
             change: "First observation".into(),
             shared_sources: Vec::new(),
+            result,
         }
     }
 
     pub fn update(&mut self, mut result: RepoResult, at: u64) {
         self.stale = !result.errors.is_empty();
-        if self.stale {
-            // A partial response must not erase runs or PRs from the last successful lookup.
+        if result.runs_failed() {
             for run in &self.result.runs {
                 if !result.runs.iter().any(|new| new.id == run.id) {
                     result.runs.push(run.clone());
                 }
             }
+        } else {
+            self.last_runs_success = Some(at);
+        }
+        if result.prs_failed() {
             for pr in &self.result.prs {
                 if !result.prs.iter().any(|new| new.number == pr.number) {
                     result.prs.push(pr.clone());
                 }
             }
         } else {
+            self.last_prs_success = Some(at);
+        }
+        if !self.stale {
             self.last_success = Some(at);
         }
         let before = latest(&self.result.runs);
@@ -281,6 +291,76 @@ mod tests {
         assert!(!cached.stale);
         assert!(cached.result.runs.is_empty());
     }
+    #[test]
+    fn pr_failure_does_not_resurrect_runs_missing_from_a_fresh_run_lookup() {
+        let mut cached = CachedRepo::new(
+            RepoResult {
+                runs: vec![Run {
+                    id: 1,
+                    ..Default::default()
+                }],
+                prs: vec![crate::remote_runs::PullRequest {
+                    number: 7,
+                    title: "ticket".into(),
+                    url: "https://github.com/acme/api/pull/7".into(),
+                    head_ref_name: "ticket".into(),
+                    state: "OPEN".into(),
+                    auto_merge_enabled: false,
+                }],
+                ..Default::default()
+            },
+            100,
+        );
+        cached.update(
+            RepoResult {
+                failed_prs: true,
+                errors: vec!["PR access denied".into()],
+                ..Default::default()
+            },
+            200,
+        );
+        assert!(cached.result.runs.is_empty());
+        assert_eq!(cached.result.prs.len(), 1);
+        assert_eq!(cached.last_success, Some(100));
+        assert_eq!(cached.last_runs_success, Some(200));
+        assert_eq!(cached.last_prs_success, Some(100));
+        assert!(cached.stale);
+    }
+
+    #[test]
+    fn run_failure_preserves_runs_but_accepts_a_fresh_empty_pr_lookup() {
+        let mut cached = CachedRepo::new(
+            RepoResult {
+                runs: vec![Run {
+                    id: 1,
+                    ..Default::default()
+                }],
+                prs: vec![crate::remote_runs::PullRequest {
+                    number: 7,
+                    title: "ticket".into(),
+                    url: "https://github.com/acme/api/pull/7".into(),
+                    head_ref_name: "ticket".into(),
+                    state: "OPEN".into(),
+                    auto_merge_enabled: false,
+                }],
+                ..Default::default()
+            },
+            100,
+        );
+        cached.update(
+            RepoResult {
+                failed_runs: true,
+                errors: vec!["Run lookup failed".into()],
+                ..Default::default()
+            },
+            200,
+        );
+        assert_eq!(cached.result.runs.len(), 1);
+        assert!(cached.result.prs.is_empty());
+        assert_eq!(cached.last_runs_success, Some(100));
+        assert_eq!(cached.last_prs_success, Some(200));
+    }
+
     #[test]
     fn elapsed_uses_metadata_and_never_turns_completion_into_acceptance() {
         let mut run = Run {
