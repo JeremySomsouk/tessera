@@ -1,5 +1,9 @@
 # Progress
 
+2026-10-29: 0.12.0 Remote runs release preparation.
+
+Added an optional GitHub Actions Remote runs view with configured source/ticket matching, bounded run and pull request lookup, run watching, output selection, and confirmed pull request comments. Lookup metadata and comment previews remain in memory; comment bodies use private temporary files during posting. Local configuration, privacy behavior, lookup limits, and comment-triggered workflow effects are documented. Native UI and live GitHub acceptance remain pending. Local validation passed: 259 Rust unit tests (including headless UI and local socket checks), three CLI integration tests, 18 Python tests, formatting, warnings-denied Clippy, shell syntax checks, ShellCheck, and the optimized 0.12.0 build. Independent review found no remaining actionable issues after cache-lifetime and lookup-cancellation fixes. GitHub log caches use private temporary directories removed on exit, pane close or launch failure; queued and subsequent metadata requests cancel when the panel closes. No live PR comment was posted.
+
 2026-10-04 — 0.5.0 local specification review and recovery.
 
 Added persisted local scope proposals against an immutable base, side-by-side comparison, explicit accept/cancel, stale-draft and revision conflict rejection, and advanced field-only acceptance. Primary actions remain simple; partial acceptance closes the proposal and discards other fields. Agent output is pasted manually; no automatic agent ingestion is claimed. Revision history compares snapshots with the draft and restores as a new revision after preserving unsaved work. Running sessions retain their pinned revision. Legacy records load with no proposal. Capacity and invalid acceptance failures preserve state.

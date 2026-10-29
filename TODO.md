@@ -34,7 +34,8 @@
 - [ ] Scope amendments with acknowledgement, independent worktrees and collision warnings.
 
 ## Connectors and release
-- [ ] Jira/GitHub read/import, project configuration and Keychain credential adapter.
+- [ ] Jira/GitHub read/import, project configuration and Keychain credential adapter (partial: configured GitHub Actions run lookup and pull request comment posting; no Jira or issue import, project connector, or credential adapter).
+- [x] Configured Remote runs view for bounded GitHub Actions and pull request lookup, run output, and confirmed pull request comments.
 - [ ] Reviewed publish with conflict re-fetch and rich-content preservation.
 - [ ] Verification receipts, staleness, criterion-linked change requests and handoff.
 - [x] One-command macOS/Linux installer and x86-64/ARM64 release packaging.

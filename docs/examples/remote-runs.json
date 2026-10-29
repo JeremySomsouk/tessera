@@ -1,0 +1,34 @@
+{
+  "remote_runs": {
+    "enabled": true,
+    "gh_path": "gh",
+    "run_limit": 200,
+    "sources": [
+      {
+        "name": "acme-autopilot",
+        "ticket_pattern": "ACME-\\d+",
+        "title_match": "{key}\\b",
+        "events": [
+          "repository_dispatch"
+        ],
+        "repos": [
+          "acme/api",
+          "acme/web"
+        ],
+        "pr_label": "ai-autopilot",
+        "output_job": "Claude",
+        "output_step": "Claude",
+        "kinds": [
+          {
+            "label": "implement",
+            "title_regex": "\\[implement\\]"
+          },
+          {
+            "label": "pr follow-up",
+            "title_regex": "^PR shepherd:"
+          }
+        ]
+      }
+    ]
+  }
+}
