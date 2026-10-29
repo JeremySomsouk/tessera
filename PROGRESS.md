@@ -1,5 +1,10 @@
 # Progress
 
+2026-10-29: combined release numbering corrected to 0.12.0.
+
+The last published release is 0.11.1. Remote runs, Autobot, and Merge Radar ship together as 0.12.0. The 0.13.0 and 0.14.0 entries below describe unpublished local build milestones only, not public releases. Their draft release notes are consolidated into 0.12.0. Corrected-version validation: 290 Rust unit tests and three CLI integration tests pass; the Apple Silicon app and DMG rebuilt and verified with 0.12.0 / 1.12.0 bundle metadata.
+
+
 2026-10-29: 0.14.0 combined Autobot and Merge Radar.
 
 Integrated the latest Autobot implementation with native Merge Radar review queues, filters, bot grouping, and saved snoozes. Preserved both work streams and updated shared navigation and command-menu coverage. Validation: all 290 Rust unit tests plus three CLI integration tests pass, including ignored socket tests, with `LC_ALL=C`, a clean fallback shell, and four test threads. All 18 Python tests, formatting, warnings-denied Clippy, ShellCheck, shell syntax, and diff checks pass. Both page navigation/input isolation and light/dark narrow layouts are covered, including combined navigation at 900 pixels. The Apple Silicon 0.14.0 app and DMG built successfully; ad hoc code signature, 0.14.0 / 1.14.0 bundle metadata, and DMG checksum verify. Native authenticated GitHub, Intel/Linux, accessibility, and installed updater acceptance remain pending. No push, tag, or publication was performed.
