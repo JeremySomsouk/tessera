@@ -217,7 +217,7 @@ impl Layout {
                     handle,
                     2.0,
                     if response.hovered() {
-                        ACCENT
+                        accent(ui)
                     } else {
                         ui.visuals().widgets.noninteractive.bg_stroke.color
                     },
@@ -236,6 +236,40 @@ struct Workspace {
     layout: Layout,
     focus: Uuid,
 }
+#[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ChromePalette {
+    Ocean,
+    Forest,
+    Plum,
+    #[default]
+    #[serde(other)]
+    Default,
+}
+
+impl ChromePalette {
+    const ALL: [(Self, &'static str); 4] = [
+        (Self::Default, "Default"),
+        (Self::Ocean, "Ocean"),
+        (Self::Forest, "Forest"),
+        (Self::Plum, "Plum"),
+    ];
+
+    fn accent(self, light: bool) -> Color32 {
+        let rgb = match (self, light) {
+            (Self::Default, true) => [27, 108, 87],
+            (Self::Default, false) => [130, 198, 180],
+            (Self::Ocean, true) => [25, 92, 150],
+            (Self::Ocean, false) => [130, 190, 240],
+            (Self::Forest, true) => [25, 105, 65],
+            (Self::Forest, false) => [145, 205, 155],
+            (Self::Plum, true) => [110, 65, 140],
+            (Self::Plum, false) => [205, 170, 230],
+        };
+        Color32::from_rgb(rgb[0], rgb[1], rgb[2])
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct Saved {
     #[serde(default)]
@@ -256,6 +290,8 @@ struct Saved {
     font_size: f32,
     #[serde(default)]
     light: bool,
+    #[serde(default)]
+    chrome_palette: ChromePalette,
     #[serde(default)]
     skip_stop_confirmation: bool,
     #[serde(default = "default_clickable_choices")]
@@ -285,6 +321,7 @@ impl Default for Saved {
             sessions: Vec::new(),
             font_size: default_font(),
             light: false,
+            chrome_palette: ChromePalette::default(),
             skip_stop_confirmation: false,
             clickable_codex_choices: default_clickable_choices(),
             folder_search_roots: crate::folders::default_roots(),
@@ -425,11 +462,7 @@ struct CreatedDirectory {
     created_at: u64,
 }
 fn accent(ui: &egui::Ui) -> Color32 {
-    if ui.visuals().dark_mode {
-        ACCENT
-    } else {
-        Color32::from_rgb(27, 108, 87)
-    }
+    ui.visuals().selection.stroke.color
 }
 fn default_font() -> f32 {
     15.0
@@ -672,7 +705,7 @@ impl App {
             Err(error) => app.updater_error = Some(format!("Updates unavailable: {error}")),
         }
         configure_terminal_fonts_with(&cc.egui_ctx, crate::fonts::automatic_terminal_fonts());
-        configure_appearance(&cc.egui_ctx, app.saved.light);
+        configure_palette(&cc.egui_ctx, app.saved.light, app.saved.chrome_palette);
         app.restore_workspace(&cc.egui_ctx);
         if !load_error.is_empty() {
             app.ui.error = load_error;
@@ -3440,11 +3473,25 @@ impl App {
                     .clicked()
                 {
                     self.saved.light = light;
-                    configure_appearance(ctx, light);
+                    configure_palette(ctx, light, self.saved.chrome_palette);
                     self.dirty = true;
                 }
             }
         });
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Workspace colors");
+            for (palette, label) in ChromePalette::ALL {
+                if ui
+                    .selectable_label(self.saved.chrome_palette == palette, label)
+                    .clicked()
+                {
+                    self.saved.chrome_palette = palette;
+                    configure_palette(ctx, self.saved.light, palette);
+                    self.dirty = true;
+                }
+            }
+        });
+        ui.small("Workspace colors update immediately in all windows. Terminal ANSI colors and background stay unchanged.");
         ui.horizontal(|ui| {
             ui.label("Terminal text");
             if ui
@@ -4093,16 +4140,9 @@ impl App {
                         let session = self.saved.sessions.iter().rev().find(|s| s.pane == id);
                         let process = session.map(|s| s.agent.label()).unwrap_or("Shell");
                         let state = self.panes.get(&id).map(|p| if p.terminal.has_exited() { format!("Exited ({})", p.terminal.exit_code().map_or("unknown".into(), |c| c.to_string())) } else if session.is_some_and(|s| s.state.attention()) { "Needs attention".into() } else { String::new() }).unwrap_or_default();
-                        ui.horizontal(|ui| {
-                            if ui.selectable_label(focused == id, process).on_hover_text("Focus this terminal").clicked() { header_action = Some((id, "Focus")); }
-                            ui.add_sized([((ui.available_width() - 180.0).max(20.0)), 18.0], egui::Label::new(&directory).truncate()).on_hover_text(&directory);
-                            if !state.is_empty() { ui.label(&state); }
-                            ui.menu_button("⋯", |ui| {
-                                for action in ["Focus", "Find", "Select", "Split side by side", "Split stacked", "Maximize / restore", "New shell", "Stop terminal"] {
-                                    if ui.button(action).clicked() { header_action = Some((id, action)); ui.close(); }
-                                }
-                            });
-                        });
+                        if let Some(action) = terminal_header(ui, process, &directory, &state, focused == id) {
+                            header_action = Some((id, action));
+                        }
                         self.restoration_panel(ui, ctx, id);
                         if let Some(pane) = self.panes.get_mut(&id) {
                             if let Some(err) =
@@ -4375,14 +4415,83 @@ fn mosaic_mark(ui: &mut egui::Ui) {
     }
 }
 
+fn terminal_header(
+    ui: &mut egui::Ui,
+    process: &str,
+    directory: &str,
+    state: &str,
+    focused: bool,
+) -> Option<&'static str> {
+    let mut action = None;
+    ui.horizontal(|ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.menu_button("Pane", |ui| {
+                for label in [
+                    "Focus",
+                    "Find",
+                    "Select",
+                    "Split side by side",
+                    "Split stacked",
+                    "Maximize / restore",
+                    "New shell",
+                    "Stop terminal",
+                ] {
+                    if ui.button(label).clicked() {
+                        action = Some(label);
+                        ui.close();
+                    }
+                }
+            });
+            let available = ui.available_width();
+            ui.allocate_ui_with_layout(
+                Vec2::new(available, 30.0),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    let process_width = (available * 0.4).min(95.0);
+                    if ui
+                        .add_sized(
+                            [process_width, 28.0],
+                            egui::Button::new(process).selected(focused).truncate(),
+                        )
+                        .on_hover_text("Focus this terminal")
+                        .clicked()
+                    {
+                        action = Some("Focus");
+                    }
+                    let remaining = (ui.available_width() - ui.spacing().item_spacing.x).max(0.0);
+                    let state_width = if state.is_empty() {
+                        0.0
+                    } else {
+                        (remaining * 0.6).min(110.0)
+                    };
+                    ui.add_sized(
+                        [(remaining - state_width).max(0.0), 18.0],
+                        egui::Label::new(directory).truncate(),
+                    )
+                    .on_hover_text(directory);
+                    if !state.is_empty() {
+                        ui.add_sized([state_width, 18.0], egui::Label::new(state).truncate())
+                            .on_hover_text(state);
+                    }
+                },
+            );
+        });
+    });
+    action
+}
+
 fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     ui.add(
         egui::Button::new(
             RichText::new(text)
                 .strong()
-                .color(Color32::from_rgb(15, 32, 29)),
+                .color(if ui.visuals().dark_mode {
+                    Color32::BLACK
+                } else {
+                    Color32::WHITE
+                }),
         )
-        .fill(ACCENT)
+        .fill(accent(ui))
         .stroke(Stroke::NONE)
         .min_size(Vec2::new(140.0, 36.0)),
     )
@@ -4560,7 +4669,12 @@ fn configure_terminal_fonts_with(ctx: &egui::Context, detected: crate::fonts::Au
     ctx.set_fonts(fonts);
 }
 
+#[cfg(test)]
 fn configure_appearance(ctx: &egui::Context, light: bool) {
+    configure_palette(ctx, light, ChromePalette::Default);
+}
+
+fn configure_palette(ctx: &egui::Context, light: bool, palette: ChromePalette) {
     ctx.set_theme(if light {
         egui::Theme::Light
     } else {
@@ -4578,7 +4692,7 @@ fn configure_appearance(ctx: &egui::Context, light: bool) {
             Color32::WHITE,
             Color32::from_rgb(200, 212, 216),
             Color32::from_rgb(29, 43, 49),
-            Color32::from_rgb(85, 103, 113),
+            Color32::from_rgb(70, 85, 95),
             Color32::from_rgb(207, 230, 222),
         )
     } else {
@@ -4588,10 +4702,26 @@ fn configure_appearance(ctx: &egui::Context, light: bool) {
             Color32::from_rgb(31, 40, 50),
             Color32::from_rgb(53, 66, 79),
             Color32::from_rgb(225, 233, 240),
-            Color32::from_rgb(153, 171, 184),
+            Color32::from_rgb(170, 186, 198),
             Color32::from_rgb(35, 62, 59),
         )
     };
+    let tint = |color: Color32| {
+        if palette == ChromePalette::Default {
+            return color;
+        }
+        let hue = palette.accent(light);
+        let mix =
+            |channel: usize| ((u16::from(color[channel]) * 7 + u16::from(hue[channel])) / 8) as u8;
+        Color32::from_rgb(mix(0), mix(1), mix(2))
+    };
+    let (base, surface, raised, border, selection) = (
+        tint(base),
+        tint(surface),
+        tint(raised),
+        tint(border),
+        tint(selection),
+    );
     visuals.panel_fill = surface;
     visuals.window_fill = surface;
     visuals.extreme_bg_color = base;
@@ -4599,14 +4729,7 @@ fn configure_appearance(ctx: &egui::Context, light: bool) {
     visuals.override_text_color = Some(text);
     visuals.weak_text_color = Some(muted);
     visuals.selection.bg_fill = selection;
-    visuals.selection.stroke = Stroke::new(
-        1.0_f32,
-        if light {
-            Color32::from_rgb(27, 108, 87)
-        } else {
-            ACCENT
-        },
-    );
+    visuals.selection.stroke = Stroke::new(1.0_f32, palette.accent(light));
     visuals.window_stroke = Stroke::new(1.0_f32, border);
     visuals.window_corner_radius = egui::CornerRadius::same(10);
     visuals.error_fg_color = if light {
@@ -4953,7 +5076,7 @@ fn terminal_view(
         ui.painter().rect_stroke(
             rect,
             6.0,
-            Stroke::new(2.0_f32, ACCENT),
+            Stroke::new(2.0_f32, accent(ui)),
             egui::StrokeKind::Inside,
         );
     }
@@ -6465,6 +6588,145 @@ mod render_tests {
         let pane = workspace.focus;
         let directory = workspace.task.directory.clone();
         assert!(app.spawn(pane, ctx, &directory));
+    }
+
+    #[test]
+    fn terminal_header_keeps_pane_menu_inside_narrow_splits() {
+        for width in [160.0, 240.0, 320.0] {
+            let ctx = egui::Context::default();
+            configure_appearance(&ctx, false);
+            let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(width, 100.0));
+            let mut used = Rect::NOTHING;
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        terminal_header(
+                            ui,
+                            "Claude Code",
+                            "~/projects/very-long-project-name/subdirectory",
+                            "Needs attention",
+                            true,
+                        );
+                        used = ui.min_rect();
+                    });
+                },
+            );
+            assert!(
+                used.right() <= screen.right(),
+                "header overflows {width}: {used:?}"
+            );
+            let menu = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::epaint::Shape::Text(text) if text.galley.text() == "Pane" => {
+                        Some(text.galley.rect.translate(text.pos.to_vec2()))
+                    }
+                    _ => None,
+                })
+                .expect("Pane menu must stay visible");
+            assert!(screen.contains_rect(menu));
+        }
+    }
+
+    #[test]
+    fn chrome_palettes_migrate_persist_and_keep_readable_controls() {
+        fn luminance(color: Color32) -> f32 {
+            let linear = |byte: u8| {
+                let value = f32::from(byte) / 255.0;
+                if value <= 0.04045 {
+                    value / 12.92
+                } else {
+                    ((value + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * linear(color.r()) + 0.7152 * linear(color.g()) + 0.0722 * linear(color.b())
+        }
+        fn contrast(a: Color32, b: Color32) -> f32 {
+            let (a, b) = (luminance(a), luminance(b));
+            (a.max(b) + 0.05) / (a.min(b) + 0.05)
+        }
+        let mut legacy = serde_json::to_value(Saved::default()).unwrap();
+        legacy.as_object_mut().unwrap().remove("chrome_palette");
+        assert!(
+            serde_json::from_value::<Saved>(legacy.clone())
+                .unwrap()
+                .chrome_palette
+                == ChromePalette::Default
+        );
+        legacy["chrome_palette"] = json!("future_palette");
+        assert!(
+            serde_json::from_value::<Saved>(legacy)
+                .unwrap()
+                .chrome_palette
+                == ChromePalette::Default
+        );
+        for light in [false, true] {
+            let ctx = egui::Context::default();
+            configure_appearance(&ctx, light);
+            let default_panel = ctx.style().visuals.panel_fill;
+            for (palette, label) in ChromePalette::ALL {
+                let saved = Saved {
+                    chrome_palette: palette,
+                    light,
+                    ..Default::default()
+                };
+                let restored: Saved =
+                    serde_json::from_slice(&serde_json::to_vec(&saved).unwrap()).unwrap();
+                assert!(restored.chrome_palette == palette);
+                configure_palette(&ctx, restored.light, restored.chrome_palette);
+                let visuals = &ctx.style().visuals;
+                assert_eq!(visuals.selection.stroke.color, palette.accent(light));
+                if palette != ChromePalette::Default {
+                    assert_ne!(visuals.panel_fill, default_panel);
+                }
+                assert!(
+                    contrast(visuals.text_color(), visuals.panel_fill) >= 4.5,
+                    "{label} text contrast"
+                );
+                assert!(
+                    contrast(visuals.weak_text_color(), visuals.panel_fill) >= 4.5,
+                    "{label} muted contrast"
+                );
+                assert!(
+                    contrast(palette.accent(light), visuals.panel_fill) >= 3.0,
+                    "{label} focus contrast"
+                );
+                let foreground = if light {
+                    Color32::WHITE
+                } else {
+                    Color32::BLACK
+                };
+                assert!(
+                    contrast(foreground, palette.accent(light)) >= 4.5,
+                    "{label} button contrast"
+                );
+                let mut app = fixture(0);
+                app.saved = restored;
+                app.open_commands(CommandPage::Settings);
+                let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(640.0, 400.0));
+                for _ in 0..3 {
+                    let _ = ctx.run(
+                        egui::RawInput {
+                            screen_rect: Some(screen),
+                            ..Default::default()
+                        },
+                        |ctx| app.draw(ctx),
+                    );
+                }
+                let modal = ctx
+                    .memory(|m| m.area_rect(egui::Id::new("workspace-commands")))
+                    .unwrap();
+                assert!(
+                    screen.contains_rect(modal),
+                    "{label} settings overflow {modal:?}"
+                );
+            }
+        }
     }
 
     #[test]
