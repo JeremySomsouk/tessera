@@ -2344,9 +2344,32 @@ mod pty_tests {
                 rows: 30,
             });
         }
+        terminal.resize(Size {
+            cols: 101,
+            rows: 30,
+        });
         std::thread::sleep(Duration::from_millis(200));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let term = terminal.term.lock().unwrap();
+            let prompt_visible = term
+                .grid()
+                .display_iter()
+                .map(|cell| cell.cell.c)
+                .collect::<String>()
+                .contains("TESSERA_ZSH_PROMPT");
+            if term.columns() == 101 && term.screen_lines() == 30 && prompt_visible {
+                break;
+            }
+            drop(term);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "zsh did not repaint after resize"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         let term = terminal.term.lock().unwrap();
-        assert_eq!(term.columns(), 100);
+        assert_eq!(term.columns(), 101);
         assert_eq!(term.screen_lines(), 30);
         let text = term
             .grid()
