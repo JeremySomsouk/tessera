@@ -12,13 +12,14 @@ use eframe::egui::{Color32, Context};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::{
     io::{Read, Write},
+    os::fd::{AsRawFd, BorrowedFd},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
-        mpsc::{SyncSender, sync_channel},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
+        mpsc::{Receiver, SyncSender, sync_channel},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use uuid::Uuid;
 #[cfg(target_os = "macos")]
@@ -160,9 +161,167 @@ fn snapshot_grid<T: EventListener>(term: &Term<T>) -> String {
     lines.join("\n")
 }
 
+fn request_repaint(ctx: &Context) {
+    let viewport = ctx.viewport_id();
+    let pass = ctx.cumulative_pass_nr_for(viewport);
+    let request = ctx.data_mut(|data| {
+        let key = eframe::egui::Id::new(("terminal repaint", viewport));
+        if data.get_temp::<u64>(key) == Some(pass) {
+            false
+        } else {
+            data.insert_temp(key, pass);
+            true
+        }
+    });
+    // egui retains one diagnostic cause per request until the next rendered pass.
+    if request {
+        ctx.request_repaint_of(viewport);
+    }
+}
+
+const INPUT_BUFFER_BYTES: usize = 64 * 1024 * 1024;
+const WRITE_CHUNK_BYTES: usize = 16 * 1024;
+const PROTOCOL_BUFFER_BYTES: usize = 1024 * 1024;
+
+struct InputBudget {
+    used: AtomicUsize,
+    limit: usize,
+}
+
+struct Input {
+    bytes: Vec<u8>,
+    paste: Option<bool>,
+    follow_cursor: bool,
+    budget: Arc<InputBudget>,
+}
+
+impl Drop for Input {
+    fn drop(&mut self) {
+        self.budget
+            .used
+            .fetch_sub(self.bytes.capacity(), Ordering::AcqRel);
+    }
+}
+
+#[derive(Clone)]
+struct InputSender {
+    tx: SyncSender<Input>,
+    budget: Arc<InputBudget>,
+}
+
+impl InputSender {
+    fn send(&self, bytes: Vec<u8>, paste: Option<bool>, follow_cursor: bool) -> Result<()> {
+        let size = bytes.capacity();
+        self.budget.used.try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            used.checked_add(size).filter(|total| *total <= self.budget.limit)
+        }).map_err(|_| anyhow::anyhow!(
+            "terminal input buffer full ({} bytes maximum); nothing from this input was sent, retry after pending input drains",
+            self.budget.limit
+        ))?;
+        self.tx
+            .try_send(Input {
+                bytes,
+                paste,
+                follow_cursor,
+                budget: self.budget.clone(),
+            })
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "terminal input queue unavailable; nothing from this input was sent"
+                )
+            })
+    }
+}
+
+fn next_input<T>(input: &Receiver<T>, replies: &Receiver<T>, prefer_reply: &mut bool) -> Option<T> {
+    let (first, second) = if *prefer_reply {
+        (replies, input)
+    } else {
+        (input, replies)
+    };
+    match first.try_recv() {
+        Ok(input) => {
+            *prefer_reply = !*prefer_reply;
+            Some(input)
+        }
+        Err(_) => second.try_recv().ok(),
+    }
+}
+
+struct PendingInput {
+    input: Input,
+    offset: usize,
+    buffer: Vec<u8>,
+    buffer_offset: usize,
+    prefix: bool,
+    suffix: bool,
+}
+
+impl PendingInput {
+    fn new(input: Input) -> Self {
+        let buffer = if input.paste.is_some() {
+            Vec::with_capacity(WRITE_CHUNK_BYTES + 12)
+        } else {
+            Vec::new()
+        };
+        Self {
+            input,
+            offset: 0,
+            buffer,
+            buffer_offset: 0,
+            prefix: false,
+            suffix: false,
+        }
+    }
+
+    fn complete(&self) -> bool {
+        self.offset == self.input.bytes.len()
+            && self.buffer_offset == self.buffer.len()
+            && (self.input.paste != Some(true) || self.suffix)
+    }
+
+    fn write(&mut self, writer: &mut dyn Write) -> std::io::Result<usize> {
+        let Some(bracketed) = self.input.paste else {
+            let end = (self.offset + WRITE_CHUNK_BYTES).min(self.input.bytes.len());
+            let n = writer.write(&self.input.bytes[self.offset..end])?;
+            self.offset += n;
+            return Ok(n);
+        };
+        if self.buffer_offset == self.buffer.len() {
+            self.buffer.clear();
+            self.buffer_offset = 0;
+            if bracketed && !self.prefix {
+                self.buffer.extend_from_slice(b"\x1b[200~");
+                self.prefix = true;
+            }
+            let end = (self.offset + WRITE_CHUNK_BYTES).min(self.input.bytes.len());
+            while self.offset < end && self.buffer.len() < WRITE_CHUNK_BYTES {
+                let byte = self.input.bytes[self.offset];
+                self.offset += 1;
+                if byte != 0x1b {
+                    self.buffer.push(if byte == b'\n' && !bracketed {
+                        b'\r'
+                    } else {
+                        byte
+                    });
+                }
+            }
+            if bracketed && self.offset == self.input.bytes.len() && !self.suffix {
+                self.buffer.extend_from_slice(b"\x1b[201~");
+                self.suffix = true;
+            }
+        }
+        if self.buffer.is_empty() {
+            return Ok(0);
+        }
+        let n = writer.write(&self.buffer[self.buffer_offset..])?;
+        self.buffer_offset += n;
+        Ok(n)
+    }
+}
+
 enum Command {
-    Input(Vec<u8>),
-    UserInput(Vec<u8>),
+    Wake,
     Resize(Size),
     Selection(SelectionAction),
     Scroll(i32),
@@ -171,7 +330,6 @@ enum Command {
 #[derive(Clone)]
 pub struct Listener {
     replies: Arc<Mutex<Vec<Event>>>,
-    ctx: Context,
 }
 impl EventListener for Listener {
     fn send_event(&self, event: Event) {
@@ -181,7 +339,6 @@ impl EventListener for Listener {
             replies.push(event);
         }
         // OSC 52 clipboard access is denied, including reads.
-        self.ctx.request_repaint();
     }
 }
 fn protocol_reply(term: &Term<Listener>, event: Event) -> Option<Vec<u8>> {
@@ -201,7 +358,6 @@ fn protocol_reply(term: &Term<Listener>, event: Event) -> Option<Vec<u8>> {
 }
 
 struct ProcessLifecycle {
-    killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
     exited: bool,
     exit_code: Option<u32>,
 }
@@ -275,6 +431,12 @@ fn agent_command(directory: &Path, launch: &str) -> Result<CommandBuilder> {
 pub struct Terminal {
     pub term: Arc<Mutex<Term<Listener>>>,
     tx: SyncSender<Command>,
+    input_tx: InputSender,
+    #[cfg(test)]
+    output_bytes: Arc<AtomicU64>,
+    #[cfg(test)]
+    input_bytes: Arc<AtomicU64>,
+    reader: Option<std::thread::JoinHandle<()>>,
     pub alive: Arc<AtomicBool>,
     pub error: Arc<Mutex<Option<String>>>,
     pub size: Size,
@@ -421,14 +583,44 @@ impl Terminal {
         directory: &Path,
         socket: &Path,
         ctx: Context,
+        command: CommandBuilder,
+        cache: Option<RemoteCache>,
+    ) -> Result<Self> {
+        let input_limit = match std::env::var("TESSERA_INPUT_BUFFER_BYTES") {
+            Ok(value) => value
+                .parse::<usize>()
+                .ok()
+                .filter(|limit| *limit > 0)
+                .context("TESSERA_INPUT_BUFFER_BYTES must be a positive byte count")?,
+            Err(_) => INPUT_BUFFER_BYTES,
+        };
+        Self::spawn_with_input_limit(id, directory, socket, ctx, command, cache, input_limit)
+    }
+
+    fn spawn_with_input_limit(
+        id: Uuid,
+        directory: &Path,
+        socket: &Path,
+        ctx: Context,
         mut command: CommandBuilder,
         cache: Option<RemoteCache>,
+        input_limit: usize,
     ) -> Result<Self> {
         let size = Size {
             cols: 100,
             rows: 30,
         };
         let pair = native_pty_system().openpty(size.pty())?;
+        let fd = pair
+            .master
+            .as_raw_fd()
+            .context("PTY does not expose a native descriptor")?;
+        // The duplicate owns its lifetime; nonblocking status is shared with the writer.
+        let reader_fd = unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned()?;
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
         command.cwd(directory);
         command.env("TERM", "xterm-256color");
         command.env("COLORTERM", "truecolor");
@@ -437,18 +629,26 @@ impl Terminal {
         let mut child = pair.slave.spawn_command(command)?;
         let shell_pid = child.process_id();
         let lifecycle = Arc::new(Mutex::new(ProcessLifecycle {
-            killer: child.clone_killer(),
             exited: false,
             exit_code: None,
         }));
         drop(pair.slave);
-        let mut reader = pair.master.try_clone_reader()?;
+        let mut reader = std::fs::File::from(reader_fd);
         let mut writer = pair.master.take_writer()?;
         let (tx, rx) = sync_channel(256);
+        let (input_channel, input_rx) = sync_channel(256);
+        let input_tx = InputSender {
+            tx: input_channel,
+            budget: Arc::new(InputBudget {
+                used: AtomicUsize::new(0),
+                limit: input_limit,
+            }),
+        };
+        let output_bytes = Arc::new(AtomicU64::new(0));
+        let input_bytes = Arc::new(AtomicU64::new(0));
         let replies = Arc::new(Mutex::new(Vec::new()));
         let listener = Listener {
             replies: replies.clone(),
-            ctx: ctx.clone(),
         };
         let term = Arc::new(Mutex::new(Term::new(terminal_config(), &size, listener)));
         let mode = Arc::new(AtomicU32::new(term.lock().unwrap().mode().bits()));
@@ -457,83 +657,195 @@ impl Terminal {
         let parser_revision = revision.clone();
         let alive = Arc::new(AtomicBool::new(true));
         let error = Arc::new(Mutex::new(None));
-        let response_tx = tx.clone();
+        let (response_channel, response_rx) = sync_channel(256);
+        let response_tx = InputSender {
+            tx: response_channel,
+            budget: Arc::new(InputBudget {
+                used: AtomicUsize::new(0),
+                limit: PROTOCOL_BUFFER_BYTES,
+            }),
+        };
+        let response_wake = tx.clone();
         let stopping = Arc::new(AtomicBool::new(false));
         let host_stopping = stopping.clone();
         let parser_term = term.clone();
         let read_alive = alive.clone();
         let read_ctx = ctx.clone();
         let read_error = error.clone();
-        std::thread::spawn(move || {
+        let read_stopping = stopping.clone();
+        let read_lifecycle = lifecycle.clone();
+        let read_bytes = output_bytes.clone();
+        let reader = std::thread::spawn(move || {
             let mut parser: Processor = Processor::new();
             let mut buf = [0u8; 16 * 1024];
             loop {
-                match reader.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        let pending = if let Ok(mut t) = parser_term.lock() {
+                if read_stopping.load(Ordering::Acquire) {
+                    break;
+                }
+                let result = reader.read(&mut buf);
+                let eof = matches!(&result, Ok(0))
+                    || matches!(&result, Err(error) if error.raw_os_error() == Some(libc::EIO));
+                let sync_expired = parser
+                    .sync_timeout()
+                    .sync_timeout()
+                    .is_some_and(|deadline| Instant::now() >= deadline);
+                let n = match &result {
+                    Ok(n) => *n,
+                    Err(_) => 0,
+                };
+                if n > 0 || eof || sync_expired {
+                    let pending = if let Ok(mut t) = parser_term.lock() {
+                        if n > 0 {
                             parser.advance(&mut *t, &buf[..n]);
-                            parser_mode.store(t.mode().bits(), Ordering::Release);
-                            parser_revision.fetch_add(1, Ordering::Release);
-                            let events = std::mem::take(&mut *replies.lock().unwrap());
-                            events
-                                .into_iter()
-                                .filter_map(|event| protocol_reply(&t, event))
-                                .collect::<Vec<_>>()
-                        } else {
-                            Vec::new()
-                        };
-                        for bytes in pending {
-                            if response_tx.send(Command::Input(bytes)).is_err() {
-                                break;
-                            }
+                            read_bytes.fetch_add(n as u64, Ordering::Relaxed);
                         }
-                        read_ctx.request_repaint();
+                        if eof
+                            || parser
+                                .sync_timeout()
+                                .sync_timeout()
+                                .is_some_and(|deadline| Instant::now() >= deadline)
+                        {
+                            parser.stop_sync(&mut *t);
+                        }
+                        parser_mode.store(t.mode().bits(), Ordering::Release);
+                        parser_revision.fetch_add(1, Ordering::Release);
+                        let events = std::mem::take(&mut *replies.lock().unwrap());
+                        events
+                            .into_iter()
+                            .filter_map(|event| protocol_reply(&t, event))
+                            .flatten()
+                            .collect::<Vec<_>>()
+                    } else {
+                        break;
+                    };
+                    if !pending.is_empty() {
+                        if let Err(error) = response_tx.send(pending, None, false)
+                            && !read_lifecycle.lock().unwrap().exited
+                        {
+                            *read_error.lock().unwrap() =
+                                Some(format!("terminal protocol reply overflow: {error}"));
+                            read_stopping.store(true, Ordering::Release);
+                            let _ = response_wake.try_send(Command::Wake);
+                            break;
+                        }
+                        let _ = response_wake.try_send(Command::Wake);
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(e) => {
-                        if let Ok(mut err) = read_error.lock() {
-                            *err = Some(e.to_string());
+                    request_repaint(&read_ctx);
+                }
+                if eof {
+                    break;
+                }
+                match result {
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        let mut descriptor = libc::pollfd {
+                            fd: reader.as_raw_fd(),
+                            events: libc::POLLIN,
+                            revents: 0,
+                        };
+                        let timeout =
+                            parser
+                                .sync_timeout()
+                                .sync_timeout()
+                                .map_or(250, |deadline| {
+                                    deadline
+                                        .saturating_duration_since(Instant::now())
+                                        .as_millis()
+                                        .clamp(1, 250) as i32
+                                });
+                        // The file owns the descriptor. Idle readers wake at most four times/sec.
+                        unsafe {
+                            libc::poll(&mut descriptor, 1, timeout);
                         }
+                    }
+                    Err(error) => {
+                        *read_error.lock().unwrap() = Some(error.to_string());
                         break;
                     }
                 }
             }
             read_alive.store(false, Ordering::Release);
-            read_ctx.request_repaint();
+            request_repaint(&read_ctx);
         });
         let host_term = term.clone();
         let host_revision = revision.clone();
         let host_mode = mode.clone();
-        let host_alive = alive.clone();
+        let host_bytes = input_bytes.clone();
+        let host_budget = input_tx.budget.clone();
         let host_error = error.clone();
         let host_lifecycle = lifecycle.clone();
         let selection_ctx = ctx.clone();
         let host = std::thread::spawn(move || {
             let mut pending = None;
+            let mut writing: Option<PendingInput> = None;
+            let mut prefer_reply = true;
             loop {
                 if host_stopping.load(Ordering::Acquire) {
-                    let mut life = host_lifecycle.lock().unwrap();
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    life.exited = true;
                     break;
                 }
+                let mut wrote = false;
+                if writing.is_none()
+                    && let Some(input) = next_input(&input_rx, &response_rx, &mut prefer_reply)
+                {
+                    if input.follow_cursor
+                        && let Ok(mut term) = host_term.lock()
+                    {
+                        term.scroll_display(Scroll::Bottom);
+                        request_repaint(&ctx);
+                    }
+                    writing = Some(PendingInput::new(input));
+                }
+                if let Some(input) = writing.as_mut() {
+                    let source_offset = input.offset;
+                    match input.write(&mut *writer) {
+                        Ok(n) => {
+                            host_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                            wrote = n > 0 || input.offset > source_offset;
+                            if input.complete() {
+                                writing = None;
+                            } else if !wrote {
+                                *host_error.lock().unwrap() = Some("terminal input write made no progress; pending input cancelled".into());
+                                host_stopping.store(true, Ordering::Release);
+                                continue;
+                            }
+                        }
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                            ) => {}
+                        Err(error) => {
+                            *host_error.lock().unwrap() = Some(format!(
+                                "terminal input failed; pending input cancelled: {error}"
+                            ));
+                            host_stopping.store(true, Ordering::Release);
+                            continue;
+                        }
+                    }
+                }
+                if !wrote && writing.is_some() {
+                    let mut descriptor = libc::pollfd {
+                        fd,
+                        events: libc::POLLOUT,
+                        revents: 0,
+                    };
+                    // The master owns fd. Use a short readiness wait between control checks.
+                    unsafe {
+                        libc::poll(&mut descriptor, 1, 2);
+                    }
+                }
+                let wait = if wrote || writing.is_some() {
+                    Duration::ZERO
+                } else {
+                    Duration::from_millis(250)
+                };
                 let command = pending
                     .take()
                     .map(Ok)
-                    .unwrap_or_else(|| rx.recv_timeout(Duration::from_millis(250)));
+                    .unwrap_or_else(|| rx.recv_timeout(wait));
                 let result = match command {
-                    Ok(Command::Input(bytes)) => writer.write_all(&bytes),
-                    Ok(Command::UserInput(bytes)) => host_term
-                        .lock()
-                        .map_err(|_| std::io::Error::other("terminal state unavailable"))
-                        .and_then(|mut term| {
-                            term.scroll_display(Scroll::Bottom);
-                            ctx.request_repaint();
-                            drop(term);
-                            writer.write_all(&bytes)
-                        }),
+                    Ok(Command::Wake) => Ok(()),
                     Ok(Command::Selection(action)) => {
                         let text = host_term
                             .lock()
@@ -548,7 +860,7 @@ impl Terminal {
                                 if let Some(text) = text {
                                     ctx.copy_text(text);
                                 }
-                                ctx.request_repaint();
+                                request_repaint(&ctx);
                                 Ok(())
                             }
                             Err(error) => Err(error),
@@ -559,7 +871,7 @@ impl Terminal {
                         .map_err(|_| std::io::Error::other("terminal state unavailable"))
                         .map(|mut term| {
                             term.scroll_display(Scroll::Delta(lines));
-                            ctx.request_repaint();
+                            request_repaint(&ctx);
                         }),
                     Ok(Command::Resize(mut s)) => {
                         while let Ok(command) = rx.try_recv() {
@@ -579,15 +891,11 @@ impl Terminal {
                                 let result =
                                     pair.master.resize(s.pty()).map_err(std::io::Error::other);
                                 host_revision.fetch_add(1, Ordering::Release);
-                                ctx.request_repaint();
+                                request_repaint(&ctx);
                                 result
                             })
                     }
                     Ok(Command::Stop) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                        let mut life = host_lifecycle.lock().unwrap();
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        life.exited = true;
                         break;
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok(()),
@@ -611,13 +919,38 @@ impl Terminal {
                     break;
                 }
             }
+            let reap = !host_lifecycle.lock().unwrap().exited;
+            if reap {
+                host_stopping.store(true, Ordering::Release);
+            }
+            // macOS may wait for pending PTY output during child exit. Close host handles first.
+            drop(writer);
+            drop(pair.master);
+            if reap {
+                let _ = child.kill();
+                let status = child.wait();
+                let mut life = host_lifecycle.lock().unwrap();
+                life.exit_code = status.ok().map(|status| status.exit_code());
+                life.exited = true;
+            }
             drop(cache);
-            host_alive.store(false, Ordering::Release);
-            ctx.request_repaint();
+            let undelivered = host_budget.used.load(Ordering::Acquire);
+            if undelivered > 0 && !host_stopping.load(Ordering::Acquire) {
+                *host_error.lock().unwrap() = Some(format!(
+                    "shell exited with {undelivered} bytes of pending input storage; delivery may be incomplete"
+                ));
+            }
+            request_repaint(&ctx);
         });
         Ok(Self {
             term,
             tx,
+            input_tx,
+            #[cfg(test)]
+            output_bytes,
+            #[cfg(test)]
+            input_bytes,
+            reader: Some(reader),
             alive,
             error,
             size,
@@ -638,13 +971,22 @@ impl Terminal {
             && self.lifecycle.try_lock().is_ok_and(|life| life.exited)
     }
     pub fn current_directory(&self) -> Result<PathBuf> {
-        if !self.alive.load(Ordering::Acquire) {
+        let lifecycle = self
+            .lifecycle
+            .lock()
+            .map_err(|_| anyhow::anyhow!("terminal process state unavailable"))?;
+        if !self.alive.load(Ordering::Acquire)
+            || self.stopping.load(Ordering::Acquire)
+            || lifecycle.exited
+        {
             return Ok(self.launch_directory.clone());
         }
         let pid = self
             .shell_pid
             .ok_or_else(|| anyhow::anyhow!("shell process ID unavailable"))?;
-        process_directory(pid)
+        let directory = process_directory(pid);
+        drop(lifecycle);
+        directory
     }
     pub fn shell_pid(&self) -> Option<u32> {
         self.shell_pid
@@ -664,7 +1006,7 @@ impl Terminal {
                 self.ctx.copy_text(text);
             }
             self.mode.store(term.mode().bits(), Ordering::Release);
-            self.ctx.request_repaint();
+            request_repaint(&self.ctx);
         }
         match action {
             SelectionAction::Enter => self.copy_mode = true,
@@ -686,19 +1028,28 @@ impl Terminal {
         self.send_input(bytes, true)
     }
     fn send_input(&self, bytes: Vec<u8>, follow_cursor: bool) -> Result<()> {
-        if bytes.len() > 64 * 1024 {
-            bail!("terminal input exceeds 64 KiB; split the paste into smaller parts");
-        }
-        if !self.alive.load(Ordering::Acquire) {
+        self.enqueue_input(bytes, None, follow_cursor)
+    }
+    fn enqueue_input(
+        &self,
+        bytes: Vec<u8>,
+        paste: Option<bool>,
+        follow_cursor: bool,
+    ) -> Result<()> {
+        if !self.alive.load(Ordering::Acquire) || self.stopping.load(Ordering::Acquire) {
             bail!("shell has exited");
         }
-        self.tx
-            .try_send(if follow_cursor {
-                Command::UserInput(bytes)
-            } else {
-                Command::Input(bytes)
-            })
-            .map_err(|_| anyhow::anyhow!("terminal input queue full; retry input"))
+        self.input_tx.send(bytes, paste, follow_cursor)?;
+        let _ = self.tx.try_send(Command::Wake);
+        Ok(())
+    }
+    #[cfg(test)]
+    pub(crate) fn output_bytes(&self) -> u64 {
+        self.output_bytes.load(Ordering::Relaxed)
+    }
+    #[cfg(test)]
+    pub(crate) fn input_bytes(&self) -> u64 {
+        self.input_bytes.load(Ordering::Relaxed)
     }
     pub fn resize(&mut self, size: Size) {
         if (self.size.cols != size.cols || self.size.rows != size.rows)
@@ -712,12 +1063,19 @@ impl Terminal {
     }
     pub fn paste(&self, s: &str) -> Result<()> {
         let bracketed = self.mode().contains(TermMode::BRACKETED_PASTE);
-        let clean = s.replace('\u{1b}', "");
-        self.input_at_cursor(if bracketed {
-            format!("\x1b[200~{clean}\x1b[201~").into_bytes()
-        } else {
-            clean.replace('\n', "\r").into_bytes()
-        })
+        if s.len()
+            > self
+                .input_tx
+                .budget
+                .limit
+                .saturating_sub(self.input_tx.budget.used.load(Ordering::Acquire))
+        {
+            bail!(
+                "terminal input buffer full ({} bytes maximum); nothing from this paste was sent",
+                self.input_tx.budget.limit
+            );
+        }
+        self.enqueue_input(s.as_bytes().to_vec(), Some(bracketed), true)
     }
     pub fn scroll(&self, lines: i32) -> Result<()> {
         if self.alive.load(Ordering::Acquire) {
@@ -730,7 +1088,7 @@ impl Terminal {
                 .try_lock()
                 .map_err(|_| anyhow::anyhow!("terminal state busy; retry scrolling"))?;
             term.scroll_display(Scroll::Delta(lines));
-            self.ctx.request_repaint();
+            request_repaint(&self.ctx);
         }
         Ok(())
     }
@@ -738,14 +1096,12 @@ impl Terminal {
 impl Drop for Terminal {
     fn drop(&mut self) {
         self.stopping.store(true, Ordering::Release);
-        if let Ok(mut life) = self.lifecycle.lock()
-            && !life.exited
-        {
-            let _ = life.killer.kill();
-        }
         let _ = self.tx.try_send(Command::Stop);
         if let Some(host) = self.host.take() {
             let _ = host.join();
+        }
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
         }
     }
 }
@@ -811,6 +1167,178 @@ mod tests {
         event::VoidListener,
         index::{Column, Line, Point},
     };
+    #[test]
+    fn repaint_requests_are_bounded_without_frames_and_promote_delayed_wakes() {
+        let ctx = Context::default();
+        for _ in 0..3 {
+            let _ = ctx.run(Default::default(), |_| {});
+        }
+        let immediate = Arc::new(AtomicUsize::new(0));
+        let observed = immediate.clone();
+        ctx.set_request_repaint_callback(move |info| {
+            if info.delay == Duration::ZERO {
+                observed.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        ctx.request_repaint_after(Duration::from_secs(5));
+        for _ in 0..100_000 {
+            request_repaint(&ctx);
+        }
+        assert_eq!(immediate.load(Ordering::Relaxed), 1);
+        let _ = ctx.run(Default::default(), |ctx| {
+            assert!(
+                ctx.repaint_causes().len() <= 2,
+                "hidden terminal accumulated repaint causes"
+            );
+        });
+        for _ in 0..100_000 {
+            request_repaint(&ctx);
+        }
+        let _ = ctx.run(Default::default(), |ctx| {
+            assert!(ctx.repaint_causes().len() <= 1);
+        });
+    }
+
+    #[test]
+    fn continuously_available_replies_cannot_starve_user_input() {
+        let (input_tx, input_rx) = sync_channel(1);
+        let (reply_tx, reply_rx) = sync_channel(2);
+        let mut prefer_reply = true;
+        reply_tx.send("reply").unwrap();
+        reply_tx.send("reply").unwrap();
+        for _ in 0..1_000 {
+            input_tx.send("user").unwrap();
+            assert_eq!(
+                next_input(&input_rx, &reply_rx, &mut prefer_reply),
+                Some("reply")
+            );
+            reply_tx.send("reply").unwrap();
+            assert_eq!(
+                next_input(&input_rx, &reply_rx, &mut prefer_reply),
+                Some("user")
+            );
+        }
+        assert_eq!(
+            next_input(&input_rx, &reply_rx, &mut prefer_reply),
+            Some("reply")
+        );
+        assert_eq!(
+            next_input(&input_rx, &reply_rx, &mut prefer_reply),
+            Some("reply")
+        );
+        input_tx.send("user").unwrap();
+        assert_eq!(
+            next_input(&input_rx, &reply_rx, &mut prefer_reply),
+            Some("user")
+        );
+        assert!(next_input(&input_rx, &reply_rx, &mut prefer_reply).is_none());
+    }
+
+    #[test]
+    fn input_admission_is_atomic_bounded_and_recovers_after_consumption() {
+        let (tx, rx) = sync_channel(1);
+        let sender = InputSender {
+            tx,
+            budget: Arc::new(InputBudget {
+                used: AtomicUsize::new(0),
+                limit: 16,
+            }),
+        };
+        sender.send(vec![1; 16], None, false).unwrap();
+        assert!(sender.send(vec![2; 1], None, false).is_err());
+        assert_eq!(sender.budget.used.load(Ordering::Acquire), 16);
+        let first = rx.recv().unwrap();
+        assert_eq!(first.bytes, [1; 16]);
+        assert!(rx.try_recv().is_err());
+        drop(first);
+        sender.send(vec![3; 8], None, false).unwrap();
+        assert!(sender.send(vec![4; 8], None, false).is_err());
+        assert_eq!(sender.budget.used.load(Ordering::Acquire), 8);
+        drop(rx.recv().unwrap());
+        assert_eq!(sender.budget.used.load(Ordering::Acquire), 0);
+        drop(rx);
+        assert!(sender.send(vec![5; 8], None, false).is_err());
+        assert_eq!(sender.budget.used.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn filtered_paste_yields_after_a_bounded_source_chunk() {
+        let (tx, rx) = sync_channel(1);
+        let sender = InputSender {
+            tx,
+            budget: Arc::new(InputBudget {
+                used: AtomicUsize::new(0),
+                limit: 4 * WRITE_CHUNK_BYTES,
+            }),
+        };
+        sender
+            .send(vec![0x1b; 4 * WRITE_CHUNK_BYTES], Some(false), false)
+            .unwrap();
+        let mut pending = PendingInput::new(rx.recv().unwrap());
+        let mut output = Vec::new();
+        for i in 1..=4 {
+            assert_eq!(pending.write(&mut output).unwrap(), 0);
+            assert_eq!(pending.offset, i * WRITE_CHUNK_BYTES);
+            assert_eq!(pending.complete(), i == 4);
+        }
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn paste_stream_preserves_utf8_framing_and_partial_write_order() {
+        struct SlowWriter {
+            bytes: Vec<u8>,
+            calls: usize,
+        }
+        impl Write for SlowWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.calls += 1;
+                if self.calls.is_multiple_of(3) {
+                    return Err(std::io::ErrorKind::WouldBlock.into());
+                }
+                let n = bytes.len().min(7);
+                self.bytes.extend_from_slice(&bytes[..n]);
+                Ok(n)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let text = "界é\n\x1b[201~".repeat(8_000);
+        for bracketed in [false, true] {
+            let (tx, rx) = sync_channel(1);
+            let sender = InputSender {
+                tx,
+                budget: Arc::new(InputBudget {
+                    used: AtomicUsize::new(0),
+                    limit: text.len(),
+                }),
+            };
+            sender
+                .send(text.as_bytes().to_vec(), Some(bracketed), true)
+                .unwrap();
+            let mut pending = PendingInput::new(rx.recv().unwrap());
+            let mut writer = SlowWriter {
+                bytes: Vec::new(),
+                calls: 0,
+            };
+            while !pending.complete() {
+                if let Err(error) = pending.write(&mut writer) {
+                    assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+                }
+            }
+            let clean = text.replace('\x1b', "");
+            let expected = if bracketed {
+                format!("\x1b[200~{clean}\x1b[201~")
+            } else {
+                clean.replace('\n', "\r")
+            };
+            assert_eq!(writer.bytes, expected.as_bytes());
+            drop(pending);
+            assert_eq!(sender.budget.used.load(Ordering::Acquire), 0);
+        }
+    }
+
     #[test]
     fn snapshot_is_rendered_text_without_control_sequences_or_hidden_content() {
         let mut term = Term::new(terminal_config(), &Size { cols: 40, rows: 3 }, VoidListener);
@@ -932,7 +1460,6 @@ mod tests {
         let replies = Arc::new(Mutex::new(Vec::new()));
         let listener = Listener {
             replies: replies.clone(),
-            ctx: Context::default(),
         };
         let mut term = Term::new(terminal_config(), &Size { cols: 20, rows: 5 }, listener);
         let mut parser: Processor = Processor::new();
@@ -964,6 +1491,321 @@ mod tests {
 #[cfg(test)]
 mod pty_tests {
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    #[ignore = "bounded terminal transport benchmark"]
+    fn transport_benchmark() {
+        use std::time::Instant;
+        for bytes in [32 * 1024, 256 * 1024, 4 * 1024 * 1024] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("received");
+            let mut command = CommandBuilder::new("/bin/sh");
+            command.args(["-c", "stty raw -echo; printf READY; exec cat > received"]);
+            let start = Instant::now();
+            let terminal = Terminal::spawn_command(
+                Uuid::new_v4(),
+                root.path(),
+                Path::new(""),
+                Context::default(),
+                command,
+            )
+            .unwrap();
+            let deadline = start + Duration::from_secs(10);
+            while !terminal.snapshot_output().contains("READY") {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let startup = start.elapsed();
+            let payload = "a界\n".repeat(bytes / 5);
+            let expected = payload.replace('\n', "\r");
+            let start = Instant::now();
+            let result = terminal.paste(&payload);
+            let submit = start.elapsed();
+            if result.is_ok() {
+                while !std::fs::metadata(&path).is_ok_and(|m| m.len() == expected.len() as u64) {
+                    assert!(Instant::now() < deadline, "paste timed out");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                assert_eq!(std::fs::read(&path).unwrap(), expected.as_bytes());
+            }
+            eprintln!(
+                "transport bytes={} startup_ms={:.3} submit_ms={:.3} completion_ms={:.3} result={:?}",
+                payload.len(),
+                startup.as_secs_f64() * 1000.0,
+                submit.as_secs_f64() * 1000.0,
+                start.elapsed().as_secs_f64() * 1000.0,
+                result
+            );
+        }
+        let root = tempfile::tempdir().unwrap();
+        let mut command = CommandBuilder::new("/bin/sh");
+        command.args([
+            "-c",
+            "stty raw -echo; printf READY; sleep 1; exec cat > received",
+        ]);
+        let mut terminal = Terminal::spawn_command(
+            Uuid::new_v4(),
+            root.path(),
+            Path::new(""),
+            Context::default(),
+            command,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !terminal.snapshot_output().contains("READY") {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        terminal.input(vec![b'x'; 60 * 1024]).unwrap();
+        std::thread::sleep(Duration::from_millis(10));
+        let start = Instant::now();
+        terminal.resize(Size {
+            cols: 101,
+            rows: 31,
+        });
+        while terminal.term.lock().unwrap().columns() != 101 {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        eprintln!(
+            "transport slow_consumer_resize_ms={:.3}",
+            start.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+
+    fn capture_terminal(root: &Path, prefix: &str) -> Terminal {
+        let mut command = CommandBuilder::new("/bin/sh");
+        command.args([
+            "-c",
+            &format!("stty raw -echo; printf 'READY'; {prefix} exec cat > received"),
+        ]);
+        let terminal = Terminal::spawn_command(
+            Uuid::new_v4(),
+            root,
+            Path::new(""),
+            Context::default(),
+            command,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !terminal.snapshot_output().contains("READY") {
+            assert!(
+                Instant::now() < deadline,
+                "capture process did not become ready"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        terminal
+    }
+
+    #[test]
+    fn large_paste_arrives_exactly_once_before_following_input() {
+        for bracketed in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let terminal = capture_terminal(root.path(), "");
+            if bracketed {
+                // Freeze the application mode at admission, as a real bracketed-paste app does.
+                terminal
+                    .mode
+                    .store(TermMode::BRACKETED_PASTE.bits(), Ordering::Release);
+            }
+            let text = "界é\n\x1b[201~".repeat(128 * 1024);
+            let clean = text.replace('\x1b', "");
+            let mut expected = if bracketed {
+                format!("\x1b[200~{clean}\x1b[201~")
+            } else {
+                clean.replace('\n', "\r")
+            };
+            expected.push_str("TRAILER");
+            terminal.paste(&text).unwrap();
+            terminal.input(b"TRAILER".to_vec()).unwrap();
+            let path = root.path().join("received");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !std::fs::metadata(&path).is_ok_and(|m| m.len() == expected.len() as u64) {
+                assert!(
+                    Instant::now() < deadline,
+                    "large paste did not finish: {:?}",
+                    terminal.error.lock().unwrap()
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert_eq!(std::fs::read(path).unwrap(), expected.as_bytes());
+            assert_eq!(terminal.input_bytes(), expected.len() as u64);
+            assert_eq!(terminal.output_bytes(), 5);
+            assert_eq!(terminal.input_tx.budget.used.load(Ordering::Acquire), 0);
+        }
+    }
+
+    #[test]
+    fn slow_input_consumer_does_not_block_resize_or_cancelled_teardown() {
+        for _ in 0..3 {
+            let root = tempfile::tempdir().unwrap();
+            let mut terminal = capture_terminal(root.path(), "sleep 10;");
+            let alive = terminal.alive.clone();
+            let budget = terminal.input_tx.budget.clone();
+            terminal.paste(&"x".repeat(2 * 1024 * 1024)).unwrap();
+            let start = Instant::now();
+            terminal.resize(Size {
+                cols: 101,
+                rows: 31,
+            });
+            while terminal.term.lock().unwrap().columns() != 101 {
+                assert!(
+                    start.elapsed() < Duration::from_millis(500),
+                    "blocked writer delayed resize"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(budget.used.load(Ordering::Acquire) > 0);
+            let start = Instant::now();
+            drop(terminal);
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "cancelled write blocked teardown"
+            );
+            assert!(!alive.load(Ordering::Acquire));
+            assert_eq!(budget.used.load(Ordering::Acquire), 0);
+        }
+    }
+
+    #[test]
+    fn protocol_replies_have_reserved_capacity_while_user_input_is_full() {
+        let root = tempfile::tempdir().unwrap();
+        let mut command = CommandBuilder::new("/bin/sh");
+        command.args(["-c", "stty raw -echo; printf READY; while [ ! -f go ]; do sleep 0.01; done; printf '\\033[6n'; sleep 0.1; exec cat > received"]);
+        let terminal = Terminal::spawn_with_input_limit(
+            Uuid::new_v4(),
+            root.path(),
+            Path::new(""),
+            Context::default(),
+            command,
+            None,
+            64 * 1024,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while terminal.output_bytes() < 5 {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        terminal.input(vec![b'x'; 64 * 1024]).unwrap();
+        assert_eq!(
+            terminal.input_tx.budget.used.load(Ordering::Acquire),
+            64 * 1024
+        );
+        assert!(terminal.input(vec![b'y']).is_err());
+        std::fs::write(root.path().join("go"), "").unwrap();
+        let mut expected = vec![b'x'; 64 * 1024];
+        expected.extend_from_slice(b"\x1b[1;6R");
+        while !std::fs::metadata(root.path().join("received"))
+            .is_ok_and(|m| m.len() == expected.len() as u64)
+        {
+            assert!(
+                terminal.error.lock().unwrap().is_none(),
+                "reply failed while user queue full"
+            );
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            std::fs::read(root.path().join("received")).unwrap(),
+            expected
+        );
+        terminal.input(b"recovered".to_vec()).unwrap();
+    }
+
+    #[test]
+    fn cancelling_backlogged_output_closes_pty_before_reaping() {
+        for _ in 0..8 {
+            let root = tempfile::tempdir().unwrap();
+            let mut command = CommandBuilder::new("/bin/sh");
+            command.args(["-c", "stty raw -echo; exec awk 'BEGIN { for (i=0; i<500000; i++) print \"pending-output\" }'"]);
+            let terminal = Terminal::spawn_command(
+                Uuid::new_v4(),
+                root.path(),
+                Path::new(""),
+                Context::default(),
+                command,
+            )
+            .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while terminal.output_bytes() < 16 * 1024 {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let (done, completed) = std::sync::mpsc::channel();
+            let teardown = std::thread::spawn(move || {
+                drop(terminal);
+                let _ = done.send(());
+            });
+            completed
+                .recv_timeout(Duration::from_secs(2))
+                .expect("PTY handles must close before reaping a child with pending output");
+            teardown.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn nonreading_protocol_consumer_fails_explicitly_without_deadlock() {
+        let root = tempfile::tempdir().unwrap();
+        let mut command = CommandBuilder::new("/bin/sh");
+        command.args(["-c", "stty raw -echo; exec awk 'BEGIN { for (i=0; i<400000; i++) printf \"\\033[6n\"; fflush(); system(\"sleep 5\") }'"]);
+        let terminal = Terminal::spawn_command(
+            Uuid::new_v4(),
+            root.path(),
+            Path::new(""),
+            Context::default(),
+            command,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !terminal.has_exited() {
+            assert!(
+                Instant::now() < deadline,
+                "protocol backlog deadlocked PTY workers"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(
+            terminal
+                .error
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|error| error.contains("protocol reply overflow"))
+        );
+        let start = Instant::now();
+        drop(terminal);
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn synchronized_output_flushes_on_timeout_and_process_exit() {
+        for ending in ["sleep 10", "exit 0"] {
+            let root = tempfile::tempdir().unwrap();
+            let mut command = CommandBuilder::new("/bin/sh");
+            command.args([
+                "-c",
+                &format!("printf '\\033[?2026hSYNC_VISIBLE'; {ending}"),
+            ]);
+            let terminal = Terminal::spawn_command(
+                Uuid::new_v4(),
+                root.path(),
+                Path::new(""),
+                Context::default(),
+                command,
+            )
+            .unwrap();
+            let start = Instant::now();
+            while !terminal.snapshot_output().contains("SYNC_VISIBLE") {
+                assert!(
+                    start.elapsed() < Duration::from_secs(3),
+                    "synchronized output stayed buffered after timeout or EOF"
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+    }
 
     fn claude_fixture(root: &Path) -> PathBuf {
         let bin = root.join("bin");
@@ -1392,6 +2234,11 @@ mod pty_tests {
             "retained output did not reach the clipboard command queue"
         );
         assert!(!terminal.copy_mode);
+        let launch = tempfile::tempdir().unwrap();
+        terminal.launch_directory = launch.path().to_path_buf();
+        terminal.shell_pid = Some(std::process::id());
+        terminal.alive.store(true, Ordering::Release);
+        assert_eq!(terminal.current_directory().unwrap(), launch.path());
         drop(terminal);
     }
     #[test]

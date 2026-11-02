@@ -82,9 +82,10 @@ pub fn select_word<T: EventListener>(term: &mut Term<T>, point: Point) {
     term.selection = Some(selection);
 }
 
-/// Called by the existing terminal control worker, preserving ordering with input/resize.
 pub fn apply<T: EventListener>(term: &mut Term<T>, action: SelectionAction) -> Option<String> {
-    if !term.mode().contains(TermMode::VI) && !matches!(action, SelectionAction::Exit) {
+    if !term.mode().contains(TermMode::VI)
+        && !matches!(action, SelectionAction::Exit | SelectionAction::Copy { .. })
+    {
         term.toggle_vi_mode();
     }
     match action {
@@ -135,7 +136,12 @@ pub fn apply<T: EventListener>(term: &mut Term<T>, action: SelectionAction) -> O
 mod tests {
     use super::*;
     use crate::terminal::Size;
-    use alacritty_terminal::{event::VoidListener, term::Config, vte::ansi::Processor};
+    use alacritty_terminal::{
+        event::VoidListener,
+        index::{Column, Line},
+        term::Config,
+        vte::ansi::Processor,
+    };
 
     fn terminal(text: &str) -> Term<VoidListener> {
         let mut term = Term::new(Config::default(), &Size { cols: 10, rows: 3 }, VoidListener);
@@ -164,6 +170,25 @@ mod tests {
                 Some(expected),
                 "{text:?} at {point:?}"
             );
+        }
+    }
+
+    #[test]
+    fn copying_preserves_pointer_selection_and_existing_copy_mode() {
+        for copy_mode in [false, true] {
+            let mut term = terminal("selected text");
+            if copy_mode {
+                apply(&mut term, SelectionAction::Enter);
+            }
+            select_word(&mut term, Point::new(Line(0), Column(0)));
+            let mode = *term.mode();
+            let selection = term.selection.clone();
+            assert_eq!(
+                apply(&mut term, SelectionAction::Copy { exit: false }).as_deref(),
+                Some("selected")
+            );
+            assert_eq!(*term.mode(), mode);
+            assert_eq!(term.selection, selection);
         }
     }
 

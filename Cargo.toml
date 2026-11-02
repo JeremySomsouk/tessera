@@ -1,6 +1,6 @@
 [package]
 name = "tessera"
-version = "0.12.2"
+version = "0.13.0"
 edition = "2024"
 license = "MIT"
 description = "A terminal workspace for durable work with Claude Code and Codex"
@@ -22,7 +22,9 @@ plist = "1"
 [dev-dependencies]
 tempfile = "3"
 
-[target.'cfg(target_os = "macos")'.dependencies]
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSBundle", "NSString", "NSError"] }

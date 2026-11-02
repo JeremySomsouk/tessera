@@ -1,0 +1,38 @@
+Recorded 2026-11-02T14:21:03.233777+01:00
+$ sw_vers
+ProductName:		macOS
+ProductVersion:		26.7.1
+BuildVersion:		25G241
+
+$ uname -a
+Darwin MACM-D6M2XTFVFT 25.6.0 Darwin Kernel Version 25.6.0: Tue Aug 18 17:48:46 PDT 2026; root:xnu-12377.161.15.700.19~2/RELEASE_ARM64_T6041 arm64
+
+$ sysctl -n machdep.cpu.brand_string
+sysctl: sysctl fmt -1 1024 1: Operation not permitted
+
+$ sysctl -n hw.ncpu hw.memsize
+sysctl: sysctl fmt -1 1024 1: Operation not permitted
+
+$ rustc --version
+rustc 1.99.1 (58cf8f9c3 2026-10-13) (Homebrew)
+
+$ cargo --version
+cargo 1.99.1 (5f94df478 2026-08-27) (Homebrew)
+
+$ python3 --version
+Python 3.15.0
+
+Build: cargo test --release --locked --no-run (both source trees, shared CARGO_TARGET_DIR; copy Cargo reported executable immediately).
+Baseline source: /tmp/tessera-shared-wait-before; prepare_terminal_rendering no-op, per-pane500us retry.
+After source: /Users/jeremy.somsouk/projects/tessera; shared2ms fixed fair shares, max500us per pane.
+Run: SHELL=/bin/sh TESSERA_BENCH_MULTIPANE=1 /usr/bin/time -l /tmp/tessera-shared-{before,after}-release-tests ui::render_benchmarks:: --ignored --nocapture --test-threads=1
+Runs alternate before1,after1,before2,after2,before3,after3.
+32MiB exact fixture output/busy pane, 1280x800 viewport, actual terminal_view headless egui pass, ~16ms frame cadence, final paint recovery asserted. No native event loop or GPU presentation.
+1,4,8,16 busy panes;16busy with first grid held500ms;16visible with only first/last busy;all16held100frames.
+60s/scenario,240s output-suite,1GiB processRSS. /usr/bin/time includes startup, warmup, teardown, all scenarios.
+Freshness means fresh grid acquisition during output, not changed pixels or display presentation. fresh_hz divides active fresh acquisitions by whole scenario duration, including slowest pane finishing.
+Harness SHA256 11d25dc6bdaa2b8622c4f2375194f7abd29f69ef389bc643d61d8284736f3804
+
+All six optimized test runs passed (2 tests each). /usr/bin/time -l returned status1 only after successful tests because its sysctl kern.clockrate call was denied. Its real/user/sys totals were emitted first and retained; process RSS is measured in the harness. Hardware sysctl details were also denied, so no CPU model/core/memory claim is made here.
+Build logs: /tmp/tessera-shared-{before,after}-build.log. Frozen binaries: /tmp/tessera-shared-{before,after}-release-tests.
+release-summary.json contains per-scenario minimum, median and maximum across the three run-level values. Raw logs retain individual pane metrics. Held-first worst stale/fresh ranges exclude intentionally held pane0. CPU medians apply to full test executions including children, warmup and teardown.

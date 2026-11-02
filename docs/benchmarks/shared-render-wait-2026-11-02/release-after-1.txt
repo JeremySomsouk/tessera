@@ -1,0 +1,64 @@
+
+running 2 tests
+test ui::render_benchmarks::benchmark_all_grids_held ... HELD panes=16 frames=100 frame_median_ms=2.220 frame_p95_ms=2.497 frame_max_ms=11.205 ui_clicks=100
+ok
+test ui::render_benchmarks::benchmark_multiple_busy_panes ... MULTIPANE scenario=busy panes=1 bytes_per_pane=33554432 frames=18 frame_median_ms=0.259 frame_p95_ms=0.784 frame_max_ms=0.784 over16ms_pct=0.0 ui_clicks=1 ui_click_frame_p95_ms=0.273 input_probes=1 input_ack_p95_ms=20.350 input_ack_max_ms=20.350 output_ms=333.943 mib_s=95.82 peak_rss_bytes=63733760
+PANE scenario=busy panes=1 index=0 fresh=17 cached=0 fresh_pct=100.0 max_stale_ms=20.327 fresh_hz=50.91
+MULTIPANE scenario=busy panes=4 bytes_per_pane=33554432 frames=33 frame_median_ms=0.636 frame_p95_ms=0.718 frame_max_ms=10.649 over16ms_pct=0.0 ui_clicks=1 ui_click_frame_p95_ms=0.667 input_probes=2 input_ack_p95_ms=20.741 input_ack_max_ms=20.741 output_ms=624.804 mib_s=204.86 peak_rss_bytes=142557184
+PANE scenario=busy panes=4 index=0 fresh=32 cached=0 fresh_pct=100.0 max_stale_ms=20.176 fresh_hz=51.22
+PANE scenario=busy panes=4 index=1 fresh=32 cached=0 fresh_pct=100.0 max_stale_ms=20.259 fresh_hz=51.22
+PANE scenario=busy panes=4 index=2 fresh=32 cached=0 fresh_pct=100.0 max_stale_ms=20.333 fresh_hz=51.22
+PANE scenario=busy panes=4 index=3 fresh=32 cached=0 fresh_pct=100.0 max_stale_ms=29.843 fresh_hz=51.22
+MULTIPANE scenario=busy panes=8 bytes_per_pane=33554432 frames=112 frame_median_ms=0.628 frame_p95_ms=0.901 frame_max_ms=8.118 over16ms_pct=0.0 ui_clicks=4 ui_click_frame_p95_ms=0.676 input_probes=5 input_ack_p95_ms=20.905 input_ack_max_ms=20.905 output_ms=2179.747 mib_s=117.44 peak_rss_bytes=211845120
+PANE scenario=busy panes=8 index=0 fresh=111 cached=0 fresh_pct=100.0 max_stale_ms=20.280 fresh_hz=50.92
+PANE scenario=busy panes=8 index=1 fresh=109 cached=1 fresh_pct=99.1 max_stale_ms=38.017 fresh_hz=50.01
+PANE scenario=busy panes=8 index=2 fresh=109 cached=0 fresh_pct=100.0 max_stale_ms=27.697 fresh_hz=50.01
+PANE scenario=busy panes=8 index=3 fresh=111 cached=0 fresh_pct=100.0 max_stale_ms=27.764 fresh_hz=50.92
+PANE scenario=busy panes=8 index=4 fresh=110 cached=1 fresh_pct=99.1 max_stale_ms=38.247 fresh_hz=50.46
+PANE scenario=busy panes=8 index=5 fresh=111 cached=0 fresh_pct=100.0 max_stale_ms=27.801 fresh_hz=50.92
+PANE scenario=busy panes=8 index=6 fresh=110 cached=1 fresh_pct=99.1 max_stale_ms=39.211 fresh_hz=50.46
+PANE scenario=busy panes=8 index=7 fresh=111 cached=0 fresh_pct=100.0 max_stale_ms=27.912 fresh_hz=50.92
+MULTIPANE scenario=busy panes=16 bytes_per_pane=33554432 frames=205 frame_median_ms=0.708 frame_p95_ms=14.026 frame_max_ms=23.432 over16ms_pct=4.4 ui_clicks=8 ui_click_frame_p95_ms=12.316 input_probes=8 input_ack_p95_ms=57.677 input_ack_max_ms=57.677 output_ms=3861.017 mib_s=132.61 peak_rss_bytes=291307520
+PANE scenario=busy panes=16 index=0 fresh=196 cached=2 fresh_pct=99.0 max_stale_ms=39.722 fresh_hz=50.76
+PANE scenario=busy panes=16 index=1 fresh=201 cached=3 fresh_pct=98.5 max_stale_ms=47.789 fresh_hz=52.06
+PANE scenario=busy panes=16 index=2 fresh=200 cached=1 fresh_pct=99.5 max_stale_ms=32.635 fresh_hz=51.80
+PANE scenario=busy panes=16 index=3 fresh=200 cached=4 fresh_pct=98.0 max_stale_ms=38.284 fresh_hz=51.80
+PANE scenario=busy panes=16 index=4 fresh=196 cached=4 fresh_pct=98.0 max_stale_ms=40.836 fresh_hz=50.76
+PANE scenario=busy panes=16 index=5 fresh=196 cached=6 fresh_pct=97.0 max_stale_ms=53.287 fresh_hz=50.76
+PANE scenario=busy panes=16 index=6 fresh=201 cached=3 fresh_pct=98.5 max_stale_ms=40.074 fresh_hz=52.06
+PANE scenario=busy panes=16 index=7 fresh=198 cached=2 fresh_pct=99.0 max_stale_ms=47.911 fresh_hz=51.28
+PANE scenario=busy panes=16 index=8 fresh=198 cached=5 fresh_pct=97.5 max_stale_ms=66.828 fresh_hz=51.28
+PANE scenario=busy panes=16 index=9 fresh=199 cached=5 fresh_pct=97.5 max_stale_ms=50.881 fresh_hz=51.54
+PANE scenario=busy panes=16 index=10 fresh=199 cached=4 fresh_pct=98.0 max_stale_ms=46.150 fresh_hz=51.54
+PANE scenario=busy panes=16 index=11 fresh=199 cached=3 fresh_pct=98.5 max_stale_ms=42.114 fresh_hz=51.54
+PANE scenario=busy panes=16 index=12 fresh=192 cached=7 fresh_pct=96.5 max_stale_ms=58.230 fresh_hz=49.73
+PANE scenario=busy panes=16 index=13 fresh=197 cached=7 fresh_pct=96.6 max_stale_ms=58.222 fresh_hz=51.02
+PANE scenario=busy panes=16 index=14 fresh=186 cached=7 fresh_pct=96.4 max_stale_ms=56.089 fresh_hz=48.17
+PANE scenario=busy panes=16 index=15 fresh=198 cached=6 fresh_pct=97.1 max_stale_ms=55.959 fresh_hz=51.28
+MULTIPANE scenario=held-first panes=16 bytes_per_pane=33554432 frames=202 frame_median_ms=0.659 frame_p95_ms=13.015 frame_max_ms=21.739 over16ms_pct=3.0 ui_clicks=8 ui_click_frame_p95_ms=15.154 input_probes=8 input_ack_p95_ms=40.580 input_ack_max_ms=40.580 output_ms=3834.457 mib_s=133.53 peak_rss_bytes=299139072
+PANE scenario=held-first panes=16 index=0 fresh=173 cached=28 fresh_pct=86.1 max_stale_ms=505.690 fresh_hz=45.12
+PANE scenario=held-first panes=16 index=1 fresh=189 cached=3 fresh_pct=98.4 max_stale_ms=39.068 fresh_hz=49.29
+PANE scenario=held-first panes=16 index=2 fresh=199 cached=1 fresh_pct=99.5 max_stale_ms=35.277 fresh_hz=51.90
+PANE scenario=held-first panes=16 index=3 fresh=199 cached=1 fresh_pct=99.5 max_stale_ms=38.909 fresh_hz=51.90
+PANE scenario=held-first panes=16 index=4 fresh=197 cached=3 fresh_pct=98.5 max_stale_ms=40.189 fresh_hz=51.38
+PANE scenario=held-first panes=16 index=5 fresh=199 cached=1 fresh_pct=99.5 max_stale_ms=36.949 fresh_hz=51.90
+PANE scenario=held-first panes=16 index=6 fresh=196 cached=3 fresh_pct=98.5 max_stale_ms=40.588 fresh_hz=51.12
+PANE scenario=held-first panes=16 index=7 fresh=195 cached=5 fresh_pct=97.5 max_stale_ms=40.185 fresh_hz=50.85
+PANE scenario=held-first panes=16 index=8 fresh=197 cached=3 fresh_pct=98.5 max_stale_ms=40.233 fresh_hz=51.38
+PANE scenario=held-first panes=16 index=9 fresh=196 cached=4 fresh_pct=98.0 max_stale_ms=40.405 fresh_hz=51.12
+PANE scenario=held-first panes=16 index=10 fresh=193 cached=5 fresh_pct=97.5 max_stale_ms=49.330 fresh_hz=50.33
+PANE scenario=held-first panes=16 index=11 fresh=195 cached=3 fresh_pct=98.5 max_stale_ms=47.645 fresh_hz=50.85
+PANE scenario=held-first panes=16 index=12 fresh=195 cached=5 fresh_pct=97.5 max_stale_ms=55.162 fresh_hz=50.85
+PANE scenario=held-first panes=16 index=13 fresh=194 cached=5 fresh_pct=97.5 max_stale_ms=54.093 fresh_hz=50.59
+PANE scenario=held-first panes=16 index=14 fresh=197 cached=2 fresh_pct=99.0 max_stale_ms=40.231 fresh_hz=51.38
+PANE scenario=held-first panes=16 index=15 fresh=190 cached=9 fresh_pct=95.5 max_stale_ms=54.095 fresh_hz=49.55
+MULTIPANE scenario=mixed-first panes=16 bytes_per_pane=33554432 frames=14 frame_median_ms=0.195 frame_p95_ms=0.497 frame_max_ms=0.497 over16ms_pct=0.0 ui_clicks=1 ui_click_frame_p95_ms=0.196 input_probes=1 input_ack_p95_ms=20.346 input_ack_max_ms=20.346 output_ms=251.300 mib_s=127.34 peak_rss_bytes=299958272
+PANE scenario=mixed-first panes=16 index=0 fresh=13 cached=0 fresh_pct=100.0 max_stale_ms=20.242 fresh_hz=51.73
+MULTIPANE scenario=mixed-last panes=16 bytes_per_pane=33554432 frames=14 frame_median_ms=0.195 frame_p95_ms=0.441 frame_max_ms=0.441 over16ms_pct=0.0 ui_clicks=1 ui_click_frame_p95_ms=0.195 input_probes=1 input_ack_p95_ms=20.310 input_ack_max_ms=20.310 output_ms=255.671 mib_s=125.16 peak_rss_bytes=300728320
+PANE scenario=mixed-last panes=16 index=15 fresh=13 cached=0 fresh_pct=100.0 max_stale_ms=20.029 fresh_hz=50.85
+ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 357 filtered out; finished in 23.40s
+
+       23.90 real        16.06 user        85.06 sys
+time: sysctl kern.clockrate: Operation not permitted

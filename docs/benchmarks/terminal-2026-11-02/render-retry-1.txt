@@ -1,0 +1,17 @@
+   Compiling tessera v0.12.2 (/Users/jeremy.somsouk/projects/tessera)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.52s
+     Running unittests src/main.rs (target/debug/deps/tessera-0b8bff1ed16336b9)
+
+running 1 test
+RENDER workload=build bytes=16777216 frames=57 fresh_passes=56 cached_passes=1 fresh_pct=98.2 median_ms=1.906 p95_ms=2.190 max_ms=3.174 max_without_fresh_ms=37.915 input_ack_ms=20.882 output_ms=1073.767
+RENDER workload=agent bytes=16777216 frames=56 fresh_passes=56 cached_passes=0 fresh_pct=100.0 median_ms=0.917 p95_ms=1.089 max_ms=1.795 max_without_fresh_ms=19.881 input_ack_ms=20.736 output_ms=1047.591
+test ui::render_tests::benchmark_heavy_output_rendering ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 347 filtered out; finished in 5.53s
+
+     Running tests/codex_cli.rs (target/debug/deps/codex_cli-22195149b07ce801)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+

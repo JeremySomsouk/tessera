@@ -379,6 +379,44 @@ impl App {
         }
     }
 
+    pub(super) fn visible_terminal_panes(&self, ctx: &egui::Context) -> usize {
+        self.windows
+            .iter()
+            .map(|(id, window)| {
+                if ctx.input(|input| {
+                    input
+                        .raw
+                        .viewports
+                        .get(id)
+                        .is_some_and(|info| info.minimized == Some(true))
+                }) {
+                    return 0;
+                }
+                let drawing = self.drawing_window == Some(*id);
+                let ui = if drawing { &self.ui } else { &window.ui };
+                if ui.radar_visible || ui.autobot_visible || ui.specifications_view || ui.overview {
+                    return 0;
+                }
+                let workspace = if drawing {
+                    self.saved.workspaces.get(ui.active)
+                } else {
+                    window.active.and_then(|active| {
+                        self.saved.workspaces.iter().find(|w| w.task.id == active)
+                    })
+                };
+                let Some(workspace) = workspace else {
+                    return 0;
+                };
+                if ui.maximized {
+                    return usize::from(self.panes.contains_key(&workspace.focus));
+                }
+                let mut ids = Vec::new();
+                workspace.layout.ids(&mut ids);
+                ids.iter().filter(|id| self.panes.contains_key(id)).count()
+            })
+            .sum()
+    }
+
     pub(super) fn show_windows(&mut self, ctx: &egui::Context) {
         self.handle_app_quit(ctx);
         if self.quitting {
@@ -399,6 +437,7 @@ impl App {
                 },
             );
         }
+        prepare_terminal_rendering(ctx, self.visible_terminal_panes(ctx));
         if self.windows.contains_key(&egui::ViewportId::ROOT) {
             self.draw_terminal_window(ctx, egui::ViewportId::ROOT);
         }
@@ -503,6 +542,60 @@ impl TerminalWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rendering_budget_counts_visible_live_panes_across_windows() {
+        let ctx = egui::Context::default();
+        let root = tempfile::tempdir().unwrap();
+        let mut app = super::super::render_tests::fixture(3);
+        let panes: Vec<_> = app.saved.workspaces.iter().map(|w| w.focus).collect();
+        let tabs: Vec<_> = app.saved.workspaces.iter().map(|w| w.task.id).collect();
+        let split = Uuid::new_v4();
+        for id in panes.iter().copied().chain([split]) {
+            assert!(app.spawn(id, &ctx, root.path().to_str().unwrap()));
+        }
+        app.saved.workspaces[0].layout.split(panes[0], split, true);
+        app.restore_windows(&ctx);
+        app.detach_workspace(&ctx, tabs[2], None);
+        let child = app.workspace_window(tabs[2]);
+        assert_eq!(app.visible_terminal_panes(&ctx), 3);
+        app.windows
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .ui
+            .maximized = true;
+        assert_eq!(app.visible_terminal_panes(&ctx), 2);
+        app.windows.get_mut(&child).unwrap().ui.overview = true;
+        assert_eq!(app.visible_terminal_panes(&ctx), 1);
+
+        let mut input = egui::RawInput::default();
+        input
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .minimized = Some(true);
+        let output = ctx.run(input, |ctx| assert_eq!(app.visible_terminal_panes(ctx), 0));
+        drop(output);
+        let mut input = egui::RawInput::default();
+        input
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .minimized = Some(false);
+        let output = ctx.run(input, |ctx| {
+            app.windows.get_mut(&child).unwrap().ui.overview = false;
+            std::mem::swap(
+                &mut app.ui,
+                &mut app.windows.get_mut(&egui::ViewportId::ROOT).unwrap().ui,
+            );
+            app.drawing_window = Some(egui::ViewportId::ROOT);
+            app.ui.active = 1;
+            assert_eq!(app.visible_terminal_panes(ctx), 2);
+            app.panes.remove(&panes[1]);
+            assert_eq!(app.visible_terminal_panes(ctx), 1);
+        });
+        drop(output);
+    }
 
     #[test]
     fn restored_geometry_does_not_reset_on_next_frame() {

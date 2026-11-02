@@ -1,0 +1,17 @@
+   Compiling tessera v0.12.2 (/Users/jeremy.somsouk/projects/tessera)
+    Finished `release` profile [optimized] target(s) in 9.88s
+     Running unittests src/main.rs (target/release/deps/tessera-d01b61ee11123069)
+
+running 1 test
+render_selection_bytes=960199
+render_frames=100 median_ms=0.316 p95_ms=0.432 max_ms=0.570
+test ui::render_tests::benchmark_terminal_rendering ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 349 filtered out; finished in 0.19s
+
+     Running tests/codex_cli.rs (target/release/deps/codex_cli-c84069b4a6c1a661)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+

@@ -1,0 +1,51 @@
+
+running 1 test
+SOAK seconds=1 cpu_s=0.636 peak_rss_bytes=44613632
+SOAK seconds=2 cpu_s=1.303 peak_rss_bytes=44630016
+SOAK seconds=3 cpu_s=1.973 peak_rss_bytes=44630016
+SOAK seconds=4 cpu_s=2.636 peak_rss_bytes=44630016
+SOAK seconds=5 cpu_s=3.276 peak_rss_bytes=44630016
+SOAK seconds=6 cpu_s=3.940 peak_rss_bytes=44630016
+SOAK seconds=7 cpu_s=4.603 peak_rss_bytes=44630016
+SOAK seconds=8 cpu_s=5.262 peak_rss_bytes=44630016
+SOAK seconds=9 cpu_s=5.929 peak_rss_bytes=44630016
+SOAK seconds=10 cpu_s=6.597 peak_rss_bytes=44630016
+SOAK seconds=11 cpu_s=7.271 peak_rss_bytes=44630016
+SOAK seconds=12 cpu_s=7.933 peak_rss_bytes=44630016
+SOAK seconds=13 cpu_s=8.598 peak_rss_bytes=44630016
+SOAK seconds=14 cpu_s=9.273 peak_rss_bytes=44630016
+SOAK seconds=15 cpu_s=9.950 peak_rss_bytes=44630016
+SOAK seconds=16 cpu_s=10.613 peak_rss_bytes=44630016
+SOAK seconds=17 cpu_s=11.262 peak_rss_bytes=44630016
+SOAK seconds=18 cpu_s=11.930 peak_rss_bytes=44630016
+SOAK seconds=19 cpu_s=12.601 peak_rss_bytes=44630016
+SOAK seconds=20 cpu_s=13.264 peak_rss_bytes=44630016
+SOAK seconds=21 cpu_s=13.921 peak_rss_bytes=44630016
+SOAK seconds=22 cpu_s=14.591 peak_rss_bytes=44630016
+SOAK seconds=23 cpu_s=15.264 peak_rss_bytes=44630016
+SOAK seconds=24 cpu_s=15.933 peak_rss_bytes=44630016
+SOAK seconds=25 cpu_s=16.596 peak_rss_bytes=44630016
+SOAK seconds=26 cpu_s=17.264 peak_rss_bytes=44630016
+SOAK seconds=27 cpu_s=17.935 peak_rss_bytes=44630016
+SOAK seconds=28 cpu_s=18.541 peak_rss_bytes=44630016
+SOAK seconds=29 cpu_s=19.195 peak_rss_bytes=44630016
+SOAK seconds=30 cpu_s=19.842 peak_rss_bytes=44630016
+SOAK seconds=31 cpu_s=20.517 peak_rss_bytes=44630016
+SOAK seconds=32 cpu_s=21.179 peak_rss_bytes=44630016
+SOAK seconds=33 cpu_s=21.833 peak_rss_bytes=44630016
+SOAK seconds=34 cpu_s=22.500 peak_rss_bytes=44630016
+SOAK seconds=35 cpu_s=23.170 peak_rss_bytes=44630016
+SOAK seconds=36 cpu_s=23.837 peak_rss_bytes=44630016
+SOAK seconds=37 cpu_s=24.481 peak_rss_bytes=44630016
+SOAK seconds=38 cpu_s=25.137 peak_rss_bytes=44630016
+SOAK seconds=39 cpu_s=25.807 peak_rss_bytes=44630016
+SOAK seconds=40 cpu_s=26.413 peak_rss_bytes=44630016
+SOAK seconds=41 cpu_s=27.065 peak_rss_bytes=44630016
+SOAK seconds=42 cpu_s=27.725 peak_rss_bytes=44630016
+SOAK seconds=43 cpu_s=28.399 peak_rss_bytes=44630016
+SOAK seconds=44 cpu_s=29.061 peak_rss_bytes=44630016
+SOAK_DONE bytes=268435456 elapsed_ms=44577.06 input_ack_ms=1.40
+test performance::terminal_soak ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 349 filtered out; finished in 46.25s
+

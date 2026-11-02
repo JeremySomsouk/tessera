@@ -1,0 +1,10 @@
+
+running 1 test
+test terminal::pty_tests::transport_benchmark ... transport bytes=32765 startup_ms=51.251 submit_ms=0.226 completion_ms=15.650 result=Ok(())
+transport bytes=262140 startup_ms=57.233 submit_ms=1.497 completion_ms=1.498 result=Err(terminal input exceeds 64 KiB; split the paste into smaller parts)
+transport bytes=4194300 startup_ms=64.839 submit_ms=26.098 completion_ms=26.099 result=Err(terminal input exceeds 64 KiB; split the paste into smaller parts)
+transport slow_consumer_resize_ms=1072.166
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 332 filtered out; finished in 1.63s
+

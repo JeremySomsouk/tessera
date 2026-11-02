@@ -1,0 +1,58 @@
+
+running 2 tests
+test ui::render_benchmarks::benchmark_all_grids_held ... HELD panes=16 frames=100 frame_median_ms=2.880 frame_p95_ms=7.534 frame_max_ms=12.723 ui_clicks=100
+ok
+test ui::render_benchmarks::benchmark_multiple_busy_panes ... MULTIPANE scenario=busy panes=1 bytes_per_pane=33554432 frames=124 frame_median_ms=2.285 frame_p95_ms=2.414 frame_max_ms=3.997 over16ms_pct=0.0 ui_clicks=5 ui_click_frame_p95_ms=2.409 input_probes=5 input_ack_p95_ms=61.261 input_ack_max_ms=61.261 output_ms=2338.532 mib_s=13.68 peak_rss_bytes=68698112
+PANE scenario=busy panes=1 index=0 fresh=121 cached=2 fresh_pct=98.4 max_stale_ms=49.657
+MULTIPANE scenario=busy panes=4 bytes_per_pane=33554432 frames=118 frame_median_ms=4.480 frame_p95_ms=5.212 frame_max_ms=14.034 over16ms_pct=0.0 ui_clicks=4 ui_click_frame_p95_ms=4.959 input_probes=5 input_ack_p95_ms=32.267 input_ack_max_ms=32.267 output_ms=2188.829 mib_s=58.48 peak_rss_bytes=147144704
+PANE scenario=busy panes=4 index=0 fresh=114 cached=1 fresh_pct=99.1 max_stale_ms=36.635
+PANE scenario=busy panes=4 index=1 fresh=114 cached=3 fresh_pct=97.4 max_stale_ms=34.533
+PANE scenario=busy panes=4 index=2 fresh=113 cached=3 fresh_pct=97.4 max_stale_ms=52.512
+PANE scenario=busy panes=4 index=3 fresh=114 cached=2 fresh_pct=98.3 max_stale_ms=44.452
+MULTIPANE scenario=busy panes=8 bytes_per_pane=33554432 frames=142 frame_median_ms=8.697 frame_p95_ms=38.407 frame_max_ms=88.103 over16ms_pct=28.9 ui_clicks=6 ui_click_frame_p95_ms=43.517 input_probes=6 input_ack_p95_ms=63.386 input_ack_max_ms=63.386 output_ms=3020.041 mib_s=84.77 peak_rss_bytes=217890816
+PANE scenario=busy panes=8 index=0 fresh=98 cached=43 fresh_pct=69.5 max_stale_ms=117.933
+PANE scenario=busy panes=8 index=1 fresh=93 cached=44 fresh_pct=67.9 max_stale_ms=106.653
+PANE scenario=busy panes=8 index=2 fresh=86 cached=48 fresh_pct=64.2 max_stale_ms=165.206
+PANE scenario=busy panes=8 index=3 fresh=82 cached=50 fresh_pct=62.1 max_stale_ms=138.286
+PANE scenario=busy panes=8 index=4 fresh=86 cached=52 fresh_pct=62.3 max_stale_ms=109.962
+PANE scenario=busy panes=8 index=5 fresh=78 cached=57 fresh_pct=57.8 max_stale_ms=166.288
+PANE scenario=busy panes=8 index=6 fresh=72 cached=62 fresh_pct=53.7 max_stale_ms=243.110
+PANE scenario=busy panes=8 index=7 fresh=66 cached=71 fresh_pct=48.2 max_stale_ms=187.546
+MULTIPANE scenario=busy panes=16 bytes_per_pane=33554432 frames=109 frame_median_ms=37.638 frame_p95_ms=110.693 frame_max_ms=157.068 over16ms_pct=88.1 ui_clicks=10 ui_click_frame_p95_ms=112.505 input_probes=10 input_ack_p95_ms=228.528 input_ack_max_ms=228.528 output_ms=5041.166 mib_s=101.56 peak_rss_bytes=385761280
+PANE scenario=busy panes=16 index=0 fresh=87 cached=16 fresh_pct=84.5 max_stale_ms=137.523
+PANE scenario=busy panes=16 index=1 fresh=84 cached=20 fresh_pct=80.8 max_stale_ms=172.379
+PANE scenario=busy panes=16 index=2 fresh=81 cached=24 fresh_pct=77.1 max_stale_ms=284.778
+PANE scenario=busy panes=16 index=3 fresh=81 cached=26 fresh_pct=75.7 max_stale_ms=213.226
+PANE scenario=busy panes=16 index=4 fresh=86 cached=24 fresh_pct=78.2 max_stale_ms=281.348
+PANE scenario=busy panes=16 index=5 fresh=77 cached=28 fresh_pct=73.3 max_stale_ms=214.934
+PANE scenario=busy panes=16 index=6 fresh=70 cached=32 fresh_pct=68.6 max_stale_ms=292.908
+PANE scenario=busy panes=16 index=7 fresh=71 cached=37 fresh_pct=65.7 max_stale_ms=215.204
+PANE scenario=busy panes=16 index=8 fresh=67 cached=37 fresh_pct=64.4 max_stale_ms=320.434
+PANE scenario=busy panes=16 index=9 fresh=71 cached=32 fresh_pct=68.9 max_stale_ms=358.153
+PANE scenario=busy panes=16 index=10 fresh=67 cached=36 fresh_pct=65.0 max_stale_ms=239.877
+PANE scenario=busy panes=16 index=11 fresh=55 cached=49 fresh_pct=52.9 max_stale_ms=288.915
+PANE scenario=busy panes=16 index=12 fresh=70 cached=33 fresh_pct=68.0 max_stale_ms=221.161
+PANE scenario=busy panes=16 index=13 fresh=60 cached=43 fresh_pct=58.3 max_stale_ms=415.921
+PANE scenario=busy panes=16 index=14 fresh=60 cached=44 fresh_pct=57.7 max_stale_ms=287.049
+PANE scenario=busy panes=16 index=15 fresh=65 cached=39 fresh_pct=62.5 max_stale_ms=290.493
+MULTIPANE scenario=held-first panes=16 bytes_per_pane=33554432 frames=115 frame_median_ms=37.047 frame_p95_ms=123.930 frame_max_ms=202.293 over16ms_pct=83.5 ui_clicks=11 ui_click_frame_p95_ms=136.781 input_probes=12 input_ack_p95_ms=252.005 input_ack_max_ms=252.005 output_ms=5627.846 mib_s=90.98 peak_rss_bytes=392052736
+PANE scenario=held-first panes=16 index=0 fresh=89 cached=25 fresh_pct=78.1 max_stale_ms=572.960
+PANE scenario=held-first panes=16 index=1 fresh=81 cached=23 fresh_pct=77.9 max_stale_ms=244.590
+PANE scenario=held-first panes=16 index=2 fresh=78 cached=24 fresh_pct=76.5 max_stale_ms=265.367
+PANE scenario=held-first panes=16 index=3 fresh=82 cached=19 fresh_pct=81.2 max_stale_ms=268.377
+PANE scenario=held-first panes=16 index=4 fresh=76 cached=25 fresh_pct=75.2 max_stale_ms=326.782
+PANE scenario=held-first panes=16 index=5 fresh=75 cached=27 fresh_pct=73.5 max_stale_ms=303.062
+PANE scenario=held-first panes=16 index=6 fresh=72 cached=34 fresh_pct=67.9 max_stale_ms=282.806
+PANE scenario=held-first panes=16 index=7 fresh=70 cached=35 fresh_pct=66.7 max_stale_ms=376.583
+PANE scenario=held-first panes=16 index=8 fresh=66 cached=34 fresh_pct=66.0 max_stale_ms=244.318
+PANE scenario=held-first panes=16 index=9 fresh=64 cached=36 fresh_pct=64.0 max_stale_ms=305.370
+PANE scenario=held-first panes=16 index=10 fresh=75 cached=31 fresh_pct=70.8 max_stale_ms=400.138
+PANE scenario=held-first panes=16 index=11 fresh=60 cached=38 fresh_pct=61.2 max_stale_ms=380.870
+PANE scenario=held-first panes=16 index=12 fresh=55 cached=48 fresh_pct=53.4 max_stale_ms=548.589
+PANE scenario=held-first panes=16 index=13 fresh=57 cached=41 fresh_pct=58.2 max_stale_ms=507.032
+PANE scenario=held-first panes=16 index=14 fresh=55 cached=46 fresh_pct=54.5 max_stale_ms=318.826
+PANE scenario=held-first panes=16 index=15 fresh=61 cached=39 fresh_pct=61.0 max_stale_ms=610.320
+ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 357 filtered out; finished in 26.27s
+

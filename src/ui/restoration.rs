@@ -26,27 +26,36 @@ pub(super) struct SavedPane {
 pub(super) struct Restoration {
     pub pending: HashMap<Uuid, Receiver<anyhow::Result<String>>>,
     pub resumed: HashSet<Uuid>,
+    retries: HashMap<Uuid, (Uuid, SavedPane)>,
     pub notices: HashMap<Uuid, String>,
     pub history: HashMap<Uuid, String>,
 }
 fn bounded(text: &str) -> String {
-    let lines: Vec<_> = text
-        .lines()
-        .rev()
-        .take(crate::terminal::SNAPSHOT_MAX_LINES)
-        .collect();
-    let text = lines.into_iter().rev().collect::<Vec<_>>().join("\n");
-    let mut start = text
-        .len()
-        .saturating_sub(crate::terminal::SNAPSHOT_MAX_BYTES);
-    while !text.is_char_boundary(start) {
-        start += 1;
+    let mut lines = Vec::new();
+    let mut bytes = 0;
+    for line in text.lines().rev().take(crate::terminal::SNAPSHOT_MAX_LINES) {
+        let separator = usize::from(!lines.is_empty());
+        let available = crate::terminal::SNAPSHOT_MAX_BYTES.saturating_sub(bytes + separator);
+        let mut start = line.len().saturating_sub(available);
+        while !line.is_char_boundary(start) {
+            start += 1;
+        }
+        lines.push(&line[start..]);
+        bytes += line.len() - start + separator;
+        if start != 0 || bytes >= crate::terminal::SNAPSHOT_MAX_BYTES {
+            break;
+        }
     }
-    text[start..]
-        .chars()
-        .filter(|c| !c.is_control() || *c == '\n')
-        .collect()
+    let mut output = String::with_capacity(bytes);
+    for (index, line) in lines.into_iter().rev().enumerate() {
+        if index != 0 {
+            output.push('\n');
+        }
+        output.extend(line.chars().filter(|c| !c.is_control() || *c == '\n'));
+    }
+    output
 }
+
 impl App {
     fn pane_conversation(&self, id: Uuid) -> Option<(Agent, String)> {
         self.saved
@@ -210,12 +219,62 @@ impl App {
         }
     }
     fn retry_resume(&mut self, id: Uuid, ctx: &egui::Context) {
-        if self.restoration.pending.contains_key(&id) {
+        self.restoration
+            .retries
+            .retain(|target, _| self.restoration.pending.contains_key(target));
+        if self.restoration.pending.contains_key(&id)
+            || self
+                .restoration
+                .retries
+                .values()
+                .any(|(source, _)| *source == id)
+        {
             return;
         }
         let Some(saved) = self.saved.restoration.panes.get(&id).cloned() else {
             return;
         };
+        if self.panes.contains_key(&id) {
+            if saved.conversation.is_none() {
+                return;
+            }
+            if self.saved.workspaces.len() + usize::from(self.folder_launch.is_some()) >= 32
+                || self.panes.len() + self.restoration.pending.len() >= 32
+            {
+                self.restoration.notices.insert(id, "Cannot retry: workspace/pane limit (32) reached. Close another terminal and try again. This terminal is unchanged.".into());
+                return;
+            }
+            let target = Uuid::new_v4();
+            self.saved.workspaces.push(Workspace {
+                task: Task {
+                    id: Uuid::new_v4(),
+                    title: format!("{} · resume", directory_name(&saved.directory)),
+                    directory: saved.directory.clone(),
+                    state: TaskState::Implementing,
+                },
+                custom_title: Some(true),
+                layout: Layout::Pane(target),
+                focus: target,
+            });
+            self.saved.restoration.panes.insert(target, saved.clone());
+            if let Some(history) = self.restoration.history.get(&id).cloned() {
+                self.restoration.history.insert(target, history);
+            }
+            self.register_workspace_window();
+            self.ui.active = self.saved.workspaces.len() - 1;
+            self.ui.maximized = false;
+            self.dirty = true;
+            self.retry_resume(target, ctx);
+            self.restoration.retries.insert(target, (id, saved));
+            self.restoration.notices.insert(id, "A retry was opened in a new workspace. This shell and saved conversation remain here until the retry starts successfully.".into());
+            self.saved
+                .restoration
+                .panes
+                .get_mut(&target)
+                .unwrap()
+                .conversation = None;
+            return;
+        }
         let directory = saved
             .resume_directory
             .clone()
@@ -225,18 +284,6 @@ impl App {
         };
         let ctx = ctx.clone();
         let (tx, rx) = channel();
-        if let Some(pane) = self.panes.remove(&id) {
-            let output = bounded(&format!(
-                "{}\n{}",
-                self.restoration
-                    .history
-                    .get(&id)
-                    .map(String::as_str)
-                    .unwrap_or(""),
-                pane.terminal.snapshot_output()
-            ));
-            self.restoration.history.insert(id, output);
-        }
         self.restoration.pending.insert(id, rx);
         self.restoration.notices.remove(&id);
         std::thread::spawn(move || {
@@ -266,6 +313,7 @@ impl App {
             .collect();
         for (id, result) in ready {
             self.restoration.pending.remove(&id);
+            let retry = self.restoration.retries.remove(&id);
             let directory = self.saved.restoration.panes[&id].directory.clone();
             let resume_directory = self.saved.restoration.panes[&id]
                 .resume_directory
@@ -282,6 +330,30 @@ impl App {
             });
             match result {
                 Ok(terminal) => {
+                    if let Some((source, saved)) = retry {
+                        if let Some(original) = self.saved.restoration.panes.get_mut(&source) {
+                            original.conversation = None;
+                            original.resume_directory = None;
+                            self.restoration.notices.insert(source, "Saved conversation moved to its new workspace. This shell remains running.".into());
+                        }
+                        for session in &mut self.saved.sessions {
+                            if session.pane == source
+                                && saved
+                                    .conversation
+                                    .as_ref()
+                                    .is_some_and(|(agent, identity)| {
+                                        session.agent == *agent && session.session_id == *identity
+                                    })
+                            {
+                                session.pane = id;
+                            }
+                        }
+                        if let Some(target) = self.saved.restoration.panes.get_mut(&id) {
+                            target.conversation = saved.conversation;
+                            target.resume_directory = saved.resume_directory;
+                        }
+                        self.dirty = true;
+                    }
                     self.panes.insert(
                         id,
                         Pane {
@@ -293,7 +365,15 @@ impl App {
                 }
                 Err(error) => {
                     self.fresh_restored_shell(id, ctx, &directory);
-                    self.restoration.notices.insert(id, format!("Conversation could not be resumed: {error:#}. Fresh shell ready. Saved identity and output are kept."));
+                    let recovery = if retry.is_some() {
+                        "Fresh shell ready. Retry from the original workspace; its saved identity and running shell are unchanged."
+                    } else {
+                        "Fresh shell ready. Saved identity and output are kept."
+                    };
+                    self.restoration.notices.insert(
+                        id,
+                        format!("Conversation could not be resumed: {error:#}. {recovery}"),
+                    );
                 }
             }
         }
@@ -329,7 +409,7 @@ impl App {
                 .id_salt(id)
                 .show(ui, |ui| {
                     egui::ScrollArea::vertical()
-                        .max_height(220.0)
+                        .max_height((ui.available_height() * 0.4).clamp(40.0, 220.0))
                         .show(ui, |ui| {
                             ui.add(
                                 egui::Label::new(RichText::new(output).monospace())
@@ -349,7 +429,7 @@ impl App {
                 .panes
                 .get(&id)
                 .is_some_and(|p| p.conversation.is_some())
-                && ui.button("Retry saved conversation").clicked()
+                && ui.button("Retry in new workspace").clicked()
             {
                 self.retry_resume(id, ctx);
             }
@@ -375,6 +455,103 @@ mod tests {
         app.capture_restoration();
         crate::snapshot::save(path, &app.saved).unwrap();
         crate::snapshot::load(path).unwrap().unwrap()
+    }
+
+    #[test]
+    #[ignore = "run with TESSERA_BENCH=1 for bounded restoration measurements"]
+    fn benchmark_restoration() {
+        if std::env::var_os("TESSERA_BENCH").is_none() {
+            return;
+        }
+        let ctx = egui::Context::default();
+        let root = tempfile::tempdir().unwrap();
+        let mut app = fixture(16);
+        app.saved.sessions.clear();
+        let history = format!("{}\n", "retained 界é output ".repeat(6)).repeat(2_000);
+        for workspace in &mut app.saved.workspaces {
+            workspace.task.directory = root.path().to_string_lossy().into_owned();
+            app.saved.restoration.panes.insert(
+                workspace.focus,
+                SavedPane {
+                    directory: workspace.task.directory.clone(),
+                    output: bounded(&history),
+                    ..Default::default()
+                },
+            );
+        }
+        let started = Instant::now();
+        app.restore_workspace(&ctx);
+        let startup = started.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(app.panes.len(), 16);
+        let mut capture = Vec::new();
+        for _ in 0..5 {
+            let started = Instant::now();
+            app.capture_restoration_with(true);
+            capture.push(started.elapsed().as_secs_f64() * 1000.0);
+        }
+        capture.sort_by(f64::total_cmp);
+        let path = root.path().join("snapshot.json");
+        let started = Instant::now();
+        crate::snapshot::save(&path, &app.saved).unwrap();
+        let first_save = started.elapsed().as_secs_f64() * 1000.0;
+        let started = Instant::now();
+        crate::snapshot::save(&path, &app.saved).unwrap();
+        let recovery_save = started.elapsed().as_secs_f64() * 1000.0;
+        let started = Instant::now();
+        let saved: Saved = crate::snapshot::load(&path).unwrap().unwrap();
+        let load = started.elapsed().as_secs_f64() * 1000.0;
+        let expected: HashMap<_, _> = saved
+            .restoration
+            .panes
+            .iter()
+            .map(|(id, pane)| (*id, pane.output.clone()))
+            .collect();
+        drop(app);
+        let mut restored = fixture(0);
+        restored.saved = saved;
+        let started = Instant::now();
+        restored.restore_workspace(&ctx);
+        let restore = started.elapsed().as_secs_f64() * 1000.0;
+        for (id, text) in expected {
+            assert_eq!(restored.restoration.history[&id], bounded(&text));
+        }
+        eprintln!(
+            "restore_panes=16 snapshot_bytes={} initial_ms={startup:.3} capture_median_ms={:.3} first_save_ms={first_save:.3} recovery_save_ms={recovery_save:.3} load_ms={load:.3} restore_ms={restore:.3}",
+            std::fs::metadata(path).unwrap().len(),
+            capture[2]
+        );
+    }
+
+    #[test]
+    fn bounded_history_matches_tail_retention_without_large_intermediates() {
+        fn reference(text: &str) -> String {
+            let lines: Vec<_> = text
+                .lines()
+                .rev()
+                .take(crate::terminal::SNAPSHOT_MAX_LINES)
+                .collect();
+            let text = lines.into_iter().rev().collect::<Vec<_>>().join("\n");
+            let mut start = text
+                .len()
+                .saturating_sub(crate::terminal::SNAPSHOT_MAX_BYTES);
+            while !text.is_char_boundary(start) {
+                start += 1;
+            }
+            text[start..]
+                .chars()
+                .filter(|c| !c.is_control() || *c == '\n')
+                .collect()
+        }
+        for text in [
+            String::new(),
+            "\n\ntext\n\n".into(),
+            "\x1b\n\x07\ntext\r\n".into(),
+            "界é".repeat(200_000),
+            "one\n\n界é\n".repeat(20_000),
+            format!("{}\nend", "界é".repeat(60_000)),
+        ] {
+            assert_eq!(bounded(&text), reference(&text));
+        }
     }
 
     #[test]
@@ -564,6 +741,96 @@ mod tests {
         final_reopen.restore_workspace(&ctx);
         assert!(final_reopen.panes.is_empty());
         assert!(final_reopen.saved.workspaces.is_empty());
+    }
+
+    #[test]
+    fn retry_preserves_live_shell_and_failure_stays_in_new_workspace() {
+        let ctx = egui::Context::default();
+        let root = tempfile::tempdir().unwrap();
+        let mut app = fixture(0);
+        assert!(app.add_workspace_in(&ctx, root.path().to_string_lossy().into_owned()));
+        let original = app.saved.workspaces[0].focus;
+        let pid = app.panes[&original].terminal.shell_pid();
+        app.saved.restoration.panes.insert(
+            original,
+            SavedPane {
+                directory: root.path().to_string_lossy().into_owned(),
+                conversation: Some((Agent::Claude, "invalid-saved-identity".into())),
+                output: "saved history".into(),
+                ..Default::default()
+            },
+        );
+        app.restoration
+            .history
+            .insert(original, "saved history".into());
+        app.retry_resume(original, &ctx);
+        let target = app.saved.workspaces[1].focus;
+        assert_ne!(original, target);
+        assert_eq!(app.panes[&original].terminal.shell_pid(), pid);
+        assert!(!app.restoration.pending.contains_key(&original));
+        assert!(app.restoration.pending.contains_key(&target));
+        assert_eq!(app.restoration.history[&target], "saved history");
+        app.retry_resume(original, &ctx);
+        assert_eq!(app.saved.workspaces.len(), 2, "one retry per source");
+        app.capture_restoration();
+        assert!(
+            app.saved.restoration.panes[&original]
+                .conversation
+                .is_some()
+        );
+        assert!(app.saved.restoration.panes[&target].conversation.is_none());
+        wait_for(|| {
+            app.poll_restoration(&ctx);
+            !app.restoration.pending.contains_key(&target)
+        });
+        assert_eq!(app.panes[&original].terminal.shell_pid(), pid);
+        assert!(app.restoration.notices[&target].contains("could not be resumed"));
+        assert!(app.panes.contains_key(&target));
+        assert!(
+            app.saved.restoration.panes[&original]
+                .conversation
+                .is_some()
+        );
+        assert!(app.saved.restoration.panes[&target].conversation.is_none());
+        app.retry_resume(original, &ctx);
+        let successful = app.saved.workspaces[2].focus;
+        let (tx, rx) = channel();
+        app.restoration.pending.insert(successful, rx);
+        tx.send(Ok("/bin/sh -c 'sleep 30'".into())).unwrap();
+        app.poll_restoration(&ctx);
+        assert!(app.restoration.resumed.contains(&successful));
+        app.capture_restoration();
+        assert!(
+            app.saved.restoration.panes[&original]
+                .conversation
+                .is_none()
+        );
+        assert!(
+            app.saved.restoration.panes[&successful]
+                .conversation
+                .is_some()
+        );
+        assert_eq!(
+            app.saved
+                .restoration
+                .panes
+                .values()
+                .filter(|p| p.conversation.is_some())
+                .count(),
+            1
+        );
+        assert_eq!(app.panes[&original].terminal.shell_pid(), pid);
+        assert_ne!(app.panes[&successful].terminal.shell_pid(), pid);
+        app.panes[&original]
+            .terminal
+            .input(b"printf 'STILL_%s\\n' ALIVE\n".to_vec())
+            .unwrap();
+        wait_for(|| {
+            app.panes[&original]
+                .terminal
+                .snapshot_output()
+                .contains("STILL_ALIVE")
+        });
     }
 
     #[test]

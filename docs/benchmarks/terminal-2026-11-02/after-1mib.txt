@@ -1,0 +1,21 @@
+
+running 1 test
+BENCH workload=build sessions=1 bytes_per_session=1048576 startup_ms=1524.20 input_ack_ms=1.59 output_ms=66.60 mib_s=15.02 busy_pct=94.3 max_probe_us=171 snapshot_ms=7.58 snapshot_bytes=133877 teardown_ms=63.49
+RESOURCES cumulative_cpu_s=0.191 peak_rss_bytes=44531712
+BENCH workload=build sessions=4 bytes_per_session=1048576 startup_ms=2770.16 input_ack_ms=1.70 output_ms=73.34 mib_s=54.54 busy_pct=92.5 max_probe_us=419 snapshot_ms=32.62 snapshot_bytes=535508 teardown_ms=270.48
+RESOURCES cumulative_cpu_s=0.759 peak_rss_bytes=130236416
+BENCH workload=agent sessions=1 bytes_per_session=1048576 startup_ms=1522.46 input_ack_ms=1.58 output_ms=73.88 mib_s=13.54 busy_pct=97.5 max_probe_us=112 snapshot_ms=9.45 snapshot_bytes=67936 teardown_ms=55.18
+RESOURCES cumulative_cpu_s=0.967 peak_rss_bytes=131727360
+BENCH workload=agent sessions=4 bytes_per_session=1048576 startup_ms=2731.58 input_ack_ms=0.48 output_ms=81.97 mib_s=48.80 busy_pct=94.6 max_probe_us=391 snapshot_ms=40.76 snapshot_bytes=271744 teardown_ms=251.45
+RESOURCES cumulative_cpu_s=1.577 peak_rss_bytes=136019968
+BENCH workload=line sessions=1 bytes_per_session=1048576 startup_ms=1467.33 input_ack_ms=0.16 output_ms=63.12 mib_s=15.84 busy_pct=90.9 max_probe_us=123 snapshot_ms=6.15 snapshot_bytes=201885 teardown_ms=56.03
+RESOURCES cumulative_cpu_s=1.767 peak_rss_bytes=136019968
+BENCH workload=line sessions=4 bytes_per_session=1048576 startup_ms=2716.35 input_ack_ms=1.82 output_ms=67.81 mib_s=58.99 busy_pct=91.4 max_probe_us=459 snapshot_ms=25.61 snapshot_bytes=807540 teardown_ms=261.44
+RESOURCES cumulative_cpu_s=2.310 peak_rss_bytes=137461760
+test performance::terminal_workloads ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 349 filtered out; finished in 14.24s
+
+real 14.77
+user 3.90
+sys 4.80

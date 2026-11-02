@@ -80,8 +80,9 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 pub fn save<T: Serialize + DeserializeOwned>(path: &Path, value: &T) -> Result<()> {
-    let bytes = serde_json::to_vec(value)?;
-    ensure!(bytes.len() <= MAX_BYTES, "Snapshot exceeds 32 MiB");
+    let mut encoded = BoundedSnapshot(Vec::new());
+    serde_json::to_writer(&mut encoded, value)?;
+    let bytes = encoded.0;
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(parent)?;
     }
@@ -92,6 +93,22 @@ pub fn save<T: Serialize + DeserializeOwned>(path: &Path, value: &T) -> Result<(
         atomic_write(&sibling(path, ".bak"), &previous)?;
     }
     atomic_write(path, &bytes)
+}
+
+struct BoundedSnapshot(Vec<u8>);
+
+impl Write for BoundedSnapshot {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > MAX_BYTES - self.0.len() {
+            return Err(std::io::Error::other("Snapshot exceeds 32 MiB"));
+        }
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -169,6 +186,32 @@ mod tests {
             .set_len(MAX_BYTES as u64 + 1)
             .unwrap();
         assert!(load::<State>(&path).is_err());
+    }
+
+    #[test]
+    fn serialization_stops_at_budget_before_materializing_the_whole_value() {
+        use serde::ser::SerializeSeq;
+        use std::cell::Cell;
+
+        struct LargeSequence<'a>(&'a Cell<usize>);
+        impl Serialize for LargeSequence<'_> {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                let block = "x".repeat(1024 * 1024);
+                let mut sequence = serializer.serialize_seq(Some(1024))?;
+                for index in 0..1024 {
+                    self.0.set(index + 1);
+                    sequence.serialize_element(&block)?;
+                }
+                sequence.end()
+            }
+        }
+
+        let visited = Cell::new(0);
+        let mut encoded = BoundedSnapshot(Vec::new());
+        let error = serde_json::to_writer(&mut encoded, &LargeSequence(&visited)).unwrap_err();
+        assert!(error.to_string().contains("Snapshot exceeds 32 MiB"));
+        assert!(encoded.0.len() <= MAX_BYTES);
+        assert_eq!(visited.get(), 32);
     }
 
     #[cfg(unix)]

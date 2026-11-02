@@ -29,6 +29,9 @@ mod merge_radar;
 mod remote_runs;
 mod remote_settings;
 mod remote_workers;
+#[cfg(test)]
+mod render_benchmarks;
+mod render_budget;
 mod restoration;
 mod windows;
 const ACCENT: Color32 = Color32::from_rgb(130, 198, 180);
@@ -450,6 +453,9 @@ enum CommandPage {
 }
 
 struct FolderLaunch {
+    name: String,
+    kind: u8,
+    page: CommandPage,
     pane: Uuid,
     window: egui::ViewportId,
     receiver: std::sync::mpsc::Receiver<anyhow::Result<(Uuid, PathBuf, Terminal)>>,
@@ -478,6 +484,7 @@ struct WindowUi {
     error: String,
     new_directory: String,
     new_workspace_name: String,
+    launch_kind: u8,
     palette: bool,
     command_page: CommandPage,
     command_index: usize,
@@ -523,6 +530,7 @@ impl Default for WindowUi {
                 .to_string_lossy()
                 .into_owned(),
             new_workspace_name: String::new(),
+            launch_kind: 0,
             palette: false,
             command_page: CommandPage::Commands,
             command_index: 0,
@@ -542,6 +550,7 @@ impl Default for WindowUi {
 }
 
 pub struct App {
+    attention_origin: Option<Uuid>,
     restoration: restoration::Restoration,
     ui: WindowUi,
     windows: HashMap<egui::ViewportId, TerminalWindow>,
@@ -652,6 +661,7 @@ impl App {
             direct_launches: HashMap::new(),
             remote_panes: Default::default(),
             restoration: Default::default(),
+            attention_origin: None,
         };
         match endpoint {
             Ok(e) => app.endpoint = Some(e),
@@ -761,6 +771,9 @@ impl App {
             self.ui.error = "Workspace/pane limit (32) reached".into();
             return false;
         }
+        if self.folder_launch.is_some() {
+            return false;
+        }
         let directory = match self.prepare_directory(&self.ui.new_directory.clone()) {
             Ok(directory) => directory,
             Err(error) => {
@@ -768,6 +781,10 @@ impl App {
                 return false;
             }
         };
+        if self.ui.launch_kind != 0 {
+            self.launch_folder(ctx, PathBuf::from(&directory));
+            return false;
+        }
         if !self.add_workspace_in(ctx, directory.clone()) {
             return false;
         }
@@ -899,6 +916,9 @@ impl App {
         }
     }
     fn stop_terminal(&mut self, id: Uuid) {
+        if self.attention_origin == Some(id) {
+            self.attention_origin = None;
+        }
         self.remote_panes.remove(&id);
         self.saved.restoration.panes.remove(&id);
         self.restoration.pending.remove(&id);
@@ -1079,7 +1099,7 @@ impl App {
             }
         }
         self.dirty |= self.sync_work();
-        if self.saved.sessions.iter().any(|s| s.work_id.is_none()) {
+        if self.ui.overview && self.saved.sessions.iter().any(|s| s.work_id.is_none()) {
             self.ui.error = "Work limit (256) reached. Existing work is kept; attach ungrouped sessions to existing work.".into();
         }
         let exited: Vec<_> = self
@@ -1097,10 +1117,10 @@ impl App {
                 *reported = Some(code);
                 if code != 0 {
                     self.ui.error = if code == 127 {
-                        "Claude Code was not found in your login shell PATH. Check that `claude` works in a terminal, then retry Claude in folder. Output is kept in this pane.".into()
+                        "The agent command was not found in your login shell PATH. Check its installation, then start a new workspace. Output is kept in this pane.".into()
                     } else {
                         format!(
-                            "Claude Code exited with code {code}. Read the terminal output, check the directory and authentication, then retry Claude in folder."
+                            "Agent exited with code {code}. Read the terminal output, check the directory and authentication, then start a new workspace."
                         )
                     };
                 }
@@ -1133,6 +1153,7 @@ impl App {
             }
             // Agent launches retain their output until explicitly closed.
             if !linked
+                && code == Some(0)
                 && !self.remote_panes.contains(&id)
                 && !self.restoration.pending.contains_key(&id)
                 && !self.restoration.resumed.contains(&id)
@@ -1173,6 +1194,50 @@ impl App {
             self.focus_workspace(index);
         }
     }
+    fn focus_pane(&mut self, pane: Uuid) {
+        if let Some(index) = self
+            .saved
+            .workspaces
+            .iter()
+            .position(|w| layout_contains(&w.layout, pane))
+        {
+            self.saved.workspaces[index].focus = pane;
+            self.focus_workspace(index);
+            self.ui.maximized = false;
+        }
+    }
+
+    fn next_attention(&mut self) {
+        let current = self.saved.workspaces.get(self.ui.active).map(|w| w.focus);
+        let targets: Vec<_> = self
+            .saved
+            .workspaces
+            .iter()
+            .flat_map(|w| {
+                let mut ids = Vec::new();
+                w.layout.ids(&mut ids);
+                ids
+            })
+            .filter(|id| {
+                self.panes.contains_key(id)
+                    && self
+                        .saved
+                        .sessions
+                        .iter()
+                        .any(|s| s.pane == *id && s.state.attention())
+            })
+            .collect();
+        if !targets.is_empty() {
+            let next = current
+                .and_then(|id| targets.iter().position(|p| *p == id))
+                .map_or(0, |i| (i + 1) % targets.len());
+            if self.attention_origin.is_none() {
+                self.attention_origin = current;
+            }
+            self.focus_pane(targets[next]);
+        }
+    }
+
     fn begin_rename(&mut self) {
         if let Some(workspace) = self.saved.workspaces.get(self.ui.active) {
             self.ui.rename = Some(WorkspaceRename {
@@ -1374,11 +1439,8 @@ impl App {
         {
             self.request_stop_terminal(id);
         }
-        if ctx.input_mut(|i| i.consume_key(command | Modifiers::SHIFT, Key::N))
-            && let Some(s) = self.saved.sessions.iter().find(|s| s.state.attention())
-        {
-            let id = s.key();
-            self.focus_session(&id);
+        if ctx.input_mut(|i| i.consume_key(command | Modifiers::SHIFT, Key::N)) {
+            self.next_attention();
         }
         let workspaces = self.window_workspaces();
         if let Some(slot) =
@@ -2179,6 +2241,9 @@ impl App {
 }
 impl App {
     fn open_commands(&mut self, page: CommandPage) {
+        if page == CommandPage::Folders {
+            self.ui.launch_kind = 1;
+        }
         self.ui.palette = true;
         self.ui.command_page = page;
         self.ui.command_index = 0;
@@ -2283,18 +2348,31 @@ impl App {
                         self.ui.overview = true;
                         self.ui.specifications_view = false;
                     }
-                    if ui
-                        .selectable_label(self.ui.radar_visible, "Merge Radar")
-                        .clicked()
-                    {
-                        self.open_merge_radar();
-                    }
-                    if self.remote_available()
-                        && ui
-                            .selectable_label(self.ui.autobot_visible, "Autobot")
+                    if wide {
+                        if ui
+                            .selectable_label(self.ui.radar_visible, "Merge Radar")
                             .clicked()
-                    {
-                        self.open_remote_runs(String::new(), ctx);
+                        {
+                            self.open_merge_radar();
+                        }
+                        if self.remote_available()
+                            && ui
+                                .selectable_label(self.ui.autobot_visible, "Autobot")
+                                .clicked()
+                        {
+                            self.open_remote_runs(String::new(), ctx);
+                        }
+                    } else {
+                        ui.menu_button("More", |ui| {
+                            if ui.button("Merge Radar").clicked() {
+                                self.open_merge_radar();
+                                ui.close();
+                            }
+                            if self.remote_available() && ui.button("Autobot").clicked() {
+                                self.open_remote_runs(String::new(), ctx);
+                                ui.close();
+                            }
+                        });
                     }
                     if wide {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2321,10 +2399,34 @@ impl App {
     }
 
     fn chrome_actions(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, wide: bool) {
-        if ui
-            .button("Settings")
-            .on_hover_text(shortcut("Settings", ","))
-            .clicked()
+        let count = self
+            .saved
+            .sessions
+            .iter()
+            .filter(|s| s.state.attention() && self.panes.contains_key(&s.pane))
+            .map(|s| s.pane)
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        if count > 0
+            && ui
+                .button(format!("Attention {count}"))
+                .on_hover_text(shortcut("Next session needing attention", "Shift+N"))
+                .clicked()
+        {
+            self.next_attention();
+        }
+        if let Some(origin) = self.attention_origin
+            && ui.button("Back to terminal").clicked()
+        {
+            self.attention_origin = None;
+            self.focus_pane(origin);
+        }
+
+        if wide
+            && ui
+                .button("Settings")
+                .on_hover_text(shortcut("Settings", ","))
+                .clicked()
         {
             self.open_commands(CommandPage::Settings);
         }
@@ -2342,17 +2444,18 @@ impl App {
         {
             self.open_commands(CommandPage::Commands);
         }
-        if ui
-            .add(
-                egui::Button::new(if wide {
-                    "Claude in folder"
-                } else {
-                    "Claude…"
-                })
-                .fill(ui.visuals().selection.bg_fill),
-            )
-            .on_hover_text(shortcut("Search folders and launch Claude Code", "Shift+L"))
-            .clicked()
+        if wide
+            && ui
+                .add(
+                    egui::Button::new(if wide {
+                        "Claude in folder"
+                    } else {
+                        "Claude…"
+                    })
+                    .fill(ui.visuals().selection.bg_fill),
+                )
+                .on_hover_text(shortcut("Search folders and launch Claude Code", "Shift+L"))
+                .clicked()
         {
             self.open_commands(CommandPage::Folders);
         }
@@ -2408,7 +2511,7 @@ impl App {
     fn workspace_actions(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         if ui
             .button(if self.ui.maximized {
-                "Restore pane"
+                "Restore splits"
             } else {
                 "Maximize pane"
             })
@@ -2438,6 +2541,7 @@ impl App {
         pane_action: &mut Option<(Uuid, &'static str)>,
     ) {
         let mut detach = None;
+        let mut rename = None;
         let mut focus = None;
         for (slot, index) in self.window_workspaces().into_iter().enumerate() {
             let w = &self.saved.workspaces[index];
@@ -2498,6 +2602,10 @@ impl App {
                 self.dragged_workspace = Some(w.task.id);
             }
             response.context_menu(|ui| {
+                if ui.button(shortcut("Rename workspace", "Shift+R")).clicked() {
+                    rename = Some(index);
+                    ui.close();
+                }
                 if ui.button("Move to new window").clicked() {
                     detach = Some(w.task.id);
                     ui.close();
@@ -2533,6 +2641,10 @@ impl App {
         }
         if let Some(index) = focus {
             self.focus_workspace(index);
+        }
+        if let Some(index) = rename {
+            self.focus_workspace(index);
+            self.begin_rename();
         }
         if let Some(workspace) = detach {
             self.detach_workspace(ui.ctx(), workspace, None);
@@ -2617,7 +2729,11 @@ impl App {
                         )
                         .auto_shrink([false, true])
                         .show(ui, |ui| match page {
-                            CommandPage::Create => self.workspace_form(ui),
+                            CommandPage::Create => {
+                                ui.add_enabled_ui(self.folder_launch.is_none(), |ui| {
+                                    self.workspace_form(ui)
+                                });
+                            }
                             CommandPage::Settings => self.settings(ui, ctx),
                             CommandPage::Commands | CommandPage::Folders => {}
                         });
@@ -2625,9 +2741,20 @@ impl App {
                 if page == CommandPage::Create {
                     ui.add_space(12.0);
                     let create = ui
-                        .add_enabled_ui(!self.ui.new_directory.trim().is_empty(), |ui| {
-                            primary_button(ui, "Create workspace")
-                        })
+                        .add_enabled_ui(
+                            self.folder_launch.is_none()
+                                && !self.ui.new_directory.trim().is_empty(),
+                            |ui| {
+                                primary_button(
+                                    ui,
+                                    if self.folder_launch.is_some() {
+                                        "Starting…"
+                                    } else {
+                                        "Create workspace"
+                                    },
+                                )
+                            },
+                        )
                         .inner;
                     if create.clicked()
                         || submit == Some(egui::Id::new("workspace-directory"))
@@ -2652,11 +2779,17 @@ impl App {
         if ui.ctx().content_rect().height() >= 500.0 {
             ui.label(RichText::new("Start a new workspace").size(18.0).strong());
             ui.label(
-                RichText::new("A login shell in the directory you choose.")
+                RichText::new("A shell or agent in the directory you choose.")
                     .color(ui.visuals().weak_text_color()),
             );
             ui.add_space(16.0);
         }
+        ui.horizontal(|ui| {
+            ui.label("Start");
+            for (kind, label) in [(0, "Shell"), (1, "Claude Code"), (2, "Codex")] {
+                ui.selectable_value(&mut self.ui.launch_kind, kind, label);
+            }
+        });
         let label = ui.label("Working directory");
         let directory = ui
             .add(
@@ -2734,7 +2867,32 @@ impl App {
                 results.push(CommandAction::Workspace(index));
             }
         }
+        for w in &self.saved.workspaces {
+            let mut ids = Vec::new();
+            w.layout.ids(&mut ids);
+            for id in ids {
+                let agent = self
+                    .saved
+                    .sessions
+                    .iter()
+                    .rev()
+                    .find(|s| s.pane == id)
+                    .map(|s| s.agent.label())
+                    .unwrap_or("Shell");
+                if format!("{} {} {}", w.task.title, w.task.directory, agent)
+                    .to_lowercase()
+                    .contains(&query)
+                {
+                    results.push(CommandAction::Terminal(id));
+                }
+            }
+        }
         for action in [
+            CommandAction::Attention,
+            CommandAction::Back,
+            CommandAction::Find,
+            CommandAction::Select,
+            CommandAction::Stop,
             CommandAction::MergeRadar,
             CommandAction::RemoteRuns,
             CommandAction::Folders,
@@ -2780,7 +2938,40 @@ impl App {
                         ui.add_space(6.0);
                         was_workspace = Some(workspace);
                     }
+                    let pane_description = if let CommandAction::Terminal(id) = action {
+                        self.saved
+                            .workspaces
+                            .iter()
+                            .find(|w| layout_contains(&w.layout, *id))
+                            .map(|w| {
+                                let mut ids = Vec::new();
+                                w.layout.ids(&mut ids);
+                                let agent = self
+                                    .saved
+                                    .sessions
+                                    .iter()
+                                    .rev()
+                                    .find(|s| s.pane == *id)
+                                    .map(|s| s.agent.label())
+                                    .unwrap_or("Shell");
+                                format!(
+                                    "{} · {} · Pane {}",
+                                    w.task.title,
+                                    agent,
+                                    ids.iter().position(|p| p == id).unwrap_or(0) + 1
+                                )
+                            })
+                            .unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
                     let (title, detail, keys, enabled) = match *action {
+                        CommandAction::Terminal(id) => (
+                            pane_description.as_str(),
+                            "Open terminal in its window",
+                            String::new(),
+                            self.panes.contains_key(&id),
+                        ),
                         CommandAction::Workspace(index) => {
                             let w = &self.saved.workspaces[index];
                             (
@@ -2843,6 +3034,37 @@ impl App {
         ui.small("Up / Down navigate     Enter open     Esc close");
         if let Some(action) = chosen {
             match action {
+                CommandAction::Terminal(id) => {
+                    self.focus_pane(id);
+                    self.ui.palette = false;
+                }
+                CommandAction::Attention => {
+                    self.next_attention();
+                    self.ui.palette = false;
+                }
+                CommandAction::Back => {
+                    if let Some(id) = self.attention_origin.take() {
+                        self.focus_pane(id);
+                    }
+                    self.ui.palette = false;
+                }
+                CommandAction::Find | CommandAction::Select | CommandAction::Stop => {
+                    self.ui.palette = false;
+                    if let Some(id) = self.saved.workspaces.get(self.ui.active).map(|w| w.focus) {
+                        self.focus_pane(id);
+                        if action == CommandAction::Stop {
+                            self.request_stop_terminal(id);
+                        } else if let Some(pane) = self.panes.get_mut(&id) {
+                            if action == CommandAction::Find {
+                                let _ = pane.terminal.selection_action(SelectionAction::Exit);
+                                pane.search.open();
+                            } else {
+                                pane.search.close();
+                                let _ = pane.terminal.selection_action(SelectionAction::Enter);
+                            }
+                        }
+                    }
+                }
                 CommandAction::Workspace(index) => {
                     self.focus_workspace(index);
                     self.ui.palette = false;
@@ -2908,10 +3130,19 @@ impl App {
     }
 
     fn folder_results(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, submit: Option<egui::Id>) {
-        ui.label("Find an existing folder, then start Claude Code in a new terminal.");
+        ui.label("Find an existing folder, then start a terminal.");
         ui.add_enabled_ui(self.folder_launch.is_none(), |ui| {
-            self.folder_search_roots_editor(ui);
+            ui.horizontal(|ui| {
+                for (kind, label) in [(0, "Shell"), (1, "Claude Code"), (2, "Codex")] {
+                    ui.selectable_value(&mut self.ui.launch_kind, kind, label);
+                }
+            });
         });
+        if ctx.content_rect().height() >= 500.0 {
+            ui.add_enabled_ui(self.folder_launch.is_none(), |ui| {
+                self.folder_search_roots_editor(ui);
+            });
+        }
         ui.add_space(8.0);
         let editing_roots =
             ctx.memory(|memory| memory.has_focus(egui::Id::new("folder-search-roots")));
@@ -3057,24 +3288,54 @@ impl App {
         let (tx, rx) = sync_channel(1);
         let ctx = ctx.clone();
         let pane = Uuid::new_v4();
+        let kind = self.ui.launch_kind;
+        let page = self.ui.command_page;
+        let name = if page == CommandPage::Create {
+            self.ui.new_workspace_name.trim().to_owned()
+        } else {
+            String::new()
+        };
         let worker = std::thread::Builder::new()
-            .name("claude-launch".into())
+            .name("terminal-launch".into())
             .spawn(move || {
-                let result = Terminal::spawn_claude(pane, &path, &socket, ctx.clone())
-                    .map(|terminal| (pane, path, terminal));
+                let result = match kind {
+                    2 => Terminal::spawn_agent(
+                        pane,
+                        &path,
+                        &socket,
+                        ctx.clone(),
+                        "codex --no-daemon",
+                    ),
+                    0 => {
+                        #[cfg(not(test))]
+                        let result = Terminal::spawn(pane, &path, &socket, ctx.clone());
+                        #[cfg(test)]
+                        let result = Terminal::spawn_test(pane, &path, &socket, ctx.clone());
+                        result
+                    }
+                    _ => Terminal::spawn_claude(pane, &path, &socket, ctx.clone()),
+                }
+                .map(|terminal| (pane, path, terminal));
                 let _ = tx.send(result);
                 ctx.request_repaint();
             });
         match worker {
             Ok(_) => {
                 self.folder_launch = Some(FolderLaunch {
+                    name,
+                    kind,
+                    page,
                     pane,
                     window: self.current_window,
                     receiver: rx,
                 });
                 self.ui.folder_error = None;
             }
-            Err(error) => self.ui.folder_error = Some(format!("Cannot start Claude Code: {error}")),
+            Err(error) => {
+                let message = format!("Cannot start terminal: {error}");
+                self.ui.folder_error = Some(message.clone());
+                self.ui.error = message;
+            }
         }
     }
 
@@ -3092,7 +3353,7 @@ impl App {
                 Err(anyhow::anyhow!("Launch worker stopped. Try again."))
             }
         };
-        self.folder_launch = None;
+        let launch = self.folder_launch.take().unwrap();
         match result {
             Ok((pane, path, terminal)) => {
                 if self.saved.workspaces.len() + usize::from(self.folder_launch.is_some()) >= 32
@@ -3106,11 +3367,15 @@ impl App {
                 self.saved.workspaces.push(Workspace {
                     task: Task {
                         id: Uuid::new_v4(),
-                        title: directory_name(&directory).into(),
+                        title: if launch.name.is_empty() {
+                            directory_name(&directory).into()
+                        } else {
+                            launch.name.clone()
+                        },
                         directory,
                         state: TaskState::Implementing,
                     },
-                    custom_title: Some(false),
+                    custom_title: Some(!launch.name.is_empty()),
                     layout: Layout::Pane(pane),
                     focus: pane,
                 });
@@ -3121,7 +3386,12 @@ impl App {
                         search: TerminalSearch::default(),
                     },
                 );
-                self.direct_launches.insert(pane, None);
+                if launch.kind != 0 {
+                    self.direct_launches.insert(pane, None);
+                }
+                if launch.page == CommandPage::Create {
+                    self.ui.new_workspace_name.clear();
+                }
                 self.register_workspace_window();
                 self.ui.active = self.saved.workspaces.len() - 1;
                 self.ui.autobot_visible = false;
@@ -3141,12 +3411,12 @@ impl App {
             }
             Err(error) => {
                 let message = format!(
-                    "Cannot launch Claude Code: {error}. Choose an accessible existing folder and retry."
+                    "Cannot launch terminal: {error}. Choose an accessible existing folder and retry."
                 );
                 self.ui.folder_error = Some(message.clone());
                 self.ui.error = message;
                 self.ui.palette = true;
-                self.ui.command_page = CommandPage::Folders;
+                self.ui.command_page = launch.page;
                 self.ui.command_focus = true;
             }
         }
@@ -3209,7 +3479,7 @@ impl App {
                 &mut self.saved.clickable_codex_choices,
                 "Clickable Claude Code and Codex choices",
             )
-            .on_hover_text("Click an option to select it. Press Enter to submit.")
+            .on_hover_text("Click a recognized option to select and submit it in the CLI.")
             .changed()
         {
             self.dirty = true;
@@ -3633,6 +3903,9 @@ impl App {
             self.ui.autobot_visible = false;
         }
         self.shortcuts(ctx);
+        if !self.ui.overview && self.ui.error.starts_with("Work limit (256)") {
+            self.ui.error.clear();
+        }
         self.sync_workspace_titles(ctx);
         let dismiss_palette = self.ui.palette
             && ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape));
@@ -3724,6 +3997,7 @@ impl App {
                 });
             });
         let mut selection_tab = None;
+        let mut header_action = None;
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
@@ -3749,14 +4023,14 @@ impl App {
                         ui.add_space(80.0);
                         ui.heading("Start where your work lives");
                         ui.label(
-                            "Find an existing folder for Claude Code, or open a shell workspace.",
+                            "Choose a directory and start a shell, Claude Code, or Codex.",
                         );
                         ui.add_space(16.0);
-                        if primary_button(ui, "Claude in folder").clicked() {
-                            self.open_commands(CommandPage::Folders);
-                        }
-                        if ui.button("New workspace").clicked() {
+                        if primary_button(ui, "New workspace").clicked() {
                             self.open_commands(CommandPage::Create);
+                        }
+                        if ui.button("Find a folder").clicked() {
+                            self.open_commands(CommandPage::Folders);
                         }
                     });
                     return;
@@ -3802,8 +4076,33 @@ impl App {
                         }
                     }
                 }
+                prepare_terminal_rendering(ctx, self.visible_terminal_panes(ctx).max(
+                    rects.iter().filter(|(id, _)| self.panes.contains_key(id)).count(),
+                ));
                 for (id, rect) in rects {
                     ui.scope_builder(egui::UiBuilder::new().max_rect(rect).id_salt(id), |ui| {
+                        let cache_id = egui::Id::new(("pane-directory", id));
+                        let cached = ctx.data(|data| data.get_temp::<(u64, String)>(cache_id));
+                        let directory = if let Some((_, directory)) = cached.as_ref().filter(|(time, _)| *time == now()) {
+                            directory.clone()
+                        } else {
+                            let directory = self.panes.get(&id).and_then(|p| p.terminal.current_directory().ok()).map(|p| readable_directory(&p.to_string_lossy())).or_else(|| cached.map(|(_, directory)| directory)).unwrap_or_default();
+                            ctx.data_mut(|data| data.insert_temp(cache_id, (now(), directory.clone())));
+                            directory
+                        };
+                        let session = self.saved.sessions.iter().rev().find(|s| s.pane == id);
+                        let process = session.map(|s| s.agent.label()).unwrap_or("Shell");
+                        let state = self.panes.get(&id).map(|p| if p.terminal.has_exited() { format!("Exited ({})", p.terminal.exit_code().map_or("unknown".into(), |c| c.to_string())) } else if session.is_some_and(|s| s.state.attention()) { "Needs attention".into() } else { String::new() }).unwrap_or_default();
+                        ui.horizontal(|ui| {
+                            if ui.selectable_label(focused == id, process).on_hover_text("Focus this terminal").clicked() { header_action = Some((id, "Focus")); }
+                            ui.add_sized([((ui.available_width() - 180.0).max(20.0)), 18.0], egui::Label::new(&directory).truncate()).on_hover_text(&directory);
+                            if !state.is_empty() { ui.label(&state); }
+                            ui.menu_button("⋯", |ui| {
+                                for action in ["Focus", "Find", "Select", "Split side by side", "Split stacked", "Maximize / restore", "New shell", "Stop terminal"] {
+                                    if ui.button(action).clicked() { header_action = Some((id, action)); ui.close(); }
+                                }
+                            });
+                        });
                         self.restoration_panel(ui, ctx, id);
                         if let Some(pane) = self.panes.get_mut(&id) {
                             if let Some(err) =
@@ -3845,6 +4144,29 @@ impl App {
                     });
                 }
             });
+        if let Some((id, action)) = header_action {
+            let was_maximized = self.ui.maximized;
+            self.focus_pane(id);
+            match action {
+                "Stop terminal" => self.request_stop_terminal(id),
+                "Split side by side" => self.split(ctx, true),
+                "Split stacked" => self.split(ctx, false),
+                "Maximize / restore" => self.ui.maximized = !was_maximized,
+                "New shell" => self.add_workspace_from_terminal(ctx),
+                "Find" | "Select" => {
+                    if let Some(pane) = self.panes.get_mut(&id) {
+                        if action == "Find" {
+                            let _ = pane.terminal.selection_action(SelectionAction::Exit);
+                            pane.search.open();
+                        } else {
+                            pane.search.close();
+                            let _ = pane.terminal.selection_action(SelectionAction::Enter);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
         if let Some((source, text)) = selection_tab {
             self.open_selection_tab(ctx, source, &text);
         }
@@ -3863,7 +4185,6 @@ impl App {
             self.saved.restoration.active = Some(workspace.task.id);
         }
         if now().saturating_sub(self.last_save) >= 5 {
-            self.capture_restoration();
             self.dirty = true;
         }
         ctx.request_repaint_after(Duration::from_secs(5));
@@ -3908,6 +4229,12 @@ enum CommandAction {
     MergeRadar,
     RemoteRuns,
     Workspace(usize),
+    Terminal(Uuid),
+    Attention,
+    Back,
+    Find,
+    Select,
+    Stop,
     Folders,
     Create,
     NewWindow,
@@ -3922,6 +4249,12 @@ impl CommandAction {
     fn label(self) -> &'static str {
         match self {
             Self::Workspace(_) => "Workspace",
+            Self::Terminal(_) => "Terminal",
+            Self::Attention => "Next session needing attention",
+            Self::Back => "Back to previous terminal",
+            Self::Find => "Find in terminal",
+            Self::Select => "Keyboard selection",
+            Self::Stop => "Stop terminal",
             Self::MergeRadar => "Merge Radar",
             Self::RemoteRuns => "Autobot",
             Self::Folders => "Claude in folder",
@@ -3937,7 +4270,10 @@ impl CommandAction {
     }
     fn detail(self) -> &'static str {
         match self {
-            Self::Workspace(_) => "",
+            Self::Workspace(_) | Self::Terminal(_) => "",
+            Self::Attention => "Open the next waiting CLI",
+            Self::Back => "Return after handling attention",
+            Self::Find | Self::Select | Self::Stop => "Applies to the focused terminal",
             Self::MergeRadar => "Review pull requests, merge blockers, and ready changes",
             Self::RemoteRuns => "Follow configured GitHub Actions runs and linked pull requests",
             Self::Folders => "Search local folders and launch Claude Code",
@@ -3952,6 +4288,10 @@ impl CommandAction {
     }
     fn keys(self) -> &'static str {
         match self {
+            Self::Attention => "Shift+N",
+            Self::Find => "F",
+            Self::Select => "Shift+Space",
+            Self::Stop => "W",
             Self::Folders => "Shift+L",
             Self::NewWindow => "Shift+T",
             Self::Settings => ",",
@@ -4490,6 +4830,32 @@ fn paint_cursor(
     }
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Default)]
+struct TerminalRenderCounts {
+    fresh: usize,
+    busy: usize,
+}
+
+#[cfg(test)]
+impl TerminalRenderCounts {
+    fn record(ctx: &egui::Context, fresh: bool) {
+        ctx.data_mut(|data| {
+            let id = egui::Id::new("terminal-render-counts");
+            if let Some(mut counts) = data.get_temp::<Self>(id) {
+                counts.fresh += usize::from(fresh);
+                counts.busy += usize::from(!fresh);
+                data.insert_temp(id, counts);
+            }
+        });
+    }
+
+    fn read(ctx: &egui::Context) -> Self {
+        ctx.data(|data| data.get_temp::<Self>(egui::Id::new("terminal-render-counts")))
+            .unwrap_or_default()
+    }
+}
+
 #[derive(Clone)]
 struct TerminalPaintCache {
     origin: Pos2,
@@ -4497,7 +4863,17 @@ struct TerminalPaintCache {
     shapes: Vec<egui::epaint::Shape>,
     cursor: Vec<egui::epaint::Shape>,
     copying: bool,
-    selected: Option<String>,
+}
+
+fn prepare_terminal_rendering(ctx: &egui::Context, visible_panes: usize) {
+    render_budget::prepare(ctx, visible_panes);
+}
+
+fn terminal_render_lock<'a, T>(
+    ctx: &egui::Context,
+    state: &'a std::sync::Mutex<T>,
+) -> Option<std::sync::MutexGuard<'a, T>> {
+    render_budget::lock(ctx, state)
 }
 
 fn terminal_view(
@@ -4516,9 +4892,38 @@ fn terminal_view(
         );
     }
     search.show(ui, terminal, focused);
+    let scrolled = terminal
+        .term
+        .try_lock()
+        .ok()
+        .map(|term| term.grid().display_offset() > 0);
+    let mut return_live = false;
+    let mut status_rect = ui.available_rect_before_wrap();
+    status_rect.min.y = (status_rect.max.y - 20.0).max(status_rect.min.y);
+    let mut status_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(status_rect)
+            .id_salt("output-mode"),
+    );
+    status_ui.horizontal(|ui| {
+        ui.set_min_height(20.0);
+        ui.small(match scrolled {
+            Some(true) => "Scrolled back",
+            Some(false) if !terminal.alive.load(Ordering::Acquire) => "Exited · output retained",
+            Some(false) => "Live output",
+            None => "Output updating",
+        });
+        if scrolled == Some(true) && !searching && !copying {
+            return_live = ui.small_button("Return to live").clicked();
+        }
+    });
+    if return_live && let Err(error) = terminal.scroll(i32::MIN) {
+        return (false, Err(error), None);
+    }
     let font = FontId::monospace(font_size);
     let cell = ui.fonts_mut(|f| Vec2::new(f.glyph_width(&font, 'M'), f.row_height(&font)));
-    let rect = ui.available_rect_before_wrap();
+    let mut rect = ui.available_rect_before_wrap();
+    rect.max.y = status_rect.min.y;
     let response = ui.allocate_rect(rect, Sense::click_and_drag());
     if !searching && (focused || response.clicked()) {
         if !response.has_focus() {
@@ -4624,24 +5029,32 @@ fn terminal_view(
         }
         *reporting
     });
+    let selection_scroll_id = response.id.with("selection_scroll");
+    if !response.dragged_by(egui::PointerButton::Primary) || primary_reporting || link_gesture {
+        ui.ctx()
+            .data_mut(|data| data.remove::<(i32, f64)>(selection_scroll_id));
+    }
+    let capture_selection = response.secondary_clicked() && !modifiers.alt;
     let mut selected = None;
+    let mut selection_busy = false;
     let mut choice_prompt = None;
     let mut choice_revision = 0;
-    if let Ok(mut term) = terminal.term.try_lock() {
+    if let Some(mut term) = terminal_render_lock(ui.ctx(), &terminal.term) {
+        #[cfg(test)]
+        TerminalRenderCounts::record(ui.ctx(), true);
         search.invalidate(terminal.revision());
         mode = *term.mode();
         if !primary_reporting
             && !link_gesture
             && let Some(pos) = response.interact_pointer_pos()
         {
-            let display_offset = term.grid().display_offset() as i32;
-            let point_at = |pos: Pos2| {
+            let point_at = |pos: Pos2, display_offset: usize| {
                 Point::new(
                     Line(
                         ((pos.y - grid_rect.top()) / cell.y)
                             .floor()
                             .clamp(0.0, rows as f32 - 1.0) as i32
-                            - display_offset,
+                            - display_offset as i32,
                     ),
                     Column(
                         ((pos.x - grid_rect.left()) / cell.x)
@@ -4655,11 +5068,40 @@ fn terminal_view(
             {
                 term.selection = Some(Selection::new(
                     SelectionType::Simple,
-                    point_at(origin),
+                    point_at(origin, term.grid().display_offset()),
                     Side::Left,
                 ));
             }
-            let point = point_at(pos);
+            if response.dragged_by(egui::PointerButton::Primary) && term.selection.is_some() {
+                let distance = if pos.y < grid_rect.top() {
+                    grid_rect.top() - pos.y
+                } else if pos.y > grid_rect.bottom() {
+                    grid_rect.bottom() - pos.y
+                } else {
+                    0.0
+                };
+                if distance != 0.0 {
+                    let direction = if distance > 0.0 { 1 } else { -1 };
+                    let now = ui.input(|input| input.time);
+                    let scroll = ui.ctx().data_mut(|data| {
+                        let previous = data.get_temp::<(i32, f64)>(selection_scroll_id);
+                        if previous.is_none_or(|(last_direction, next)| {
+                            direction != last_direction || now >= next
+                        }) {
+                            data.insert_temp(selection_scroll_id, (direction, now + 0.05));
+                            direction * (distance.abs() / cell.y).ceil().clamp(1.0, 10.0) as i32
+                        } else {
+                            0
+                        }
+                    });
+                    term.scroll_display(alacritty_terminal::grid::Scroll::Delta(scroll));
+                    ui.ctx().request_repaint_after(Duration::from_millis(50));
+                } else {
+                    ui.ctx()
+                        .data_mut(|data| data.remove::<(i32, f64)>(selection_scroll_id));
+                }
+            }
+            let point = point_at(pos, term.grid().display_offset());
             if response.dragged_by(egui::PointerButton::Primary)
                 && let Some(s) = &mut term.selection
             {
@@ -4802,7 +5244,9 @@ fn terminal_view(
                 );
             }
         }
-        selected = term.selection_to_string();
+        if capture_selection {
+            selected = term.selection_to_string();
+        }
         let (shapes, cursor) = ui.ctx().graphics(|graphics| {
             let entries = graphics.get(painter.layer_id()).unwrap().all_entries();
             let shapes = entries
@@ -4822,11 +5266,12 @@ fn terminal_view(
                     shapes,
                     cursor,
                     copying,
-                    selected: selected.clone(),
                 },
             )
         });
     } else {
+        #[cfg(test)]
+        TerminalRenderCounts::record(ui.ctx(), false);
         if let Some(mut cache) = ui
             .ctx()
             .data(|data| data.get_temp::<TerminalPaintCache>(response.id.with("paint_cache")))
@@ -4840,13 +5285,19 @@ fn terminal_view(
                 shape.translate(translation);
             }
             ui.painter().with_clip_rect(grid_rect).extend(cache.shapes);
-            selected = cache.selected;
         }
+        selection_busy = capture_selection;
         ui.ctx().request_repaint_after(Duration::from_millis(16));
     }
     let reporting =
         !copying && mode.intersects(TermMode::MOUSE_MODE) && !ui.input(|i| i.modifiers.shift);
-    let mut result = Ok(());
+    let mut result = if selection_busy {
+        Err(anyhow::anyhow!(
+            "Terminal selection is busy; reopen the menu to retry"
+        ))
+    } else {
+        Ok(())
+    };
     if response.hovered()
         && let Some(pos) = ui
             .input(|i| i.pointer.hover_pos())
@@ -4855,7 +5306,7 @@ fn terminal_view(
         let (delta, modifiers) = ui.input(|i| (i.raw_scroll_delta.y, i.modifiers));
         let route = scroll_route(
             mode,
-            copying || modifiers.shift || !terminal.alive.load(Ordering::Acquire),
+            searching || copying || modifiers.shift || !terminal.alive.load(Ordering::Acquire),
         );
         let lines = ui.ctx().data_mut(|data| {
             data.get_temp_mut_or_default::<ScrollState>(response.id.with("scroll"))
@@ -4954,7 +5405,10 @@ fn terminal_view(
     let menu_id = response.id.with("selection_menu_text");
     if response.secondary_clicked() && !modifiers.alt {
         ui.ctx().data_mut(|data| {
-            data.insert_temp(menu_id, selected.clone().unwrap_or_default());
+            data.insert_temp(
+                menu_id,
+                std::sync::Arc::new(selected.take().unwrap_or_default()),
+            );
         });
     }
     let mut menu_action = None;
@@ -4963,20 +5417,36 @@ fn terminal_view(
         response.context_menu(|ui| {
             let text = ui
                 .ctx()
-                .data(|data| data.get_temp::<String>(menu_id))
+                .data(|data| data.get_temp::<std::sync::Arc<String>>(menu_id))
                 .unwrap_or_default();
+            if ui
+                .add_enabled(
+                    !copying && !searching && terminal.alive.load(Ordering::Acquire),
+                    egui::Button::new(shortcut("Paste clipboard", "V")),
+                )
+                .clicked()
+            {
+                response.request_focus();
+                ui.ctx()
+                    .send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+                ui.close();
+            }
             if text.is_empty() {
-                ui.add_enabled(false, egui::Label::new("Select text for actions"));
+                ui.add_enabled(false, egui::Label::new("Select text for copy actions"));
                 return;
             }
+            ui.separator();
             for (action, label) in [
                 (SelectionMenuAction::Copy, "Copy"),
                 (
                     SelectionMenuAction::CopyWithoutIndentation,
                     "Copy without indentation",
                 ),
-                (SelectionMenuAction::Paste, "Paste into this terminal"),
-                (SelectionMenuAction::NewTab, "Open in new terminal tab"),
+                (SelectionMenuAction::Paste, "Insert selection as one line"),
+                (
+                    SelectionMenuAction::NewTab,
+                    "Insert selection in new workspace",
+                ),
                 (SelectionMenuAction::Search, "Search in browser"),
             ] {
                 let enabled = action != SelectionMenuAction::Paste
@@ -4991,7 +5461,7 @@ fn terminal_view(
                     button
                 };
                 if button.clicked() {
-                    menu_action = Some((action, text));
+                    menu_action = Some((action, (*text).clone()));
                     ui.close();
                     break;
                 }
@@ -4999,7 +5469,8 @@ fn terminal_view(
         });
     }
     if let Some((action, text)) = menu_action {
-        ui.ctx().data_mut(|data| data.remove::<String>(menu_id));
+        ui.ctx()
+            .data_mut(|data| data.remove::<std::sync::Arc<String>>(menu_id));
         match action {
             SelectionMenuAction::Copy => ui.ctx().copy_text(text),
             SelectionMenuAction::CopyWithoutIndentation => ui
@@ -5018,7 +5489,8 @@ fn terminal_view(
     }
     let menu_open = response.context_menu_opened();
     if !menu_open && menu_was_open {
-        ui.ctx().data_mut(|data| data.remove::<String>(menu_id));
+        ui.ctx()
+            .data_mut(|data| data.remove::<std::sync::Arc<String>>(menu_id));
     }
     let clicked = response.clicked() || response.drag_started() || response.secondary_clicked();
     if searching
@@ -5044,8 +5516,9 @@ fn terminal_view(
                 None
             }
             egui::Event::Copy => {
-                if let Some(s) = &selected {
-                    ui.ctx().copy_text(s.clone());
+                if let Err(error) = terminal.selection_action(SelectionAction::Copy { exit: false })
+                {
+                    result = Err(error);
                 }
                 None
             }
@@ -6409,6 +6882,40 @@ mod render_tests {
         assert_eq!(app.ui.active, 1);
     }
 
+    #[test]
+    fn attention_cycles_live_targets_and_keeps_return_origin() {
+        let ctx = egui::Context::default();
+        let mut app = fixture(3);
+        let ids: Vec<_> = app.saved.workspaces.iter().map(|w| w.focus).collect();
+        for id in &ids {
+            assert!(app.spawn(*id, &ctx, "/tmp"));
+        }
+        app.saved.sessions[0].state = SessionState::Input;
+        app.saved.sessions[1].state = SessionState::Input;
+        app.saved.sessions[2].state = SessionState::Running;
+        app.ui.active = 2;
+        app.next_attention();
+        assert_eq!(app.saved.workspaces[app.ui.active].focus, ids[0]);
+        app.next_attention();
+        assert_eq!(app.saved.workspaces[app.ui.active].focus, ids[1]);
+        app.next_attention();
+        assert_eq!(app.saved.workspaces[app.ui.active].focus, ids[0]);
+        assert_eq!(app.attention_origin, Some(ids[2]));
+        let target = app.saved.workspaces[0].task.id;
+        app.detach_workspace(&ctx, target, None);
+        let destination = app.workspace_window(target);
+        assert_ne!(destination, egui::ViewportId::ROOT);
+        std::mem::swap(
+            &mut app.ui,
+            &mut app.windows.get_mut(&destination).unwrap().ui,
+        );
+        app.current_window = destination;
+        let origin = app.attention_origin.take().unwrap();
+        app.focus_pane(origin);
+        assert_eq!(app.pending_focus, Some(app.saved.workspaces[2].task.id));
+        assert_eq!(app.saved.workspaces[2].focus, ids[2]);
+    }
+
     pub(super) fn fixture(count: usize) -> App {
         let (writer, _) = sync_channel(1);
         let mut saved = Saved::default();
@@ -6502,6 +7009,7 @@ mod render_tests {
             direct_launches: HashMap::new(),
             remote_panes: Default::default(),
             restoration: Default::default(),
+            attention_origin: None,
         }
     }
     #[test]
@@ -6647,6 +7155,7 @@ mod render_tests {
         let path = root.path().join("deleted project");
         std::fs::create_dir(&path).unwrap();
         std::fs::remove_dir(&path).unwrap();
+        app.open_commands(CommandPage::Folders);
         app.launch_folder(&ctx, path.clone());
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while app.folder_launch.is_some() {
@@ -6659,12 +7168,34 @@ mod render_tests {
                 .folder_error
                 .as_ref()
                 .unwrap()
-                .contains("Cannot launch Claude Code")
+                .contains("Cannot launch terminal")
         );
         assert!(app.ui.palette && app.ui.command_page == CommandPage::Folders);
         assert!(!path.exists());
         assert!(app.saved.workspaces.is_empty() && app.panes.is_empty());
         assert!(app.saved.created_directories.is_empty());
+    }
+
+    #[test]
+    fn async_shell_launch_captures_name_and_keeps_shell_exit_policy() {
+        let ctx = egui::Context::default();
+        let mut app = fixture(0);
+        let root = tempfile::tempdir().unwrap();
+        app.ui.command_page = CommandPage::Create;
+        app.ui.launch_kind = 0;
+        app.ui.new_workspace_name = "Captured name".into();
+        app.launch_folder(&ctx, root.path().to_owned());
+        app.ui.new_workspace_name = "Later edit".into();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.folder_launch.is_some() {
+            app.poll_folder_launch(&ctx);
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let workspace = &app.saved.workspaces[0];
+        assert_eq!(workspace.task.title, "Captured name");
+        assert_eq!(workspace.custom_title, Some(true));
+        assert!(!app.direct_launches.contains_key(&workspace.focus));
     }
 
     #[test]
@@ -6683,6 +7214,9 @@ mod render_tests {
         .unwrap();
         let (tx, rx) = sync_channel(1);
         app.folder_launch = Some(FolderLaunch {
+            name: String::new(),
+            kind: 1,
+            page: CommandPage::Folders,
             window: egui::ViewportId::ROOT,
             pane: id,
             receiver: rx,
@@ -6891,6 +7425,9 @@ mod render_tests {
         }
         let (_tx, receiver) = sync_channel(1);
         app.folder_launch = Some(FolderLaunch {
+            name: String::new(),
+            kind: 1,
+            page: CommandPage::Folders,
             window: egui::ViewportId::ROOT,
             pane: Uuid::new_v4(),
             receiver,
@@ -7837,7 +8374,52 @@ mod render_tests {
                         },
                     );
                     let found = output.shapes.iter().any(|shape| matches!(&shape.shape, egui::epaint::Shape::Text(text) if text.galley.text() == "Autobot"));
-                    assert_eq!(found, visible);
+                    assert_eq!(found, visible && width >= 900.0);
+                    if width < 900.0 {
+                        let position = output
+                            .shapes
+                            .iter()
+                            .find_map(|shape| match &shape.shape {
+                                egui::epaint::Shape::Text(text) if text.galley.text() == "More" => {
+                                    Some(text.galley.rect.translate(text.pos.to_vec2()).center())
+                                }
+                                _ => None,
+                            })
+                            .expect("narrow navigation must expose More");
+                        for pressed in [true, false] {
+                            let _ = ctx.run(
+                                egui::RawInput {
+                                    screen_rect: Some(Rect::from_min_size(
+                                        Pos2::ZERO,
+                                        Vec2::new(width, 700.0),
+                                    )),
+                                    events: vec![
+                                        egui::Event::PointerMoved(position),
+                                        egui::Event::PointerButton {
+                                            pos: position,
+                                            button: egui::PointerButton::Primary,
+                                            pressed,
+                                            modifiers: Modifiers::NONE,
+                                        },
+                                    ],
+                                    ..Default::default()
+                                },
+                                |ctx| app.chrome(ctx, false, &mut None),
+                            );
+                        }
+                        let menu = ctx.run(
+                            egui::RawInput {
+                                screen_rect: Some(Rect::from_min_size(
+                                    Pos2::ZERO,
+                                    Vec2::new(width, 700.0),
+                                )),
+                                ..Default::default()
+                            },
+                            |ctx| app.chrome(ctx, false, &mut None),
+                        );
+                        let found = menu.shapes.iter().any(|shape| matches!(&shape.shape, egui::epaint::Shape::Text(text) if text.galley.text() == "Autobot"));
+                        assert_eq!(found, visible, "More must retain configured navigation");
+                    }
                     assert!(
                         used_rect.right() <= width + 1.0,
                         "chrome overflow: {used_rect:?} at {width}"
@@ -8566,6 +9148,145 @@ mod render_tests {
         pointer_selection_regression(true);
     }
 
+    #[test]
+    fn dragging_selection_outside_terminal_scrolls_history_until_released() {
+        for (mouse_mode, modifiers) in [
+            (false, Modifiers::NONE),
+            (true, Modifiers::NONE),
+            (true, Modifiers::ALT),
+        ] {
+            let ctx = egui::Context::default();
+            let dir = tempfile::tempdir().unwrap();
+            let mut terminal = Terminal::spawn_test(
+                Uuid::new_v4(),
+                dir.path(),
+                std::path::Path::new(""),
+                ctx.clone(),
+            )
+            .unwrap();
+            if mouse_mode {
+                terminal
+                    .input(b"printf '\\033[?1000h\\033[?1006h'\n".to_vec())
+                    .unwrap();
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while !terminal
+                    .mode()
+                    .contains(TermMode::MOUSE_REPORT_CLICK | TermMode::SGR_MOUSE)
+                {
+                    assert!(Instant::now() < deadline);
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+            let mut search = TerminalSearch::default();
+            let mut time = 0.0;
+            let mut frame = |terminal: &mut Terminal, events| {
+                time += 0.06;
+                let mut grid = Rect::NOTHING;
+                let output = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 200.0))),
+                        time: Some(time),
+                        events,
+                        modifiers,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            grid = ui.available_rect_before_wrap().shrink(8.0);
+                            terminal_view(ui, terminal, &mut search, true, 15.0, false)
+                                .1
+                                .unwrap();
+                        });
+                    },
+                );
+                (grid, output)
+            };
+            let (grid, _) = frame(&mut terminal, vec![]);
+            {
+                let mut term = terminal.term.lock().unwrap();
+                let mut parser: alacritty_terminal::vte::ansi::Processor = Default::default();
+                parser.advance(&mut *term, b"\x1b[2J\x1b[H");
+                for row in 0..80 {
+                    parser.advance(&mut *term, format!("row {row:02}\r\n").as_bytes());
+                }
+                if mouse_mode {
+                    parser.advance(&mut *term, b"\x1b[?1000h\x1b[?1006h");
+                }
+            }
+            let start = grid.center();
+            let above = Pos2::new(start.x, grid.top() - 20.0);
+            frame(&mut terminal, vec![egui::Event::PointerMoved(above)]);
+            assert_eq!(terminal.term.lock().unwrap().grid().display_offset(), 0);
+            frame(
+                &mut terminal,
+                vec![
+                    egui::Event::PointerMoved(start),
+                    egui::Event::PointerButton {
+                        pos: start,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers,
+                    },
+                ],
+            );
+            frame(&mut terminal, vec![egui::Event::PointerMoved(above)]);
+            let first_offset = terminal.term.lock().unwrap().grid().display_offset();
+            if modifiers.alt {
+                assert_eq!(first_offset, 0);
+                assert!(terminal.term.lock().unwrap().selection.is_none());
+                continue;
+            }
+            assert!(first_offset > 0, "dragging above must reveal history");
+            let first_text = terminal.term.lock().unwrap().selection_to_string().unwrap();
+            for _ in 0..5 {
+                frame(&mut terminal, vec![]);
+            }
+            let offset = terminal.term.lock().unwrap().grid().display_offset();
+            assert!(
+                offset > first_offset,
+                "holding the pointer still must keep scrolling"
+            );
+            let text = terminal.term.lock().unwrap().selection_to_string().unwrap();
+            assert!(
+                text.len() > first_text.len(),
+                "selection must grow into revealed history"
+            );
+            let below = Pos2::new(start.x, grid.bottom() + 20.0);
+            frame(&mut terminal, vec![egui::Event::PointerMoved(below)]);
+            for _ in 0..3 {
+                frame(&mut terminal, vec![]);
+            }
+            let after_down = terminal.term.lock().unwrap().grid().display_offset();
+            assert!(after_down < offset, "dragging below must scroll back down");
+            frame(
+                &mut terminal,
+                vec![egui::Event::PointerButton {
+                    pos: below,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers,
+                }],
+            );
+            for _ in 0..3 {
+                frame(&mut terminal, vec![]);
+            }
+            assert_eq!(
+                terminal.term.lock().unwrap().grid().display_offset(),
+                after_down
+            );
+            let selected = terminal.term.lock().unwrap().selection_to_string().unwrap();
+            let (_, mut output) = frame(&mut terminal, vec![egui::Event::Copy]);
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !output.platform_output.commands.iter().any(|command| {
+                matches!(command, egui::OutputCommand::CopyText(text) if text == &selected)
+            }) {
+                assert!(Instant::now() < deadline, "copy must include the selected history");
+                std::thread::sleep(Duration::from_millis(5));
+                output = frame(&mut terminal, vec![]).1;
+            }
+        }
+    }
+
     fn pointer_selection_regression(reporting: bool) {
         let ctx = egui::Context::default();
         let dir = tempfile::tempdir().unwrap();
@@ -8692,15 +9413,20 @@ mod render_tests {
                     .as_deref(),
                 Some("selecta")
             );
-            let output = frame(
+            let mut output = frame(
                 &mut terminal,
                 &mut search,
                 vec![egui::Event::Copy],
                 Modifiers::NONE,
             );
-            assert!(output.platform_output.commands.iter().any(|command| {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !output.platform_output.commands.iter().any(|command| {
                 matches!(command, egui::OutputCommand::CopyText(text) if text == "selecta")
-            }));
+            }) {
+                assert!(Instant::now() < deadline, "selection copy did not complete");
+                std::thread::sleep(Duration::from_millis(5));
+                output = frame(&mut terminal, &mut search, vec![], Modifiers::NONE);
+            }
             for pressed in [true, false] {
                 frame(
                     &mut terminal,
@@ -8730,8 +9456,8 @@ mod render_tests {
             for label in [
                 "Copy",
                 "Copy without indentation",
-                "Paste into this terminal",
-                "Open in new terminal tab",
+                "Insert selection as one line",
+                "Insert selection in new workspace",
                 "Search in browser",
             ] {
                 assert!(screen.contains(menu_button(label)));
@@ -8913,6 +9639,50 @@ mod render_tests {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+        search.open();
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                events: vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: Vec2::new(0.0, height * 4.0),
+                        modifiers: Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    terminal_view(ui, &mut terminal, &mut search, true, 15.0, false)
+                        .1
+                        .unwrap();
+                });
+            },
+        );
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            std::fs::read(&path).unwrap_or_default().is_empty(),
+            "Find leaked wheel input to the application"
+        );
+        search.close();
+        // Settle hit testing after removing the Find controls before the gesture.
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                events: vec![egui::Event::PointerMoved(pos)],
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    terminal_view(ui, &mut terminal, &mut search, true, 15.0, false)
+                        .1
+                        .unwrap();
+                });
+            },
+        );
+
         for _ in 0..4 {
             let _ = ctx.run(
                 egui::RawInput {
@@ -9719,6 +10489,291 @@ mod render_tests {
     }
 
     #[test]
+    fn large_copy_waits_for_busy_grid_and_delivers_exact_selection() {
+        use alacritty_terminal::grid::Dimensions;
+        let ctx = egui::Context::default();
+        let mut terminal = Terminal::spawn_test(
+            Uuid::new_v4(),
+            &std::env::current_dir().unwrap(),
+            std::path::Path::new(""),
+            ctx.clone(),
+        )
+        .unwrap();
+        let mut search = TerminalSearch::default();
+        let mut frame = |terminal: &mut Terminal, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 480.0))),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        terminal_view(ui, terminal, &mut search, true, 15.0, false)
+                            .1
+                            .unwrap();
+                    });
+                },
+            )
+        };
+        frame(&mut terminal, Vec::new());
+        std::thread::sleep(Duration::from_millis(50));
+        let expected = {
+            let mut term = terminal.term.lock().unwrap();
+            let mut parser: alacritty_terminal::vte::ansi::Processor = Default::default();
+            parser.advance(
+                &mut *term,
+                format!("{}\r\n", "界é copied ".repeat(8))
+                    .repeat(10_000)
+                    .as_bytes(),
+            );
+            let start = Point::new(Line(-(term.grid().history_size() as i32)), Column(0));
+            let end = Point::new(
+                Line(term.screen_lines() as i32 - 1),
+                Column(term.columns() - 1),
+            );
+            let mut selection = Selection::new(SelectionType::Simple, start, Side::Left);
+            selection.update(end, Side::Right);
+            term.selection = Some(selection);
+            term.selection_to_string().unwrap()
+        };
+        assert!(expected.len() > 512 * 1024);
+        let mode = terminal.mode();
+        let selection = terminal.term.lock().unwrap().selection.clone();
+        assert!(!terminal.copy_mode);
+        frame(&mut terminal, Vec::new());
+        let grid = terminal.term.clone();
+        let held = grid.lock().unwrap();
+        let mut output = frame(&mut terminal, vec![egui::Event::Copy]);
+        drop(held);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Some(text) =
+                output
+                    .platform_output
+                    .commands
+                    .iter()
+                    .find_map(|command| match command {
+                        egui::OutputCommand::CopyText(text) => Some(text),
+                        _ => None,
+                    })
+            {
+                assert_eq!(text.as_bytes(), expected.as_bytes());
+                assert_eq!(terminal.mode(), mode);
+                assert_eq!(terminal.term.lock().unwrap().selection, selection);
+                assert!(!terminal.copy_mode);
+                break;
+            }
+            assert!(Instant::now() < deadline, "large copy did not complete");
+            std::thread::sleep(Duration::from_millis(5));
+            output = frame(&mut terminal, Vec::new());
+        }
+    }
+
+    #[test]
+    #[ignore = "run with TESSERA_BENCH=1 for bounded rendering measurements"]
+    fn benchmark_terminal_rendering() {
+        if std::env::var_os("TESSERA_BENCH").is_none() {
+            return;
+        }
+        use alacritty_terminal::grid::Dimensions;
+        let ctx = egui::Context::default();
+        let mut terminal = Terminal::spawn_test(
+            Uuid::new_v4(),
+            &std::env::current_dir().unwrap(),
+            std::path::Path::new(""),
+            ctx.clone(),
+        )
+        .unwrap();
+        let mut search = TerminalSearch::default();
+        let mut frame = |terminal: &mut Terminal| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 480.0))),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        terminal_view(ui, terminal, &mut search, true, 15.0, false)
+                            .1
+                            .unwrap();
+                    });
+                },
+            )
+        };
+        frame(&mut terminal);
+        std::thread::sleep(Duration::from_millis(50));
+        {
+            let mut term = terminal.term.lock().unwrap();
+            let mut parser: alacritty_terminal::vte::ansi::Processor = Default::default();
+            let line = format!("{}\r\n", "build 界é ".repeat(8));
+            parser.advance(&mut *term, line.repeat(10_000).as_bytes());
+            let start = Point::new(Line(-(term.grid().history_size() as i32)), Column(0));
+            let end = Point::new(
+                Line(term.screen_lines() as i32 - 1),
+                Column(term.columns() - 1),
+            );
+            let mut selection = Selection::new(SelectionType::Simple, start, Side::Left);
+            selection.update(end, Side::Right);
+            term.selection = Some(selection);
+            eprintln!(
+                "render_selection_bytes={}",
+                term.selection_to_string().unwrap().len()
+            );
+        }
+        let mut times = Vec::new();
+        for _ in 0..100 {
+            let started = Instant::now();
+            std::hint::black_box(frame(&mut terminal));
+            times.push(started.elapsed().as_secs_f64() * 1000.0);
+        }
+        times.sort_by(f64::total_cmp);
+        eprintln!(
+            "render_frames=100 median_ms={:.3} p95_ms={:.3} max_ms={:.3}",
+            times[50], times[95], times[99]
+        );
+    }
+
+    #[test]
+    #[ignore = "set TESSERA_BENCH_RENDER=1 for bounded heavy-output rendering measurements"]
+    fn benchmark_heavy_output_rendering() {
+        if std::env::var_os("TESSERA_BENCH_RENDER").is_none() {
+            return;
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let fixture = root.join("tests/fixtures/terminal/workload.py");
+        let bytes = 16 * 1024 * 1024;
+        let overall = Instant::now();
+        for kind in ["build", "agent"] {
+            let temporary = tempfile::tempdir().unwrap();
+            let ack = temporary.path().join("ack");
+            let ctx = egui::Context::default();
+            let mut terminal = Terminal::spawn_agent(
+                Uuid::new_v4(),
+                root,
+                std::path::Path::new(""),
+                ctx.clone(),
+                &format!(
+                    "python3 '{}' {kind} {bytes} '{}'",
+                    fixture.display(),
+                    ack.display()
+                ),
+            )
+            .unwrap();
+            let marker = |terminal: &Terminal, marker: &str| {
+                terminal.term.try_lock().is_ok_and(|term| {
+                    term.grid()
+                        .display_iter()
+                        .map(|cell| cell.cell.c)
+                        .collect::<String>()
+                        .contains(marker)
+                })
+            };
+            let startup = Instant::now();
+            while !marker(&terminal, "BENCH_READY") {
+                assert!(
+                    startup.elapsed() < Duration::from_secs(15),
+                    "render benchmark startup timeout"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let mut search = TerminalSearch::default();
+            let mut frame = |terminal: &mut Terminal, events| {
+                ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 480.0))),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            terminal_view(ui, terminal, &mut search, true, 15.0, false)
+                                .1
+                                .unwrap();
+                        });
+                    },
+                )
+            };
+            frame(&mut terminal, Vec::new());
+            std::thread::sleep(Duration::from_millis(30));
+            ctx.data_mut(|data| {
+                data.insert_temp(
+                    egui::Id::new("terminal-render-counts"),
+                    TerminalRenderCounts::default(),
+                )
+            });
+            let started = Instant::now();
+            terminal.input(b"s".to_vec()).unwrap();
+            let mut input_started = None;
+            let mut input_ack = None;
+            let mut times = Vec::new();
+            let mut last_fresh = Instant::now();
+            let mut max_stale = Duration::ZERO;
+            let mut previous_fresh = 0;
+            loop {
+                let events =
+                    if input_started.is_none() && started.elapsed() >= Duration::from_millis(10) {
+                        input_started = Some(Instant::now());
+                        vec![egui::Event::Text("p".into())]
+                    } else {
+                        Vec::new()
+                    };
+                let frame_started = Instant::now();
+                std::hint::black_box(frame(&mut terminal, events));
+                let frame_duration = frame_started.elapsed();
+                times.push(frame_duration.as_secs_f64() * 1000.0);
+                let counts = TerminalRenderCounts::read(&ctx);
+                max_stale = max_stale.max(last_fresh.elapsed());
+                if counts.fresh > previous_fresh {
+                    last_fresh = Instant::now();
+                    previous_fresh = counts.fresh;
+                }
+                if input_ack.is_none() && ack.exists() {
+                    input_ack = Some(input_started.unwrap().elapsed().as_secs_f64() * 1000.0);
+                }
+                if marker(&terminal, "BENCH_DONE") && input_ack.is_some() {
+                    break;
+                }
+                assert!(
+                    started.elapsed() < Duration::from_secs(30),
+                    "heavy-output rendering timeout"
+                );
+                std::thread::sleep(Duration::from_millis(16).saturating_sub(frame_duration));
+            }
+            let counts = TerminalRenderCounts::read(&ctx);
+            times.sort_by(f64::total_cmp);
+            eprintln!(
+                "RENDER workload={kind} bytes={bytes} frames={} fresh_passes={} cached_passes={} fresh_pct={:.1} median_ms={:.3} p95_ms={:.3} max_ms={:.3} max_without_fresh_ms={:.3} input_ack_ms={:.3} output_ms={:.3}",
+                times.len(),
+                counts.fresh,
+                counts.busy,
+                100.0 * counts.fresh as f64 / (counts.fresh + counts.busy) as f64,
+                times[times.len() / 2],
+                times[(times.len() * 95 / 100).min(times.len() - 1)],
+                times[times.len() - 1],
+                max_stale.as_secs_f64() * 1000.0,
+                input_ack.unwrap(),
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+            assert!(
+                overall.elapsed() < Duration::from_secs(90),
+                "heavy-render overall time budget"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_render_lock_budget_preserves_bounded_fallback() {
+        let state = std::sync::Mutex::new(());
+        let held = state.lock().unwrap();
+        let started = Instant::now();
+        assert!(terminal_render_lock(&egui::Context::default(), &state).is_none());
+        assert!(started.elapsed() < Duration::from_millis(100));
+        drop(held);
+        assert!(terminal_render_lock(&egui::Context::default(), &state).is_some());
+    }
+
+    #[test]
     fn terminal_content_stays_visible_while_parser_holds_grid() {
         let ctx = egui::Context::default();
         let mut terminal = Terminal::spawn_test(
@@ -10288,7 +11343,8 @@ mod render_tests {
                         .unwrap();
                     assert!(
                         screen.contains_rect(modal),
-                        "Command center overflows: {modal:?}"
+                        "Command center page {} overflows: {modal:?}",
+                        page as u8
                     );
                     if page == CommandPage::Create {
                         let button = out

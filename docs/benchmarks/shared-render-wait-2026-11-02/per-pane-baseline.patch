@@ -1,0 +1,201 @@
+--- a/src/ui.rs
++++ b/src/ui.rs
+@@ -25,13 +25,12 @@
+     time::{Duration, Instant},
+ };
+ use uuid::Uuid;
++#[cfg(test)]
++mod render_benchmarks;
+ mod merge_radar;
+ mod remote_runs;
+ mod remote_settings;
+ mod remote_workers;
+-#[cfg(test)]
+-mod render_benchmarks;
+-mod render_budget;
+ mod restoration;
+ mod windows;
+ const ACCENT: Color32 = Color32::from_rgb(130, 198, 180);
+@@ -3805,9 +3804,6 @@
+                         }
+                     }
+                 }
+-                prepare_terminal_rendering(ctx, self.visible_terminal_panes(ctx).max(
+-                    rects.iter().filter(|(id, _)| self.panes.contains_key(id)).count(),
+-                ));
+                 for (id, rect) in rects {
+                     ui.scope_builder(egui::UiBuilder::new().max_rect(rect).id_salt(id), |ui| {
+                         self.restoration_panel(ui, ctx, id);
+@@ -4530,15 +4526,25 @@
+     copying: bool,
+ }
+ 
+-fn prepare_terminal_rendering(ctx: &egui::Context, visible_panes: usize) {
+-    render_budget::prepare(ctx, visible_panes);
+-}
+-
+-fn terminal_render_lock<'a, T>(
+-    ctx: &egui::Context,
+-    state: &'a std::sync::Mutex<T>,
+-) -> Option<std::sync::MutexGuard<'a, T>> {
+-    render_budget::lock(ctx, state)
++#[cfg(test)]
++fn prepare_terminal_rendering(_ctx: &egui::Context, _visible_panes: usize) {}
++
++const TERMINAL_RENDER_LOCK_BUDGET: Duration = Duration::from_micros(500);
++
++fn terminal_render_lock<T>(state: &std::sync::Mutex<T>) -> Option<std::sync::MutexGuard<'_, T>> {
++    let started = Instant::now();
++    loop {
++        match state.try_lock() {
++            Ok(guard) => return Some(guard),
++            Err(std::sync::TryLockError::WouldBlock) => {
++                if started.elapsed() >= TERMINAL_RENDER_LOCK_BUDGET {
++                    return None;
++                }
++                std::thread::yield_now();
++            }
++            Err(std::sync::TryLockError::Poisoned(_)) => return None,
++        }
++    }
+ }
+ 
+ fn terminal_view(
+@@ -4675,7 +4681,7 @@
+     let mut selection_busy = false;
+     let mut choice_prompt = None;
+     let mut choice_revision = 0;
+-    if let Some(mut term) = terminal_render_lock(ui.ctx(), &terminal.term) {
++    if let Some(mut term) = terminal_render_lock(&terminal.term) {
+         #[cfg(test)]
+         TerminalRenderCounts::record(ui.ctx(), true);
+         search.invalidate(terminal.revision());
+@@ -10234,10 +10240,10 @@
+         let state = std::sync::Mutex::new(());
+         let held = state.lock().unwrap();
+         let started = Instant::now();
+-        assert!(terminal_render_lock(&egui::Context::default(), &state).is_none());
++        assert!(terminal_render_lock(&state).is_none());
+         assert!(started.elapsed() < Duration::from_millis(100));
+         drop(held);
+-        assert!(terminal_render_lock(&egui::Context::default(), &state).is_some());
++        assert!(terminal_render_lock(&state).is_some());
+     }
+ 
+     #[test]
+--- a/src/ui/windows.rs
++++ b/src/ui/windows.rs
+@@ -379,44 +379,6 @@
+         }
+     }
+ 
+-    pub(super) fn visible_terminal_panes(&self, ctx: &egui::Context) -> usize {
+-        self.windows
+-            .iter()
+-            .map(|(id, window)| {
+-                if ctx.input(|input| {
+-                    input
+-                        .raw
+-                        .viewports
+-                        .get(id)
+-                        .is_some_and(|info| info.minimized == Some(true))
+-                }) {
+-                    return 0;
+-                }
+-                let drawing = self.drawing_window == Some(*id);
+-                let ui = if drawing { &self.ui } else { &window.ui };
+-                if ui.radar_visible || ui.autobot_visible || ui.specifications_view || ui.overview {
+-                    return 0;
+-                }
+-                let workspace = if drawing {
+-                    self.saved.workspaces.get(ui.active)
+-                } else {
+-                    window.active.and_then(|active| {
+-                        self.saved.workspaces.iter().find(|w| w.task.id == active)
+-                    })
+-                };
+-                let Some(workspace) = workspace else {
+-                    return 0;
+-                };
+-                if ui.maximized {
+-                    return usize::from(self.panes.contains_key(&workspace.focus));
+-                }
+-                let mut ids = Vec::new();
+-                workspace.layout.ids(&mut ids);
+-                ids.iter().filter(|id| self.panes.contains_key(id)).count()
+-            })
+-            .sum()
+-    }
+-
+     pub(super) fn show_windows(&mut self, ctx: &egui::Context) {
+         self.handle_app_quit(ctx);
+         if self.quitting {
+@@ -437,7 +399,6 @@
+                 },
+             );
+         }
+-        prepare_terminal_rendering(ctx, self.visible_terminal_panes(ctx));
+         if self.windows.contains_key(&egui::ViewportId::ROOT) {
+             self.draw_terminal_window(ctx, egui::ViewportId::ROOT);
+         }
+@@ -544,60 +505,6 @@
+     use super::*;
+ 
+     #[test]
+-    fn rendering_budget_counts_visible_live_panes_across_windows() {
+-        let ctx = egui::Context::default();
+-        let root = tempfile::tempdir().unwrap();
+-        let mut app = super::super::render_tests::fixture(3);
+-        let panes: Vec<_> = app.saved.workspaces.iter().map(|w| w.focus).collect();
+-        let tabs: Vec<_> = app.saved.workspaces.iter().map(|w| w.task.id).collect();
+-        let split = Uuid::new_v4();
+-        for id in panes.iter().copied().chain([split]) {
+-            assert!(app.spawn(id, &ctx, root.path().to_str().unwrap()));
+-        }
+-        app.saved.workspaces[0].layout.split(panes[0], split, true);
+-        app.restore_windows(&ctx);
+-        app.detach_workspace(&ctx, tabs[2], None);
+-        let child = app.workspace_window(tabs[2]);
+-        assert_eq!(app.visible_terminal_panes(&ctx), 3);
+-        app.windows
+-            .get_mut(&egui::ViewportId::ROOT)
+-            .unwrap()
+-            .ui
+-            .maximized = true;
+-        assert_eq!(app.visible_terminal_panes(&ctx), 2);
+-        app.windows.get_mut(&child).unwrap().ui.overview = true;
+-        assert_eq!(app.visible_terminal_panes(&ctx), 1);
+-
+-        let mut input = egui::RawInput::default();
+-        input
+-            .viewports
+-            .get_mut(&egui::ViewportId::ROOT)
+-            .unwrap()
+-            .minimized = Some(true);
+-        let output = ctx.run(input, |ctx| assert_eq!(app.visible_terminal_panes(ctx), 0));
+-        drop(output);
+-        let mut input = egui::RawInput::default();
+-        input
+-            .viewports
+-            .get_mut(&egui::ViewportId::ROOT)
+-            .unwrap()
+-            .minimized = Some(false);
+-        let output = ctx.run(input, |ctx| {
+-            app.windows.get_mut(&child).unwrap().ui.overview = false;
+-            std::mem::swap(
+-                &mut app.ui,
+-                &mut app.windows.get_mut(&egui::ViewportId::ROOT).unwrap().ui,
+-            );
+-            app.drawing_window = Some(egui::ViewportId::ROOT);
+-            app.ui.active = 1;
+-            assert_eq!(app.visible_terminal_panes(ctx), 2);
+-            app.panes.remove(&panes[1]);
+-            assert_eq!(app.visible_terminal_panes(ctx), 1);
+-        });
+-        drop(output);
+-    }
+-
+-    #[test]
+     fn restored_geometry_does_not_reset_on_next_frame() {
+         let mut window = TerminalWindow {
+             active: None,

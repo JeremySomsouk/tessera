@@ -8,6 +8,8 @@ mod github_debug;
 mod integration;
 mod merge_radar;
 mod model;
+#[cfg(test)]
+mod performance;
 mod remote_runs;
 mod resume;
 mod search;

@@ -6,9 +6,9 @@
 
 See which task needs a decision, keep related agent sessions together, and carry specifications and work stages beyond a single terminal session. Tessera brings that context into a native terminal workspace, so you can return to the CLI to review, approve, and act.
 
-[Download](https://github.com/JeremySomsouk/tessera/releases) · [Getting started](#install) · [Documentation](docs/usage.md) · [Release notes](docs/releases/0.12.2.md)
+[Download](https://github.com/JeremySomsouk/tessera/releases) · [Getting started](#install) · [Documentation](docs/usage.md) · [Release notes](docs/releases/0.13.0.md)
 
-Tessera runs on **macOS and Linux**, on Intel/AMD and ARM64. Built with Rust, with no browser runtime. Current version: **0.12.2 (alpha)**.
+Tessera runs on **macOS and Linux**, on Intel/AMD and ARM64. Built with Rust, with no browser runtime. Current version: **0.13.0 (alpha)**.
 
 ## A look inside
 
@@ -109,11 +109,13 @@ Preferences, work items, specifications, and bounded session histories are saved
 
 Tessera restores open workspaces, tabs, split ratios, focused panes, and their latest recorded directories automatically. Quitting or closing the final window saves the workspace and stops hosted processes. Explicitly stopped panes and workspaces stay closed. Closing a window while other windows remain open stops that window's terminals. Separate windows reopen with their original tabs, tab order, active tab, position, and size. Use Cmd+Q (Ctrl+Shift+Q on Linux) to quit while keeping all windows for the next launch. Older snapshots without window metadata open in one main window. Window placement may be adjusted by the operating system when the display setup changes.
 
-Ordinary terminals reopen as fresh shells. Claude and Codex panes resume only their exact saved conversation UUID, after checking the local session record and installed CLI resume support. Process-discovery placeholders cannot resume; enable Tessera's agent hooks to capture real session IDs. Failed resumes keep their identity and output, open a shell, and offer **Retry saved conversation**. Repair missing CLI installations, authentication, directories, or session files before retrying. No typed input or arbitrary running command is replayed.
+Ordinary terminals reopen as fresh shells. Claude and Codex panes resume only their exact saved conversation UUID, after checking the local session record and installed CLI resume support. Process-discovery placeholders cannot resume; enable Tessera's agent hooks to capture real session IDs. Failed resumes keep their identity and output, open a shell, and offer a saved-conversation retry in a new workspace. Repair missing CLI installations, authentication, directories, or session files before retrying. The fallback shell stays running while the new workspace resumes the conversation. No typed input or arbitrary running command is replayed.
 
 **Saved output (previous run, read only)** is separate from the live terminal. It retains rendered text, including scrollback, rather than executable terminal escape sequences. Colours, hidden text, and interactive screen state are omitted. Each pane keeps at most 2,000 lines and 256 KiB of UTF-8 text, with oldest output discarded first. Snapshots are taken every five seconds and flushed on clean exit, written atomically with private permissions and one validated backup. Total snapshot size is capped at 32 MiB. A corrupt primary snapshot can recover the previous generation; if neither copy is usable, the originals remain and a separate recovery workspace is used. Existing metadata-only snapshots migrate automatically.
 
 Tessera is an alpha with local sessions and no background terminal daemon. Update/relaunch uses the same clean-exit snapshot path; forced termination can lose changes since the last snapshot. See [terminal compatibility](docs/terminal-compatibility.md) for renderer limitations.
+
+Large pastes stream through the PTY in order. Each terminal admits up to 64 MiB of pending input by default, with a separate bounded allowance for terminal protocol replies. Set `TESSERA_INPUT_BUFFER_BYTES` before launching Tessera to change the input budget. An input that cannot fit is rejected in full with an error; accepted input can still fail if the receiving process exits. Closing the pane cancels pending input. Scrollback retains 10,000 rows, and saved output remains a bounded visual tail rather than a complete transcript. See [terminal performance](docs/terminal-performance.md) for architecture, limits, measured workloads, and benchmark commands.
 
 The macOS app downloads signed updates and installs them when you quit. On Linux, rerun the installer. [Update details](docs/updates.md)
 

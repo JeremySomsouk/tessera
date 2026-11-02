@@ -1,0 +1,607 @@
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -8,6 +8,8 @@
+ mod integration;
+ mod merge_radar;
+ mod model;
++#[cfg(test)]
++mod performance;
+ mod remote_runs;
+ mod resume;
+ mod search;
+--- /dev/null
++++ b/src/performance.rs
+@@ -0,0 +1,138 @@
++//! Opt-in, bounded end-to-end PTY measurements; see docs/terminal-performance.md.
++use crate::terminal::Terminal;
++use eframe::egui::Context;
++use std::time::{Duration, Instant};
++use uuid::Uuid;
++
++fn marker(terminal: &Terminal, text: &str) -> bool {
++    terminal.term.try_lock().is_ok_and(|term| {
++        term.grid()
++            .display_iter()
++            .map(|cell| cell.cell.c)
++            .collect::<String>()
++            .contains(text)
++    })
++}
++
++#[test]
++#[ignore = "set TESSERA_BENCH_MIB=1,4,16 to run bounded PTY workloads"]
++fn terminal_workloads() {
++    let Ok(mib) = std::env::var("TESSERA_BENCH_MIB") else { return };
++    let mib: usize = mib.parse().unwrap();
++    assert!((1..=16).contains(&mib), "benchmark budget: 1..=16 MiB/session");
++    let bytes = mib * 1024 * 1024;
++    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
++    let fixture = root.join("tests/fixtures/terminal/workload.py");
++    let overall = Instant::now();
++    let (initial_cpu, _) = resources();
++    for kind in ["build", "agent", "line"] {
++        for sessions in [1, 4] {
++            let startup = Instant::now();
++            let temporary = tempfile::tempdir().unwrap();
++            let terminals: Vec<_> = (0..sessions)
++                .map(|index| Terminal::spawn_agent(
++                    Uuid::new_v4(), root, std::path::Path::new("/tmp/tessera-bench-unused.sock"),
++                    Context::default(),
++                    &format!("python3 '{}' {kind} {bytes} '{}'", fixture.display(), temporary.path().join(index.to_string()).display()),
++                ).unwrap())
++                .collect();
++            let deadline = Instant::now() + Duration::from_secs(15);
++            while !terminals.iter().all(|term| marker(term, "BENCH_READY")) {
++                assert!(Instant::now() < deadline, "startup timeout");
++                std::thread::sleep(Duration::from_millis(1));
++            }
++            let startup_ms = startup.elapsed().as_secs_f64() * 1000.0;
++            let started = Instant::now();
++            for term in &terminals { term.input(b"s".to_vec()).unwrap(); }
++            std::thread::sleep(Duration::from_millis(10));
++            let input_started = Instant::now();
++            for term in &terminals { term.input(b"p".to_vec()).unwrap(); }
++            let mut input_ms = None;
++            let mut probes = 0usize;
++            let mut busy = 0usize;
++            let mut max_probe_us = 0u128;
++            loop {
++                let probe = Instant::now();
++                let mut complete = true;
++                for term in &terminals {
++                    probes += 1;
++                    if term.term.try_lock().is_err() { busy += 1; }
++                    complete &= marker(term, "BENCH_DONE");
++                }
++                max_probe_us = max_probe_us.max(probe.elapsed().as_micros());
++                if input_ms.is_none() && (0..sessions).all(|index| temporary.path().join(index.to_string()).exists()) {
++                    input_ms = Some(input_started.elapsed().as_secs_f64() * 1000.0);
++                }
++                if complete && input_ms.is_some() { break; }
++                assert!(started.elapsed() < Duration::from_secs(30), "output timeout");
++                std::thread::sleep(Duration::from_millis(1));
++            }
++            let elapsed = started.elapsed();
++            let snapshot = Instant::now();
++            let snapshot_bytes: usize = terminals.iter().map(|term| term.snapshot_output().len()).sum();
++            let snapshot_ms = snapshot.elapsed().as_secs_f64() * 1000.0;
++            let teardown = Instant::now();
++            drop(terminals);
++            println!("BENCH workload={kind} sessions={sessions} bytes_per_session={bytes} startup_ms={startup_ms:.2} input_ack_ms={:.2} output_ms={:.2} mib_s={:.2} busy_pct={:.1} max_probe_us={max_probe_us} snapshot_ms={snapshot_ms:.2} snapshot_bytes={snapshot_bytes} teardown_ms={:.2}", input_ms.unwrap(), elapsed.as_secs_f64()*1000.0, mib as f64*sessions as f64/elapsed.as_secs_f64(), busy as f64*100.0/probes as f64, teardown.elapsed().as_secs_f64()*1000.0);
++            let (cpu, rss) = resources();
++            println!("RESOURCES cumulative_cpu_s={:.3} peak_rss_bytes={rss}", cpu - initial_cpu);
++            assert!(overall.elapsed() < Duration::from_secs(180), "overall benchmark time budget");
++        }
++    }
++}
++
++#[cfg(unix)]
++fn resources() -> (f64, i64) {
++    let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
++    // SAFETY: getrusage initializes the supplied rusage on success.
++    assert_eq!(unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) }, 0);
++    let usage = unsafe { usage.assume_init() };
++    let cpu = usage.ru_utime.tv_sec as f64 + usage.ru_utime.tv_usec as f64 / 1e6
++        + usage.ru_stime.tv_sec as f64 + usage.ru_stime.tv_usec as f64 / 1e6;
++    let rss = if cfg!(target_os = "macos") { usage.ru_maxrss } else { usage.ru_maxrss * 1024 };
++    (cpu, rss)
++}
++
++
++#[test]
++#[ignore = "set TESSERA_BENCH_SOAK=1 for a bounded 256 MiB continuous session"]
++fn terminal_soak() {
++    if std::env::var_os("TESSERA_BENCH_SOAK").is_none() { return; }
++    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
++    let temporary = tempfile::tempdir().unwrap();
++    let ack = temporary.path().join("ack");
++    let bytes = 256 * 1024 * 1024;
++    let terminal = Terminal::spawn_agent(
++        Uuid::new_v4(), root, std::path::Path::new("/tmp/tessera-bench-unused.sock"),
++        Context::default(), &format!("python3 '{}' soak {bytes} '{}'", root.join("tests/fixtures/terminal/workload.py").display(), ack.display()),
++    ).unwrap();
++    let deadline = Instant::now() + Duration::from_secs(15);
++    while !marker(&terminal, "BENCH_READY") {
++        assert!(Instant::now() < deadline, "startup timeout");
++        std::thread::sleep(Duration::from_millis(1));
++    }
++    let started = Instant::now();
++    let (initial_cpu, _) = resources();
++    terminal.input(b"s".to_vec()).unwrap();
++    std::thread::sleep(Duration::from_millis(10));
++    let input_started = Instant::now();
++    terminal.input(b"p".to_vec()).unwrap();
++    while !ack.exists() {
++        assert!(input_started.elapsed() < Duration::from_secs(5), "input acknowledgement timeout");
++        std::thread::sleep(Duration::from_millis(1));
++    }
++    let input_ms = input_started.elapsed().as_secs_f64() * 1000.0;
++    let mut next_sample = 1;
++    loop {
++        if started.elapsed().as_secs() >= next_sample {
++            let (cpu, rss) = resources();
++            println!("SOAK seconds={} cpu_s={:.3} peak_rss_bytes={rss}", started.elapsed().as_secs(), cpu - initial_cpu);
++            assert!(rss < 512 * 1024 * 1024, "512 MiB process memory budget exceeded");
++            next_sample += 1;
++        }
++        if marker(&terminal, "BENCH_DONE") { break; }
++        assert!(started.elapsed() < Duration::from_secs(60), "soak time budget exceeded");
++        std::thread::sleep(Duration::from_millis(2));
++    }
++    println!("SOAK_DONE bytes={bytes} elapsed_ms={:.2} input_ack_ms={input_ms:.2}", started.elapsed().as_secs_f64() * 1000.0);
++}
+--- a/src/ui.rs
++++ b/src/ui.rs
+@@ -4490,6 +4490,32 @@
+     }
+ }
+ 
++#[cfg(test)]
++#[derive(Clone, Copy, Default)]
++struct TerminalRenderCounts {
++    fresh: usize,
++    busy: usize,
++}
++
++#[cfg(test)]
++impl TerminalRenderCounts {
++    fn record(ctx: &egui::Context, fresh: bool) {
++        ctx.data_mut(|data| {
++            let id = egui::Id::new("terminal-render-counts");
++            if let Some(mut counts) = data.get_temp::<Self>(id) {
++                counts.fresh += usize::from(fresh);
++                counts.busy += usize::from(!fresh);
++                data.insert_temp(id, counts);
++            }
++        });
++    }
++
++    fn read(ctx: &egui::Context) -> Self {
++        ctx.data(|data| data.get_temp::<Self>(egui::Id::new("terminal-render-counts")))
++            .unwrap_or_default()
++    }
++}
++
+ #[derive(Clone)]
+ struct TerminalPaintCache {
+     origin: Pos2,
+@@ -4628,6 +4654,8 @@
+     let mut choice_prompt = None;
+     let mut choice_revision = 0;
+     if let Ok(mut term) = terminal.term.try_lock() {
++        #[cfg(test)]
++        TerminalRenderCounts::record(ui.ctx(), true);
+         search.invalidate(terminal.revision());
+         mode = *term.mode();
+         if !primary_reporting
+@@ -4827,6 +4855,8 @@
+             )
+         });
+     } else {
++        #[cfg(test)]
++        TerminalRenderCounts::record(ui.ctx(), false);
+         if let Some(mut cache) = ui
+             .ctx()
+             .data(|data| data.get_temp::<TerminalPaintCache>(response.id.with("paint_cache")))
+@@ -9719,6 +9749,198 @@
+     }
+ 
+     #[test]
++    #[ignore = "run with TESSERA_BENCH=1 for bounded rendering measurements"]
++    fn benchmark_terminal_rendering() {
++        if std::env::var_os("TESSERA_BENCH").is_none() {
++            return;
++        }
++        use alacritty_terminal::grid::Dimensions;
++        let ctx = egui::Context::default();
++        let mut terminal = Terminal::spawn_test(
++            Uuid::new_v4(),
++            &std::env::current_dir().unwrap(),
++            std::path::Path::new(""),
++            ctx.clone(),
++        )
++        .unwrap();
++        let mut search = TerminalSearch::default();
++        let mut frame = |terminal: &mut Terminal| {
++            ctx.run(
++                egui::RawInput {
++                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 480.0))),
++                    ..Default::default()
++                },
++                |ctx| {
++                    egui::CentralPanel::default().show(ctx, |ui| {
++                        terminal_view(ui, terminal, &mut search, true, 15.0, false)
++                            .1
++                            .unwrap();
++                    });
++                },
++            )
++        };
++        frame(&mut terminal);
++        std::thread::sleep(Duration::from_millis(50));
++        {
++            let mut term = terminal.term.lock().unwrap();
++            let mut parser: alacritty_terminal::vte::ansi::Processor = Default::default();
++            let line = format!("{}\r\n", "build 界é ".repeat(8));
++            parser.advance(&mut *term, line.repeat(10_000).as_bytes());
++            let start = Point::new(Line(-(term.grid().history_size() as i32)), Column(0));
++            let end = Point::new(
++                Line(term.screen_lines() as i32 - 1),
++                Column(term.columns() - 1),
++            );
++            let mut selection = Selection::new(SelectionType::Simple, start, Side::Left);
++            selection.update(end, Side::Right);
++            term.selection = Some(selection);
++            eprintln!(
++                "render_selection_bytes={}",
++                term.selection_to_string().unwrap().len()
++            );
++        }
++        let mut times = Vec::new();
++        for _ in 0..100 {
++            let started = Instant::now();
++            std::hint::black_box(frame(&mut terminal));
++            times.push(started.elapsed().as_secs_f64() * 1000.0);
++        }
++        times.sort_by(f64::total_cmp);
++        eprintln!(
++            "render_frames=100 median_ms={:.3} p95_ms={:.3} max_ms={:.3}",
++            times[50], times[95], times[99]
++        );
++    }
++
++    #[test]
++    #[ignore = "set TESSERA_BENCH_RENDER=1 for bounded heavy-output rendering measurements"]
++    fn benchmark_heavy_output_rendering() {
++        if std::env::var_os("TESSERA_BENCH_RENDER").is_none() {
++            return;
++        }
++        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
++        let fixture = root.join("tests/fixtures/terminal/workload.py");
++        let bytes = 16 * 1024 * 1024;
++        let overall = Instant::now();
++        for kind in ["build", "agent"] {
++            let temporary = tempfile::tempdir().unwrap();
++            let ack = temporary.path().join("ack");
++            let ctx = egui::Context::default();
++            let mut terminal = Terminal::spawn_agent(
++                Uuid::new_v4(),
++                root,
++                std::path::Path::new(""),
++                ctx.clone(),
++                &format!(
++                    "python3 '{}' {kind} {bytes} '{}'",
++                    fixture.display(),
++                    ack.display()
++                ),
++            )
++            .unwrap();
++            let marker = |terminal: &Terminal, marker: &str| {
++                terminal.term.try_lock().is_ok_and(|term| {
++                    term.grid()
++                        .display_iter()
++                        .map(|cell| cell.cell.c)
++                        .collect::<String>()
++                        .contains(marker)
++                })
++            };
++            let startup = Instant::now();
++            while !marker(&terminal, "BENCH_READY") {
++                assert!(
++                    startup.elapsed() < Duration::from_secs(15),
++                    "render benchmark startup timeout"
++                );
++                std::thread::sleep(Duration::from_millis(1));
++            }
++            let mut search = TerminalSearch::default();
++            let mut frame = |terminal: &mut Terminal, events| {
++                ctx.run(
++                    egui::RawInput {
++                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 480.0))),
++                        events,
++                        ..Default::default()
++                    },
++                    |ctx| {
++                        egui::CentralPanel::default().show(ctx, |ui| {
++                            terminal_view(ui, terminal, &mut search, true, 15.0, false)
++                                .1
++                                .unwrap();
++                        });
++                    },
++                )
++            };
++            frame(&mut terminal, Vec::new());
++            std::thread::sleep(Duration::from_millis(30));
++            ctx.data_mut(|data| {
++                data.insert_temp(
++                    egui::Id::new("terminal-render-counts"),
++                    TerminalRenderCounts::default(),
++                )
++            });
++            let started = Instant::now();
++            terminal.input(b"s".to_vec()).unwrap();
++            let mut input_started = None;
++            let mut input_ack = None;
++            let mut times = Vec::new();
++            let mut last_fresh = Instant::now();
++            let mut max_stale = Duration::ZERO;
++            let mut previous_fresh = 0;
++            loop {
++                let events =
++                    if input_started.is_none() && started.elapsed() >= Duration::from_millis(10) {
++                        input_started = Some(Instant::now());
++                        vec![egui::Event::Text("p".into())]
++                    } else {
++                        Vec::new()
++                    };
++                let frame_started = Instant::now();
++                std::hint::black_box(frame(&mut terminal, events));
++                let frame_duration = frame_started.elapsed();
++                times.push(frame_duration.as_secs_f64() * 1000.0);
++                let counts = TerminalRenderCounts::read(&ctx);
++                max_stale = max_stale.max(last_fresh.elapsed());
++                if counts.fresh > previous_fresh {
++                    last_fresh = Instant::now();
++                    previous_fresh = counts.fresh;
++                }
++                if input_ack.is_none() && ack.exists() {
++                    input_ack = Some(input_started.unwrap().elapsed().as_secs_f64() * 1000.0);
++                }
++                if marker(&terminal, "BENCH_DONE") && input_ack.is_some() {
++                    break;
++                }
++                assert!(
++                    started.elapsed() < Duration::from_secs(30),
++                    "heavy-output rendering timeout"
++                );
++                std::thread::sleep(Duration::from_millis(16).saturating_sub(frame_duration));
++            }
++            let counts = TerminalRenderCounts::read(&ctx);
++            times.sort_by(f64::total_cmp);
++            eprintln!(
++                "RENDER workload={kind} bytes={bytes} frames={} fresh_passes={} cached_passes={} fresh_pct={:.1} median_ms={:.3} p95_ms={:.3} max_ms={:.3} max_without_fresh_ms={:.3} input_ack_ms={:.3} output_ms={:.3}",
++                times.len(),
++                counts.fresh,
++                counts.busy,
++                100.0 * counts.fresh as f64 / (counts.fresh + counts.busy) as f64,
++                times[times.len() / 2],
++                times[(times.len() * 95 / 100).min(times.len() - 1)],
++                times[times.len() - 1],
++                max_stale.as_secs_f64() * 1000.0,
++                input_ack.unwrap(),
++                started.elapsed().as_secs_f64() * 1000.0
++            );
++            assert!(
++                overall.elapsed() < Duration::from_secs(90),
++                "heavy-render overall time budget"
++            );
++        }
++    }
++
++    #[test]
+     fn terminal_content_stays_visible_while_parser_holds_grid() {
+         let ctx = egui::Context::default();
+         let mut terminal = Terminal::spawn_test(
+--- a/src/ui/restoration.rs
++++ b/src/ui/restoration.rs
+@@ -378,6 +378,71 @@
+     }
+ 
+     #[test]
++    #[ignore = "run with TESSERA_BENCH=1 for bounded restoration measurements"]
++    fn benchmark_restoration() {
++        if std::env::var_os("TESSERA_BENCH").is_none() {
++            return;
++        }
++        let ctx = egui::Context::default();
++        let root = tempfile::tempdir().unwrap();
++        let mut app = fixture(16);
++        app.saved.sessions.clear();
++        let history = format!("{}\n", "retained 界é output ".repeat(6)).repeat(2_000);
++        for workspace in &mut app.saved.workspaces {
++            workspace.task.directory = root.path().to_string_lossy().into_owned();
++            app.saved.restoration.panes.insert(
++                workspace.focus,
++                SavedPane {
++                    directory: workspace.task.directory.clone(),
++                    output: bounded(&history),
++                    ..Default::default()
++                },
++            );
++        }
++        let started = Instant::now();
++        app.restore_workspace(&ctx);
++        let startup = started.elapsed().as_secs_f64() * 1000.0;
++        assert_eq!(app.panes.len(), 16);
++        let mut capture = Vec::new();
++        for _ in 0..5 {
++            let started = Instant::now();
++            app.capture_restoration_with(true);
++            capture.push(started.elapsed().as_secs_f64() * 1000.0);
++        }
++        capture.sort_by(f64::total_cmp);
++        let path = root.path().join("snapshot.json");
++        let started = Instant::now();
++        crate::snapshot::save(&path, &app.saved).unwrap();
++        let first_save = started.elapsed().as_secs_f64() * 1000.0;
++        let started = Instant::now();
++        crate::snapshot::save(&path, &app.saved).unwrap();
++        let recovery_save = started.elapsed().as_secs_f64() * 1000.0;
++        let started = Instant::now();
++        let saved: Saved = crate::snapshot::load(&path).unwrap().unwrap();
++        let load = started.elapsed().as_secs_f64() * 1000.0;
++        let expected: HashMap<_, _> = saved
++            .restoration
++            .panes
++            .iter()
++            .map(|(id, pane)| (*id, pane.output.clone()))
++            .collect();
++        drop(app);
++        let mut restored = fixture(0);
++        restored.saved = saved;
++        let started = Instant::now();
++        restored.restore_workspace(&ctx);
++        let restore = started.elapsed().as_secs_f64() * 1000.0;
++        for (id, text) in expected {
++            assert_eq!(restored.restoration.history[&id], bounded(&text));
++        }
++        eprintln!(
++            "restore_panes=16 snapshot_bytes={} initial_ms={startup:.3} capture_median_ms={:.3} first_save_ms={first_save:.3} recovery_save_ms={recovery_save:.3} load_ms={load:.3} restore_ms={restore:.3}",
++            std::fs::metadata(path).unwrap().len(),
++            capture[2]
++        );
++    }
++
++    #[test]
+     fn remote_output_never_enters_snapshots_and_reopens_as_a_fresh_shell() {
+         let ctx = egui::Context::default();
+         let root = tempfile::tempdir().unwrap();
+--- a/src/terminal.rs
++++ b/src/terminal.rs
+@@ -1541,4 +1541,85 @@
+             "shell did not respond with output and resized dimensions"
+         );
+     }
+-}
++    #[test]
++    #[ignore = "bounded terminal transport benchmark"]
++    fn transport_benchmark() {
++        use std::time::Instant;
++        for bytes in [32 * 1024, 256 * 1024, 4 * 1024 * 1024] {
++            let root = tempfile::tempdir().unwrap();
++            let path = root.path().join("received");
++            let mut command = CommandBuilder::new("/bin/sh");
++            command.args(["-c", "stty raw -echo; printf READY; exec cat > received"]);
++            let start = Instant::now();
++            let terminal = Terminal::spawn_command(
++                Uuid::new_v4(),
++                root.path(),
++                Path::new(""),
++                Context::default(),
++                command,
++            )
++            .unwrap();
++            let deadline = start + Duration::from_secs(10);
++            while !terminal.snapshot_output().contains("READY") {
++                assert!(Instant::now() < deadline);
++                std::thread::sleep(Duration::from_millis(1));
++            }
++            let startup = start.elapsed();
++            let payload = "a界\n".repeat(bytes / 5);
++            let expected = payload.replace('\n', "\r");
++            let start = Instant::now();
++            let result = terminal.paste(&payload);
++            let submit = start.elapsed();
++            if result.is_ok() {
++                while !std::fs::metadata(&path).is_ok_and(|m| m.len() == expected.len() as u64) {
++                    assert!(Instant::now() < deadline, "paste timed out");
++                    std::thread::sleep(Duration::from_millis(1));
++                }
++                assert_eq!(std::fs::read(&path).unwrap(), expected.as_bytes());
++            }
++            eprintln!(
++                "transport bytes={} startup_ms={:.3} submit_ms={:.3} completion_ms={:.3} result={:?}",
++                payload.len(),
++                startup.as_secs_f64() * 1000.0,
++                submit.as_secs_f64() * 1000.0,
++                start.elapsed().as_secs_f64() * 1000.0,
++                result
++            );
++        }
++        let root = tempfile::tempdir().unwrap();
++        let mut command = CommandBuilder::new("/bin/sh");
++        command.args([
++            "-c",
++            "stty raw -echo; printf READY; sleep 1; exec cat > received",
++        ]);
++        let mut terminal = Terminal::spawn_command(
++            Uuid::new_v4(),
++            root.path(),
++            Path::new(""),
++            Context::default(),
++            command,
++        )
++        .unwrap();
++        let deadline = Instant::now() + Duration::from_secs(5);
++        while !terminal.snapshot_output().contains("READY") {
++            assert!(Instant::now() < deadline);
++            std::thread::sleep(Duration::from_millis(1));
++        }
++        terminal.input(vec![b'x'; 60 * 1024]).unwrap();
++        std::thread::sleep(Duration::from_millis(10));
++        let start = Instant::now();
++        terminal.resize(Size {
++            cols: 101,
++            rows: 31,
++        });
++        while terminal.term.lock().unwrap().columns() != 101 {
++            assert!(Instant::now() < deadline);
++            std::thread::sleep(Duration::from_millis(1));
++        }
++        eprintln!(
++            "transport slow_consumer_resize_ms={:.3}",
++            start.elapsed().as_secs_f64() * 1000.0
++        );
++    }
++
++}
+--- /dev/null
++++ b/tests/fixtures/terminal/workload.py
+@@ -0,0 +1,37 @@
++"""Bounded, deterministic PTY benchmark producer. No external dependencies."""
++import os
++import sys
++import tty
++import threading
++import time
++
++tty.setraw(0)
++kind, count = sys.argv[1], int(sys.argv[2])
++records = {
++    "build": b"Compiling crate v1.0.0: warning: unused variable at src/main.rs:42\r\n",
++    "agent": "\x1b[32mtool complete\x1b[0m: 界 café e\u0301 🚀\r\n".encode(),
++    "line": b"x" * 16384,
++}
++record = records["agent" if kind == "soak" else kind]
++block = record * max(1, 16384 // len(record))
++os.write(1, b"\r\nBENCH_READY\r\n")
++assert os.read(0, 1) == b"s"
++def acknowledge():
++    assert os.read(0, 1) == b"p"
++    with open(sys.argv[3], "wb") as output:
++        output.write(b"p")
++
++thread = threading.Thread(target=acknowledge)
++thread.start()
++remaining = count
++while remaining:
++    data = block if remaining >= len(block) else record * (remaining // len(record)) + b" " * (remaining % len(record))
++    while data:
++        written = os.write(1, data)
++        remaining -= written
++        data = data[written:]
++    if kind == "soak":
++        time.sleep(0.001)
++os.write(1, b"\r\nBENCH_DONE\r\n")
++thread.join()
++os.read(0, 1)

@@ -1,0 +1,8 @@
+
+running 1 test
+RENDER workload=build bytes=16777216 frames=53 fresh_passes=4 cached_passes=49 fresh_pct=7.5 median_ms=0.740 p95_ms=2.073 max_ms=3.601 max_without_fresh_ms=598.336 input_ack_ms=20.646 output_ms=985.308
+RENDER workload=agent bytes=16777216 frames=55 fresh_passes=4 cached_passes=51 fresh_pct=7.3 median_ms=0.321 p95_ms=0.914 max_ms=3.448 max_without_fresh_ms=692.691 input_ack_ms=20.588 output_ms=1029.571
+test ui::render_tests::benchmark_heavy_output_rendering ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 330 filtered out; finished in 5.38s
+

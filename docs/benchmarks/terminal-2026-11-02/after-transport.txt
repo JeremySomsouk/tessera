@@ -1,0 +1,10 @@
+
+running 1 test
+test terminal::pty_tests::transport_benchmark ... transport bytes=32765 startup_ms=82.880 submit_ms=0.016 completion_ms=18.210 result=Ok(())
+transport bytes=262140 startup_ms=57.292 submit_ms=0.023 completion_ms=31.123 result=Ok(())
+transport bytes=4194300 startup_ms=53.103 submit_ms=0.318 completion_ms=225.395 result=Ok(())
+transport slow_consumer_resize_ms=5.811
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 349 filtered out; finished in 0.83s
+
