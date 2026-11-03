@@ -6,9 +6,9 @@
 
 See which task needs a decision, keep related agent sessions together, and carry specifications and work stages beyond a single terminal session. Tessera brings that context into a native terminal workspace, so you can return to the CLI to review, approve, and act.
 
-[Download](https://github.com/JeremySomsouk/tessera/releases) · [Getting started](#install) · [Documentation](docs/usage.md) · [Release notes](docs/releases/0.13.1.md)
+[Download](https://github.com/JeremySomsouk/tessera/releases) · [Getting started](#install) · [Documentation](docs/usage.md) · [Release notes](docs/releases/0.14.0.md)
 
-Tessera runs on **macOS and Linux**, on Intel/AMD and ARM64. Built with Rust, with no browser runtime. Current version: **0.13.1 (alpha)**.
+Tessera runs on **macOS and Linux**, on Intel/AMD and ARM64. Built with Rust, with no browser runtime. Current version: **0.14.0 (alpha)**.
 
 ## A look inside
 
@@ -75,7 +75,7 @@ Use **Terminal** for shells, **Work** for task context, and **Autobot** for conf
 
 Configure an Autobot source in Settings, then track ticket keys such as `ACME-42`. The page groups recent runs and linked pull requests by source and ticket, surfaces failures, and opens a run timeline with job/step progress. Refresh manually or enable optional live refresh while the page is visible. Autobot stays hidden until a source is configured. Authentication remains with your installed `gh` CLI. [Autobot setup and controls](docs/usage.md#autobot)
 
-**Claude in folder** searches existing folders by name and opens a terminal running `claude`. Configure **Search roots** there or in Settings to keep folder-name searches within selected directories. Pasting an exact existing path also works, including outside those roots.
+**Claude in folder** searches existing folders by name and opens a terminal running `claude`. Use **Git** beside a folder result, **Git before launch** in New workspace, or **Git** in a terminal header to fetch origin, switch to the default branch, pull, and search local or origin branches. Configure **Search roots** there or in Settings to keep folder-name searches within selected directories. Pasting an exact existing path also works, including outside those roots.
 
 On macOS, use Cmd below. On Linux, replace Cmd with Ctrl+Alt.
 

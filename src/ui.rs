@@ -25,6 +25,7 @@ use std::{
     time::{Duration, Instant},
 };
 use uuid::Uuid;
+mod git;
 mod merge_radar;
 mod remote_runs;
 mod remote_settings;
@@ -501,6 +502,7 @@ struct WorkspaceRename {
 }
 
 struct WindowUi {
+    git: Option<git::Panel>,
     remote: Option<remote_runs::Panel>,
     autobot_visible: bool,
     radar_visible: bool,
@@ -522,8 +524,10 @@ struct WindowUi {
     command_page: CommandPage,
     command_index: usize,
     command_focus: bool,
+    create_focus: bool,
     folder_search: Option<crate::folders::FolderSearch>,
     folder_query: String,
+    folder_focus: Option<PathBuf>,
     folder_error: Option<String>,
     rename: Option<WorkspaceRename>,
     closing: Option<TerminalClose>,
@@ -546,6 +550,7 @@ impl Default for WindowUi {
     fn default() -> Self {
         Self {
             active: 0,
+            git: None,
             remote: None,
             autobot_visible: false,
             radar_visible: false,
@@ -568,8 +573,10 @@ impl Default for WindowUi {
             command_page: CommandPage::Commands,
             command_index: 0,
             command_focus: false,
+            create_focus: false,
             folder_search: None,
             folder_query: String::new(),
+            folder_focus: None,
             folder_error: None,
             rename: None,
             closing: None,
@@ -1357,7 +1364,7 @@ impl App {
         } else {
             Modifiers::CTRL | Modifiers::ALT
         };
-        if self.ui.rename.is_some() || self.ui.closing.is_some() {
+        if self.ui.rename.is_some() || self.ui.closing.is_some() || self.ui.git.is_some() {
             return;
         }
         if ctx.input_mut(|i| i.consume_key(command | Modifiers::SHIFT, Key::L)) {
@@ -2281,8 +2288,10 @@ impl App {
         self.ui.command_page = page;
         self.ui.command_index = 0;
         self.ui.command_focus = true;
+        self.ui.create_focus = false;
         self.ui.filter.clear();
         self.ui.folder_query.clear();
+        self.ui.folder_focus = None;
         self.ui.folder_error = None;
         if let Some(search) = &mut self.ui.folder_search {
             search.cancel();
@@ -2774,21 +2783,30 @@ impl App {
                 if page == CommandPage::Create {
                     ui.add_space(12.0);
                     let create = ui
-                        .add_enabled_ui(
-                            self.folder_launch.is_none()
-                                && !self.ui.new_directory.trim().is_empty(),
-                            |ui| {
-                                primary_button(
-                                    ui,
-                                    if self.folder_launch.is_some() {
-                                        "Starting…"
-                                    } else {
-                                        "Create workspace"
-                                    },
-                                )
-                            },
-                        )
+                        .push_id("create-workspace-action", |ui| {
+                            ui.add_enabled_ui(
+                                self.folder_launch.is_none()
+                                    && !self.ui.new_directory.trim().is_empty(),
+                                |ui| {
+                                    primary_button(
+                                        ui,
+                                        if self.folder_launch.is_some() {
+                                            "Starting…"
+                                        } else {
+                                            "Create workspace"
+                                        },
+                                    )
+                                },
+                            )
+                            .inner
+                        })
                         .inner;
+                    if self.ui.create_focus && create.enabled() {
+                        if create.has_focus() && !ui.is_sizing_pass() {
+                            self.ui.create_focus = false;
+                        }
+                        create.request_focus();
+                    }
                     if create.clicked()
                         || submit == Some(egui::Id::new("workspace-directory"))
                         || submit == Some(egui::Id::new("new-workspace-name"))
@@ -2846,6 +2864,15 @@ impl App {
         }
         if let Ok(path) = crate::directories::resolve(&self.ui.new_directory) {
             ui.small(format!("Workspace directory: {}", path.display()));
+            if ui
+                .add_enabled(path.is_dir(), egui::Button::new("Git before launch"))
+                .on_hover_text(
+                    "Prepare branches in this existing directory before starting the terminal",
+                )
+                .clicked()
+            {
+                self.open_launch_git(ui.ctx(), path);
+            }
         }
         ui.add_space(10.0);
         let label = ui.label("Name (optional)");
@@ -3234,6 +3261,15 @@ impl App {
             self.ui.command_index = 0;
         }
         let count = search.results.len();
+        let focus_index = self.ui.folder_focus.as_ref().and_then(|path| {
+            search
+                .results
+                .iter()
+                .position(|folder| folder.path == *path)
+        });
+        if let Some(index) = focus_index {
+            self.ui.command_index = index;
+        }
         self.ui.command_index = self.ui.command_index.min(count.saturating_sub(1));
         if count > 0 && !launching {
             if down {
@@ -3255,6 +3291,8 @@ impl App {
             });
         }
         let mut chosen = None;
+        let mut git_directory = None;
+        let mut folder_focused = false;
         egui::ScrollArea::vertical().id_salt("folder-results")
             .max_height((ui.available_height() - 36.0).max(40.0)).auto_shrink([false, false])
             .show(ui, |ui| {
@@ -3270,9 +3308,20 @@ impl App {
                     let selected = index == self.ui.command_index;
                     let response = ui.push_id((&folder.path, "folder-result"), |ui| {
                         ui.add_enabled_ui(!launching, |ui| {
-                            command_row(ui, &folder.name, &path, "", selected, ui.available_width())
+                            ui.horizontal(|ui| {
+                                let row = command_row(ui, &folder.name, &path, "", selected, (ui.available_width() - 48.0).max(40.0));
+                                if ui.button("Git").on_hover_text(format!("Prepare Git branches before launching in {}", path)).clicked() {
+                                    git_directory = Some(folder.path.clone());
+                                }
+                                row
+                            }).inner
                         }).inner
                     }).inner.on_hover_text(path.as_ref());
+                    if focus_index == Some(index) && !launching {
+                        folder_focused = response.has_focus();
+                        response.request_focus();
+                        response.scroll_to_me(Some(egui::Align::Center));
+                    }
                     if !down && !up && response.has_focus() && self.ui.command_index != index {
                         self.ui.command_index = index;
                         ctx.request_repaint();
@@ -3297,7 +3346,12 @@ impl App {
                 self.ui.command_page = CommandPage::Settings;
             }
         });
-        if let Some(path) = chosen {
+        if !ui.is_sizing_pass() && (folder_focused || (focus_index.is_none() && !search.loading)) {
+            self.ui.folder_focus = None;
+        }
+        if let Some(path) = git_directory {
+            self.open_launch_git(ctx, path);
+        } else if let Some(path) = chosen {
             self.launch_folder(ctx, path);
         }
     }
@@ -3986,7 +4040,8 @@ impl App {
                 }
             }
         }
-        if (!self.ui.palette || self.ui.command_page != CommandPage::Folders)
+        if self.ui.git.is_none()
+            && (!self.ui.palette || self.ui.command_page != CommandPage::Folders)
             && let Some(search) = &mut self.ui.folder_search
         {
             search.cancel();
@@ -4090,7 +4145,7 @@ impl App {
                     w.layout.rects(ui, rect, &mut rects);
                 }
                 let mut focused = w.focus;
-                if !self.ui.palette && self.ui.rename.is_none() && self.ui.closing.is_none() {
+                if !self.ui.palette && self.ui.rename.is_none() && self.ui.closing.is_none() && self.ui.git.is_none() {
                     let dropped = ctx.input_mut(|i| std::mem::take(&mut i.raw.dropped_files));
                     if !dropped.is_empty() {
                         let pointer = ctx.input(|i| i.pointer.latest_pos());
@@ -4158,12 +4213,14 @@ impl App {
                                     && !self.restoration.pending.contains_key(&id)
                                     && !self.ui.palette
                                     && self.ui.rename.is_none()
+                                    && self.ui.git.is_none()
                                     && self.ui.closing.is_none(),
 
                                 self.font_size,
                                 self.saved.clickable_codex_choices
                                     && !self.ui.palette
                                     && self.ui.rename.is_none()
+                                    && self.ui.git.is_none()
                                     && self.ui.closing.is_none(),
                             );
                             if let Some(text) = new_tab {
@@ -4188,6 +4245,7 @@ impl App {
             let was_maximized = self.ui.maximized;
             self.focus_pane(id);
             match action {
+                "Git" => self.open_git(ctx, id),
                 "Stop terminal" => self.request_stop_terminal(id),
                 "Split side by side" => self.split(ctx, true),
                 "Split stacked" => self.split(ctx, false),
@@ -4215,6 +4273,7 @@ impl App {
         }
         self.rename_dialog(ctx);
         self.close_dialog(ctx);
+        self.git_dialog(ctx);
         if !self.ui.autobot_visible
             || self.ui.palette
             || ctx.input(|input| input.viewport().minimized.unwrap_or(false))
@@ -4442,7 +4501,14 @@ fn terminal_header(
                     }
                 }
             });
-            let available = ui.available_width();
+            if ui
+                .button("Git")
+                .on_hover_text("Fetch, pull, and search Git branches for this terminal")
+                .clicked()
+            {
+                action = Some("Git");
+            }
+            let available = ui.available_width().max(0.0);
             ui.allocate_ui_with_layout(
                 Vec2::new(available, 30.0),
                 egui::Layout::left_to_right(egui::Align::Center),
@@ -7647,12 +7713,14 @@ mod render_tests {
         let ctx = egui::Context::default();
         let mut app = folder_keyboard_fixture(&ctx);
         tab_to_second_folder(&mut app, &ctx);
-        folder_keyboard_frame(
-            &mut app,
-            &ctx,
-            vec![key_event(Key::Tab, None, Modifiers::NONE)],
-        );
-        folder_keyboard_frame(&mut app, &ctx, vec![]);
+        for _ in 0..2 {
+            folder_keyboard_frame(
+                &mut app,
+                &ctx,
+                vec![key_event(Key::Tab, None, Modifiers::NONE)],
+            );
+            folder_keyboard_frame(&mut app, &ctx, vec![]);
+        }
         folder_keyboard_frame(
             &mut app,
             &ctx,

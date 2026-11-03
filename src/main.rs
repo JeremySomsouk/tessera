@@ -4,6 +4,7 @@ mod directories;
 mod discovery;
 mod folders;
 mod fonts;
+mod git;
 mod github_debug;
 mod integration;
 mod merge_radar;
