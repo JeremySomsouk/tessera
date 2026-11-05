@@ -341,11 +341,11 @@ impl EventListener for Listener {
         // OSC 52 clipboard access is denied, including reads.
     }
 }
-fn protocol_reply(term: &Term<Listener>, event: Event) -> Option<Vec<u8>> {
+fn protocol_reply(term: &Term<Listener>, event: Event, theme: TerminalTheme) -> Option<Vec<u8>> {
     match event {
         Event::PtyWrite(text) => Some(text.into_bytes()),
         Event::ColorRequest(index, format) if index <= NamedColor::DimForeground as usize => {
-            let fallback = color_index(index);
+            let fallback = color_index(index, theme);
             let rgb = term.colors()[index].unwrap_or(Rgb {
                 r: fallback.r(),
                 g: fallback.g(),
@@ -694,6 +694,7 @@ impl Terminal {
                     Err(_) => 0,
                 };
                 if n > 0 || eof || sync_expired {
+                    let theme = TerminalTheme::from_context(&read_ctx);
                     let pending = if let Ok(mut t) = parser_term.lock() {
                         if n > 0 {
                             parser.advance(&mut *t, &buf[..n]);
@@ -712,7 +713,7 @@ impl Terminal {
                         let events = std::mem::take(&mut *replies.lock().unwrap());
                         events
                             .into_iter()
-                            .filter_map(|event| protocol_reply(&t, event))
+                            .filter_map(|event| protocol_reply(&t, event, theme))
                             .flatten()
                             .collect::<Vec<_>>()
                     } else {
@@ -1105,16 +1106,51 @@ impl Drop for Terminal {
         }
     }
 }
-pub fn color(c: Color) -> Color32 {
-    let index = match c {
-        Color::Spec(rgb) => return Color32::from_rgb(rgb.r, rgb.g, rgb.b),
-        Color::Indexed(i) => i as usize,
-        Color::Named(n) => n as usize,
-    };
-    color_index(index)
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalTheme {
+    Light,
+    #[default]
+    #[serde(other)]
+    Dark,
 }
 
-fn color_index(index: usize) -> Color32 {
+impl TerminalTheme {
+    pub fn from_context(ctx: &Context) -> Self {
+        ctx.data(|data| data.get_temp(eframe::egui::Id::new("terminal-theme")))
+            .unwrap_or_default()
+    }
+
+    pub fn apply(self, ctx: &Context) {
+        ctx.data_mut(|data| data.insert_temp(eframe::egui::Id::new("terminal-theme"), self));
+        let viewports = ctx.input(|input| input.raw.viewports.keys().copied().collect::<Vec<_>>());
+        for viewport in viewports {
+            ctx.request_repaint_of(viewport);
+        }
+    }
+
+    pub fn background(self) -> Color32 {
+        self.color(Color::Named(NamedColor::Background))
+    }
+
+    pub fn selection(self) -> Color32 {
+        match self {
+            Self::Dark => Color32::from_rgb(55, 85, 91),
+            Self::Light => Color32::from_rgb(194, 220, 230),
+        }
+    }
+
+    pub fn color(self, color: Color) -> Color32 {
+        let index = match color {
+            Color::Spec(rgb) => return Color32::from_rgb(rgb.r, rgb.g, rgb.b),
+            Color::Indexed(i) => i as usize,
+            Color::Named(n) => n as usize,
+        };
+        color_index(index, self)
+    }
+}
+
+fn color_index(index: usize, theme: TerminalTheme) -> Color32 {
     const PALETTE: [[u8; 3]; 16] = [
         [28, 31, 38],
         [231, 115, 131],
@@ -1147,17 +1183,29 @@ fn color_index(index: usize) -> Color32 {
     } else if index < 256 {
         Color32::from_gray((8 + (index - 232) * 10) as u8)
     } else if index == NamedColor::Background as usize {
-        Color32::from_rgb(24, 27, 34)
+        match theme {
+            TerminalTheme::Dark => Color32::from_rgb(24, 27, 34),
+            TerminalTheme::Light => Color32::from_rgb(250, 250, 250),
+        }
     } else if index == NamedColor::Cursor as usize {
-        Color32::from_rgb(130, 198, 180)
+        match theme {
+            TerminalTheme::Dark => Color32::from_rgb(130, 198, 180),
+            TerminalTheme::Light => Color32::from_rgb(27, 108, 87),
+        }
     } else if (NamedColor::DimBlack as usize..=NamedColor::DimWhite as usize).contains(&index) {
-        color_index(index - NamedColor::DimBlack as usize).gamma_multiply(0.65)
+        color_index(index - NamedColor::DimBlack as usize, theme).gamma_multiply(0.65)
     } else if index == NamedColor::BrightForeground as usize {
-        color_index(NamedColor::BrightWhite as usize)
+        match theme {
+            TerminalTheme::Dark => color_index(NamedColor::BrightWhite as usize, theme),
+            TerminalTheme::Light => Color32::from_rgb(29, 43, 49),
+        }
     } else if index == NamedColor::DimForeground as usize {
-        color_index(NamedColor::Foreground as usize).gamma_multiply(0.65)
+        color_index(NamedColor::Foreground as usize, theme).gamma_multiply(0.65)
     } else {
-        Color32::from_rgb(216, 221, 230)
+        match theme {
+            TerminalTheme::Dark => Color32::from_rgb(216, 221, 230),
+            TerminalTheme::Light => Color32::from_rgb(29, 43, 49),
+        }
     }
 }
 #[cfg(test)]
@@ -1456,35 +1504,65 @@ mod tests {
         assert_eq!(term.renderable_content().cursor.shape, CursorShape::Beam);
     }
     #[test]
-    fn terminal_color_queries_report_dark_background_and_current_dynamic_colors() {
-        let replies = Arc::new(Mutex::new(Vec::new()));
-        let listener = Listener {
-            replies: replies.clone(),
-        };
-        let mut term = Term::new(terminal_config(), &Size { cols: 20, rows: 5 }, listener);
-        let mut parser: Processor = Processor::new();
-        parser.advance(&mut term, b"\x1b]10;?\x07\x1b]11;?\x07");
-        let responses: Vec<_> = std::mem::take(&mut *replies.lock().unwrap())
-            .into_iter()
-            .filter_map(|event| protocol_reply(&term, event))
-            .collect();
-        assert_eq!(
-            responses,
-            [
-                b"\x1b]10;rgb:d8d8/dddd/e6e6\x07".to_vec(),
-                b"\x1b]11;rgb:1818/1b1b/2222\x07".to_vec()
-            ]
-        );
-        parser.advance(&mut term, b"\x1b]11;#123456\x07\x1b]11;?\x1b\\");
-        let responses: Vec<_> = std::mem::take(&mut *replies.lock().unwrap())
-            .into_iter()
-            .filter_map(|event| protocol_reply(&term, event))
-            .collect();
-        assert_eq!(responses, [b"\x1b]11;rgb:1212/3434/5656\x1b\\".to_vec()]);
+    fn terminal_color_queries_follow_theme_and_preserve_application_overrides() {
+        for (theme, foreground, background) in [
+            (TerminalTheme::Dark, "d8d8/dddd/e6e6", "1818/1b1b/2222"),
+            (TerminalTheme::Light, "1d1d/2b2b/3131", "fafa/fafa/fafa"),
+        ] {
+            let replies = Arc::new(Mutex::new(Vec::new()));
+            let listener = Listener {
+                replies: replies.clone(),
+            };
+            let mut term = Term::new(terminal_config(), &Size { cols: 20, rows: 5 }, listener);
+            let mut parser: Processor = Processor::new();
+            let responses = |term: &Term<Listener>| {
+                std::mem::take(&mut *replies.lock().unwrap())
+                    .into_iter()
+                    .filter_map(|event| protocol_reply(term, event, theme))
+                    .collect::<Vec<_>>()
+            };
+            parser.advance(&mut term, b"\x1b]10;?\x07\x1b]11;?\x07");
+            assert_eq!(
+                responses(&term),
+                [
+                    format!("\x1b]10;rgb:{foreground}\x07").into_bytes(),
+                    format!("\x1b]11;rgb:{background}\x07").into_bytes(),
+                ]
+            );
+            parser.advance(&mut term, b"\x1b]11;#123456\x07\x1b]11;?\x1b\\");
+            assert_eq!(
+                responses(&term),
+                [b"\x1b]11;rgb:1212/3434/5656\x1b\\".to_vec()]
+            );
+            parser.advance(&mut term, b"\x1b]111\x07\x1b]11;?\x07");
+            assert_eq!(
+                responses(&term),
+                [format!("\x1b]11;rgb:{background}\x07").into_bytes()]
+            );
+        }
     }
+
     #[test]
-    fn palette_truecolor_and_cube() {
-        assert_eq!(color(Color::Indexed(196)), Color32::RED);
+    fn terminal_themes_preserve_shell_colors() {
+        for index in 0..=255 {
+            assert_eq!(
+                TerminalTheme::Dark.color(Color::Indexed(index)),
+                TerminalTheme::Light.color(Color::Indexed(index))
+            );
+        }
+        let custom = Color::Spec(Rgb {
+            r: 19,
+            g: 87,
+            b: 143,
+        });
+        for theme in [TerminalTheme::Dark, TerminalTheme::Light] {
+            assert_eq!(theme.color(custom), Color32::from_rgb(19, 87, 143));
+            assert_eq!(theme.color(Color::Indexed(196)), Color32::RED);
+            assert_eq!(
+                theme.color(Color::Named(NamedColor::Red)),
+                theme.color(Color::Indexed(1))
+            );
+        }
     }
 }
 

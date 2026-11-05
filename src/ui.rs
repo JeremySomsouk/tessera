@@ -3,7 +3,7 @@ use crate::{
     model::{Session, SessionState, Task, TaskState, WorkDisposition, WorkItem, WorkStage},
     search::TerminalSearch,
     selection::{SelectionAction, key_action},
-    terminal::{Size, Terminal, color},
+    terminal::{Size, Terminal, TerminalTheme},
 };
 use alacritty_terminal::{
     index::{Column, Line, Point, Side},
@@ -294,6 +294,8 @@ struct Saved {
     #[serde(default)]
     chrome_palette: ChromePalette,
     #[serde(default)]
+    terminal_theme: TerminalTheme,
+    #[serde(default)]
     skip_stop_confirmation: bool,
     #[serde(default = "default_clickable_choices")]
     clickable_codex_choices: bool,
@@ -323,6 +325,7 @@ impl Default for Saved {
             font_size: default_font(),
             light: false,
             chrome_palette: ChromePalette::default(),
+            terminal_theme: TerminalTheme::default(),
             skip_stop_confirmation: false,
             clickable_codex_choices: default_clickable_choices(),
             folder_search_roots: crate::folders::default_roots(),
@@ -713,6 +716,7 @@ impl App {
         }
         configure_terminal_fonts_with(&cc.egui_ctx, crate::fonts::automatic_terminal_fonts());
         configure_palette(&cc.egui_ctx, app.saved.light, app.saved.chrome_palette);
+        app.saved.terminal_theme.apply(&cc.egui_ctx);
         app.restore_workspace(&cc.egui_ctx);
         if !load_error.is_empty() {
             app.ui.error = load_error;
@@ -3520,7 +3524,7 @@ impl App {
         section_label(ui, "APPEARANCE");
         ui.add_space(8.0);
         ui.horizontal(|ui| {
-            ui.label("Theme");
+            ui.label("App theme");
             for (light, label) in [(false, "Dark"), (true, "Light")] {
                 if ui
                     .selectable_label(self.saved.light == light, label)
@@ -3545,7 +3549,24 @@ impl App {
                 }
             }
         });
-        ui.small("Workspace colors update immediately in all windows. Terminal ANSI colors and background stay unchanged.");
+        ui.small("Workspace colors update immediately in all windows.");
+        ui.horizontal(|ui| {
+            ui.label("Terminal theme");
+            for (theme, label) in [
+                (TerminalTheme::Dark, "Dark"),
+                (TerminalTheme::Light, "Light"),
+            ] {
+                if ui
+                    .selectable_label(self.saved.terminal_theme == theme, label)
+                    .clicked()
+                {
+                    self.saved.terminal_theme = theme;
+                    theme.apply(ctx);
+                    self.dirty = true;
+                }
+            }
+        });
+        ui.small("Applies to all terminal panes. Colors set by your shell or applications are preserved.");
         ui.horizontal(|ui| {
             ui.label("Terminal text");
             if ui
@@ -5047,6 +5068,7 @@ impl TerminalRenderCounts {
 
 #[derive(Clone)]
 struct TerminalPaintCache {
+    theme: TerminalTheme,
     origin: Pos2,
     font_size: f32,
     shapes: Vec<egui::epaint::Shape>,
@@ -5136,8 +5158,8 @@ fn terminal_view(
     if !ui.is_sizing_pass() && !ui.ctx().will_discard() {
         terminal.resize(Size { cols, rows });
     }
-    ui.painter()
-        .rect_filled(rect, 6.0, Color32::from_rgb(24, 27, 34));
+    let theme = TerminalTheme::from_context(ui.ctx());
+    ui.painter().rect_filled(rect, 6.0, theme.background());
     if focused {
         ui.painter().rect_stroke(
             rect,
@@ -5349,14 +5371,14 @@ fn terminal_view(
                 };
                 n.and_then(|n| content.colors[n])
                     .map(|rgb| Color32::from_rgb(rgb.r, rgb.g, rgb.b))
-                    .unwrap_or_else(|| color(c))
+                    .unwrap_or_else(|| theme.color(c))
             };
             let (mut fg, mut bg) = (resolve(c.fg), resolve(c.bg));
             if c.flags.contains(Flags::INVERSE) {
                 std::mem::swap(&mut fg, &mut bg);
             }
             if content.selection.is_some_and(|s| s.contains(indexed.point)) {
-                bg = Color32::from_rgb(55, 85, 91);
+                bg = theme.selection();
             }
             if search.contains(indexed.point) {
                 bg = Color32::from_rgb(184, 151, 64);
@@ -5365,7 +5387,7 @@ fn terminal_view(
             if c.flags.contains(Flags::DIM) {
                 fg = fg.gamma_multiply(0.65);
             }
-            if bg != Color32::from_rgb(24, 27, 34) {
+            if bg != theme.background() {
                 painter.rect_filled(Rect::from_min_size(pos, cell), 0.0, bg);
             }
             if !c.flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::HIDDEN) && c.c != ' ' {
@@ -5411,7 +5433,11 @@ fn terminal_view(
                 };
                 let cursor_color = content.colors[NamedColor::Cursor as usize]
                     .map(|rgb| Color32::from_rgb(rgb.r, rgb.g, rgb.b))
-                    .unwrap_or(ACCENT);
+                    .unwrap_or_else(|| {
+                        theme.color(alacritty_terminal::vte::ansi::Color::Named(
+                            NamedColor::Cursor,
+                        ))
+                    });
                 let mut glyph = String::new();
                 if !cursor_cell
                     .flags
@@ -5450,6 +5476,7 @@ fn terminal_view(
             data.insert_temp(
                 response.id.with("paint_cache"),
                 TerminalPaintCache {
+                    theme,
                     origin: grid_rect.min,
                     font_size,
                     shapes,
@@ -5465,6 +5492,7 @@ fn terminal_view(
             .ctx()
             .data(|data| data.get_temp::<TerminalPaintCache>(response.id.with("paint_cache")))
             && cache.font_size == font_size
+            && cache.theme == theme
         {
             if focused && !searching && cache.copying == copying {
                 cache.shapes.extend(cache.cursor);
@@ -6696,6 +6724,93 @@ mod render_tests {
                 })
                 .expect("Pane menu must stay visible");
             assert!(screen.contains_rect(menu));
+        }
+    }
+
+    #[test]
+    fn terminal_theme_settings_are_independent_and_persist() {
+        let mut legacy = serde_json::to_value(Saved::default()).unwrap();
+        legacy.as_object_mut().unwrap().remove("terminal_theme");
+        assert_eq!(
+            serde_json::from_value::<Saved>(legacy)
+                .unwrap()
+                .terminal_theme,
+            TerminalTheme::Dark
+        );
+        for app_light in [false, true] {
+            let ctx = egui::Context::default();
+            configure_appearance(&ctx, app_light);
+            let mut app = fixture(0);
+            app.saved.light = app_light;
+            let frame = |app: &mut App, events| {
+                ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(
+                            Pos2::ZERO,
+                            Vec2::new(640.0, 1100.0),
+                        )),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| app.settings(ui, ctx));
+                    },
+                )
+            };
+            for (theme, label) in [
+                (TerminalTheme::Light, "Light"),
+                (TerminalTheme::Dark, "Dark"),
+            ] {
+                let out = frame(&mut app, vec![]);
+                let row = out
+                    .shapes
+                    .iter()
+                    .find_map(|shape| match &shape.shape {
+                        egui::epaint::Shape::Text(text)
+                            if text.galley.text() == "Terminal theme" =>
+                        {
+                            Some(text.pos.y)
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                let pos = out
+                    .shapes
+                    .iter()
+                    .find_map(|shape| match &shape.shape {
+                        egui::epaint::Shape::Text(text)
+                            if text.galley.text() == label && (text.pos.y - row).abs() < 4.0 =>
+                        {
+                            Some(text.pos + text.galley.size() * 0.5)
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                app.dirty = false;
+                for pressed in [true, false] {
+                    frame(
+                        &mut app,
+                        vec![
+                            egui::Event::PointerMoved(pos),
+                            egui::Event::PointerButton {
+                                pos,
+                                button: egui::PointerButton::Primary,
+                                pressed,
+                                modifiers: Modifiers::NONE,
+                            },
+                        ],
+                    );
+                }
+                assert_eq!(app.saved.terminal_theme, theme);
+                assert_eq!(TerminalTheme::from_context(&ctx), theme);
+                assert_eq!(app.saved.light, app_light);
+                assert_eq!(ctx.style().visuals.dark_mode, !app_light);
+                assert!(app.dirty);
+                let restored: Saved =
+                    serde_json::from_slice(&serde_json::to_vec(&app.saved).unwrap()).unwrap();
+                assert_eq!(restored.terminal_theme, theme);
+                assert_eq!(restored.light, app_light);
+            }
         }
     }
 
@@ -11157,7 +11272,30 @@ mod render_tests {
             text(&busy).contains("stable-output"),
             "busy parser erased terminal content"
         );
+        TerminalTheme::Light.apply(&ctx);
+        let switching = frame(&mut terminal);
+        assert!(
+            !text(&switching).contains("stable-output"),
+            "old theme cache was reused"
+        );
+        assert!(switching.shapes.iter().any(|shape| matches!(&shape.shape,
+            egui::epaint::Shape::Rect(rect) if rect.fill == TerminalTheme::Light.background() && rect.rect.width() > 800.0
+        )));
         drop(held);
+        for theme in [TerminalTheme::Light, TerminalTheme::Dark] {
+            theme.apply(&ctx);
+            let out = frame(&mut terminal);
+            assert!(text(&out).contains("stable-output"));
+            assert!(out.shapes.iter().any(|shape| matches!(&shape.shape,
+                egui::epaint::Shape::Rect(rect) if rect.fill == theme.background() && rect.rect.width() > 800.0
+            )));
+            let foreground = theme.color(alacritty_terminal::vte::ansi::Color::Named(
+                NamedColor::Foreground,
+            ));
+            assert!(out.shapes.iter().any(|shape| matches!(&shape.shape,
+                egui::epaint::Shape::Text(text) if text.galley.text() == "s" && text.fallback_color == foreground
+            )));
+        }
     }
 
     #[test]
