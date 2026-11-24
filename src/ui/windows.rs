@@ -437,6 +437,10 @@ impl App {
                 },
             );
         }
+        // Only panes actually drawn below need a new frame for incoming bytes.
+        for pane in self.panes.values() {
+            pane.terminal.visible.store(false, Ordering::Relaxed);
+        }
         prepare_terminal_rendering(ctx, self.visible_terminal_panes(ctx));
         if self.windows.contains_key(&egui::ViewportId::ROOT) {
             self.draw_terminal_window(ctx, egui::ViewportId::ROOT);

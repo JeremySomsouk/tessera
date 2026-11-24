@@ -26,6 +26,7 @@ use std::{
 };
 use uuid::Uuid;
 mod git;
+mod live_peek;
 mod merge_radar;
 mod remote_runs;
 mod remote_settings;
@@ -34,6 +35,8 @@ mod remote_workers;
 mod render_benchmarks;
 mod render_budget;
 mod restoration;
+#[cfg(test)]
+mod terminal_interaction_tests;
 mod windows;
 const ACCENT: Color32 = Color32::from_rgb(130, 198, 180);
 #[derive(Clone, Serialize, Deserialize)]
@@ -4189,6 +4192,7 @@ impl App {
                                     &dropped,
                                     pane.terminal.mode(),
                                 )?)?;
+                                pane.terminal.held_screen = None;
                                 self.saved.workspaces[self.ui.active].focus = id;
                                 focused = id;
                                 self.dirty = true;
@@ -4503,9 +4507,14 @@ fn terminal_header(
     focused: bool,
 ) -> Option<&'static str> {
     let mut action = None;
+    let compact = ui.available_width() < 360.0;
     ui.horizontal(|ui| {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.menu_button("Pane", |ui| {
+                if compact && ui.button("Git").clicked() {
+                    action = Some("Git");
+                    ui.close();
+                }
                 for label in [
                     "Focus",
                     "Find",
@@ -4522,10 +4531,11 @@ fn terminal_header(
                     }
                 }
             });
-            if ui
-                .button("Git")
-                .on_hover_text("Fetch, pull, and search Git branches for this terminal")
-                .clicked()
+            if !compact
+                && ui
+                    .button("Git")
+                    .on_hover_text("Fetch, pull, and search Git branches for this terminal")
+                    .clicked()
             {
                 action = Some("Git");
             }
@@ -4538,7 +4548,10 @@ fn terminal_header(
                     if ui
                         .add_sized(
                             [process_width, 28.0],
-                            egui::Button::new(process).selected(focused).truncate(),
+                            egui::Button::new(RichText::new(process).strong().size(12.0))
+                                .selected(focused)
+                                .corner_radius(7)
+                                .truncate(),
                         )
                         .on_hover_text("Focus this terminal")
                         .clicked()
@@ -4553,12 +4566,36 @@ fn terminal_header(
                     };
                     ui.add_sized(
                         [(remaining - state_width).max(0.0), 18.0],
-                        egui::Label::new(directory).truncate(),
+                        egui::Label::new(
+                            RichText::new(if compact {
+                                directory
+                                    .trim_end_matches('/')
+                                    .rsplit('/')
+                                    .next()
+                                    .filter(|name| !name.is_empty())
+                                    .unwrap_or(directory)
+                            } else {
+                                directory
+                            })
+                            .monospace()
+                            .size(12.0),
+                        )
+                        .truncate(),
                     )
                     .on_hover_text(directory);
                     if !state.is_empty() {
-                        ui.add_sized([state_width, 18.0], egui::Label::new(state).truncate())
-                            .on_hover_text(state);
+                        ui.add_sized(
+                            [state_width, 18.0],
+                            egui::Label::new(RichText::new(state).small().color(
+                                if state == "Needs attention" {
+                                    attention_color(ui)
+                                } else {
+                                    ui.visuals().weak_text_color()
+                                },
+                            ))
+                            .truncate(),
+                        )
+                        .on_hover_text(state);
                     }
                 },
             );
@@ -5087,6 +5124,57 @@ fn terminal_render_lock<'a, T>(
     render_budget::lock(ctx, state)
 }
 
+fn terminal_drag_endpoints(
+    ui: &egui::Ui,
+    response: &egui::Response,
+    grid: Rect,
+) -> (Option<Pos2>, Option<Pos2>) {
+    let gesture_id = response.id.with("drag_origin");
+    let (pressed, released, down) = ui.input(|i| {
+        let position = |pressed| {
+            i.events.iter().rev().find_map(|e| match e {
+                egui::Event::PointerButton {
+                    button: egui::PointerButton::Primary,
+                    pressed: state,
+                    pos,
+                    ..
+                } if *state == pressed => Some(*pos),
+                _ => None,
+            })
+        };
+        (
+            i.pointer
+                .primary_pressed()
+                .then(|| position(true))
+                .flatten(),
+            i.pointer
+                .primary_released()
+                .then(|| position(false))
+                .flatten(),
+            i.pointer.primary_down(),
+        )
+    });
+    let origin = pressed.filter(|p| {
+        response.enabled() && grid.contains(*p) && ui.ctx().layer_id_at(*p) == Some(ui.layer_id())
+    });
+    if let Some(pos) = origin {
+        ui.data_mut(|data| data.insert_temp(gesture_id, pos));
+    }
+    let end = if let Some(pos) = released {
+        let start = ui.data_mut(|data| data.remove_temp::<Pos2>(gesture_id));
+        let threshold = ui.ctx().options(|o| o.input_options.max_click_dist);
+        start
+            .filter(|start| start.distance(pos) > threshold)
+            .map(|_| pos)
+    } else {
+        if !down {
+            ui.data_mut(|data| data.remove::<Pos2>(gesture_id));
+        }
+        None
+    };
+    (origin, end)
+}
+
 fn terminal_view(
     ui: &mut egui::Ui,
     terminal: &mut Terminal,
@@ -5095,6 +5183,10 @@ fn terminal_view(
     font_size: f32,
     clickable_choices: bool,
 ) -> (bool, anyhow::Result<()>, Option<String>) {
+    terminal.visible.store(
+        !ui.input(|i| i.viewport().minimized.unwrap_or(false)),
+        Ordering::Relaxed,
+    );
     let copying = terminal.copy_mode;
     let searching = search.is_open();
     if copying {
@@ -5103,42 +5195,130 @@ fn terminal_view(
         );
     }
     search.show(ui, terminal, focused);
-    let scrolled = terminal
-        .term
-        .try_lock()
-        .ok()
-        .map(|term| term.grid().display_offset() > 0);
+    if searching || copying || !terminal.mode().contains(TermMode::ALT_SCREEN) {
+        terminal.held_screen = None;
+    }
+    if let Ok(term) = terminal.term.try_lock() {
+        terminal.rows_from_live = term.grid().display_offset();
+    }
+    let scrolled = terminal.rows_from_live > 0;
     let mut return_live = false;
     let mut status_rect = ui.available_rect_before_wrap();
     status_rect.min.y = (status_rect.max.y - 20.0).max(status_rect.min.y);
     let mut status_ui = ui.new_child(
         egui::UiBuilder::new()
             .max_rect(status_rect)
-            .id_salt("output-mode"),
+            .id_salt(("output-mode", terminal.id)),
     );
-    status_ui.horizontal(|ui| {
-        ui.set_min_height(20.0);
-        ui.small(match scrolled {
-            Some(true) => "Scrolled back",
-            Some(false) if !terminal.alive.load(Ordering::Acquire) => "Exited · output retained",
-            Some(false) => "Live output",
-            None => "Output updating",
-        });
-        if scrolled == Some(true) && !searching && !copying {
-            return_live = ui.small_button("Return to live").clicked();
+    let held = terminal.held_screen.is_some();
+    let alive = terminal.alive.load(Ordering::Acquire);
+    let show_return = (scrolled || held) && !searching && !copying;
+    let wide = status_rect.width() >= 260.0;
+    status_ui.set_clip_rect(status_ui.clip_rect().intersect(status_rect));
+    status_ui.horizontal_centered(|ui| {
+        ui.set_height(status_rect.height());
+        ui.spacing_mut().item_spacing.x = 6.0;
+        ui.add_space(3.0);
+        let (marker, _) = ui.allocate_exact_size(Vec2::splat(6.0), Sense::hover());
+        let color = if focused {
+            accent(ui)
+        } else {
+            ui.visuals().weak_text_color()
+        };
+        if held || scrolled {
+            ui.painter()
+                .circle_stroke(marker.center(), 2.5, Stroke::new(1.25_f32, color));
+        } else {
+            ui.painter().circle_filled(marker.center(), 2.5, color);
+        }
+        let state = if held {
+            "Selection paused".to_owned()
+        } else if scrolled && wide {
+            format!(
+                "{} {} back",
+                terminal.rows_from_live,
+                if terminal.rows_from_live == 1 {
+                    "row"
+                } else {
+                    "rows"
+                }
+            )
+        } else if scrolled {
+            "History".to_owned()
+        } else if !alive {
+            "Exited".to_owned()
+        } else {
+            "Live".to_owned()
+        };
+        ui.label(
+            RichText::new(state)
+                .size(12.0)
+                .color(ui.visuals().text_color()),
+        );
+        if show_return {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let label = if alive {
+                    "Return to live"
+                } else {
+                    "Latest output"
+                };
+                return_live = ui
+                    .add(
+                        egui::Button::new(RichText::new(label).size(12.0))
+                            .fill(ui.visuals().selection.bg_fill)
+                            .corner_radius(5)
+                            .min_size(Vec2::new(0.0, 19.0)),
+                    )
+                    .on_hover_text("Jump to the newest output and focus this terminal")
+                    .clicked();
+                if wide && alive {
+                    live_peek::show(ui, terminal);
+                }
+            });
         }
     });
-    if return_live && let Err(error) = terminal.scroll(i32::MIN) {
-        return (false, Err(error), None);
+    if return_live {
+        terminal.held_screen = None;
+        if scrolled && let Err(error) = terminal.scroll(i32::MIN) {
+            return (false, Err(error), None);
+        }
     }
     let font = FontId::monospace(font_size);
     let cell = ui.fonts_mut(|f| Vec2::new(f.glyph_width(&font, 'M'), f.row_height(&font)));
     let mut rect = ui.available_rect_before_wrap();
     rect.max.y = status_rect.min.y;
-    let response = ui.allocate_rect(rect, Sense::click_and_drag());
-    if !searching && (focused || response.clicked()) {
-        if !response.has_focus() {
+    ui.advance_cursor_after_rect(rect);
+    let response = ui.interact(
+        rect,
+        egui::Id::new(("terminal-grid", terminal.id)),
+        Sense::click_and_drag(),
+    );
+    let grid_rect = rect.shrink(8.0);
+    // A fast drag can begin and end between paints. egui clears press_origin on
+    // release, so retain the actual button positions for this pane's gesture.
+    let (press_origin, drag_release) = terminal_drag_endpoints(ui, &response, grid_rect);
+    let focus_key = egui::Id::new(("keyboard-terminal", ui.ctx().viewport_id()));
+    if !searching
+        && terminal.pending_paste.is_none()
+        && (focused
+            || return_live
+            || response.clicked()
+            || response.secondary_clicked()
+            || drag_release.is_some())
+    {
+        let owner = ui.memory(|m| m.focused());
+        let previous = ui.data(|d| d.get_temp::<egui::Id>(focus_key));
+        if return_live
+            || drag_release.is_some()
+            || response.clicked()
+            || response.secondary_clicked()
+            || owner.is_none()
+            || owner == previous
+        {
             response.request_focus();
+        }
+        if response.has_focus() {
+            ui.data_mut(|d| d.insert_temp(focus_key, response.id));
         }
         ui.memory_mut(|memory| {
             memory.set_focus_lock_filter(
@@ -5152,7 +5332,6 @@ fn terminal_view(
             )
         });
     }
-    let grid_rect = rect.shrink(8.0);
     let cols = ((grid_rect.width() / cell.x).floor() as usize).clamp(2, 500);
     let rows = ((grid_rect.height() / cell.y).floor() as usize).clamp(1, 200);
     if !ui.is_sizing_pass() && !ui.ctx().will_discard() {
@@ -5160,32 +5339,42 @@ fn terminal_view(
     }
     let theme = TerminalTheme::from_context(ui.ctx());
     ui.painter().rect_filled(rect, 6.0, theme.background());
-    if focused {
-        ui.painter().rect_stroke(
-            rect,
-            6.0,
-            Stroke::new(2.0_f32, accent(ui)),
-            egui::StrokeKind::Inside,
-        );
-    }
+    let keyboard_focus =
+        focused && response.has_focus() && !searching && terminal.pending_paste.is_none();
+    let frame_color = if keyboard_focus {
+        accent(ui)
+    } else {
+        ui.visuals().widgets.noninteractive.bg_stroke.color
+    };
+    ui.painter().rect_stroke(
+        rect,
+        6.0,
+        Stroke::new(1.0_f32, frame_color),
+        egui::StrokeKind::Inside,
+    );
     let mut mode = terminal.mode();
     // Reserve primary drags for local selection. Latch the explicit mouse-input
     // override at press time so changing modifiers cannot split a gesture.
-    let (primary_pressed, primary_down, primary_released, modifiers, press_origin) =
-        ui.input(|i| {
-            (
-                i.pointer.primary_pressed(),
-                i.pointer.primary_down(),
-                i.pointer.primary_released(),
-                i.modifiers,
-                i.pointer.press_origin(),
-            )
-        });
+    let (primary_pressed, primary_down, primary_released, modifiers) = ui.input(|i| {
+        (
+            i.pointer.primary_pressed(),
+            i.pointer.primary_down(),
+            i.pointer.primary_released(),
+            i.modifiers,
+        )
+    });
+    let link_modifier = modifiers.command || modifiers.alt;
     let hovered_url = response
         .hover_pos()
-        .filter(|pos| grid_rect.contains(*pos))
+        .filter(|pos| link_modifier && grid_rect.contains(*pos))
         .and_then(|pos| {
-            let term = terminal.term.try_lock().ok()?;
+            let live;
+            let term = if let Some(held) = &terminal.held_screen {
+                &held.view
+            } else {
+                live = terminal.term.try_lock().ok()?;
+                &*live
+            };
             let point = Point::new(
                 Line(
                     ((pos.y - grid_rect.top()) / cell.y).floor() as i32
@@ -5195,9 +5384,8 @@ fn terminal_view(
             );
             terminal_url_at(term.grid(), point)
         });
-    let link_modifier = modifiers.command || modifiers.alt;
     let link_clicked = response.clicked_by(egui::PointerButton::Primary);
-    let link_dragged = response.drag_started();
+    let link_dragged = response.drag_started() || drag_release.is_some();
     let mut open_link = None;
     let link_gesture = ui.ctx().data_mut(|data| {
         let target = data.get_temp_mut_or_default::<Option<String>>(response.id.with("link_press"));
@@ -5245,38 +5433,72 @@ fn terminal_view(
         ui.ctx()
             .data_mut(|data| data.remove::<(i32, f64)>(selection_scroll_id));
     }
+    let press_id = response.id.with("selection_press");
+    if primary_pressed
+        && (response.contains_pointer() || drag_release.is_some())
+        && !primary_reporting
+        && !link_gesture
+        && let Some(origin) = press_origin.filter(|p| grid_rect.contains(*p))
+    {
+        ui.data_mut(|d| d.insert_temp(press_id, origin));
+    } else if !primary_down && !primary_released {
+        ui.data_mut(|d| d.remove::<Pos2>(press_id));
+    }
     let capture_selection = response.secondary_clicked() && !modifiers.alt;
     let mut selected = None;
     let mut selection_busy = false;
     let mut choice_prompt = None;
     let mut choice_revision = 0;
-    if let Some(mut term) = terminal_render_lock(ui.ctx(), &terminal.term) {
+    let mut live = terminal_render_lock(ui.ctx(), &terminal.term);
+    let revision = terminal.revision();
+    if let Some(grid) = live.as_deref() {
+        mode = *grid.mode();
+        if mode.contains(TermMode::ALT_SCREEN)
+            && !searching
+            && !copying
+            && terminal.held_screen.is_none()
+            && ui.data(|d| d.get_temp::<Pos2>(press_id).is_some())
+        {
+            terminal.held_screen = Some(crate::terminal::hold_alternate_screen(grid, revision));
+        }
+    }
+    let holding = terminal.held_screen.is_some();
+    let displayed_revision = terminal
+        .held_screen
+        .as_ref()
+        .map_or(revision, |held| held.revision);
+    if let Some(term) = terminal
+        .held_screen
+        .as_mut()
+        .map(|held| &mut held.view)
+        .or(live.as_deref_mut())
+    {
         #[cfg(test)]
         TerminalRenderCounts::record(ui.ctx(), true);
-        search.invalidate(terminal.revision());
-        mode = *term.mode();
+        search.invalidate(revision);
         if !primary_reporting
             && !link_gesture
-            && let Some(pos) = response.interact_pointer_pos()
+            && let Some(pos) = drag_release.or(response.interact_pointer_pos())
         {
+            use alacritty_terminal::grid::Dimensions;
+            let actual_rows = term.screen_lines();
+            let actual_cols = term.columns();
             let point_at = |pos: Pos2, display_offset: usize| {
                 Point::new(
                     Line(
                         ((pos.y - grid_rect.top()) / cell.y)
                             .floor()
-                            .clamp(0.0, rows as f32 - 1.0) as i32
+                            .clamp(0.0, actual_rows as f32 - 1.0) as i32
                             - display_offset as i32,
                     ),
                     Column(
                         ((pos.x - grid_rect.left()) / cell.x)
                             .floor()
-                            .clamp(0.0, cols as f32 - 1.0) as usize,
+                            .clamp(0.0, actual_cols as f32 - 1.0) as usize,
                     ),
                 )
             };
-            if response.drag_started_by(egui::PointerButton::Primary)
-                && let Some(origin) = ui.input(|i| i.pointer.press_origin())
-            {
+            if let Some(origin) = ui.data_mut(|d| d.remove_temp::<Pos2>(press_id)) {
                 term.selection = Some(Selection::new(
                     SelectionType::Simple,
                     point_at(origin, term.grid().display_offset()),
@@ -5313,24 +5535,30 @@ fn terminal_view(
                 }
             }
             let point = point_at(pos, term.grid().display_offset());
-            if response.dragged_by(egui::PointerButton::Primary)
+            if (response.dragged_by(egui::PointerButton::Primary)
+                || response.drag_stopped_by(egui::PointerButton::Primary)
+                || drag_release.is_some())
                 && let Some(s) = &mut term.selection
             {
                 s.update(point, Side::Right);
+                s.include_all();
             }
-            if response.double_clicked_by(egui::PointerButton::Primary) {
-                crate::selection::select_word(&mut *term, point);
-            } else if response.clicked_by(egui::PointerButton::Primary) {
+            if drag_release.is_none() && response.double_clicked_by(egui::PointerButton::Primary) {
+                crate::selection::select_word(term, point);
+            } else if drag_release.is_none() && response.clicked_by(egui::PointerButton::Primary) {
                 term.selection = None;
             }
         }
         if clickable_choices
+            && displayed_revision == revision
+            && (!holding || primary_pressed || response.clicked())
+            && response.hovered()
             && !copying
             && !searching
             && terminal.alive.load(Ordering::Acquire)
             && term.grid().display_offset() == 0
         {
-            choice_revision = terminal.revision();
+            choice_revision = revision;
             choice_prompt = ui.ctx().data_mut(|data| {
                 let cache =
                     data.get_temp_mut_or_default::<ChoiceCache>(response.id.with("choices"));
@@ -5350,11 +5578,9 @@ fn terminal_view(
         }
         let content = term.renderable_content();
         let painter = ui.painter().with_clip_rect(grid_rect);
-        let paint_start = ui.ctx().graphics(|graphics| {
-            graphics
-                .get(painter.layer_id())
-                .map_or(0, |list| list.all_entries().len())
-        });
+        let mut shapes = Vec::new();
+        // Build common glyph layouts once per frame. Positions and colors remain per cell.
+        let mut ascii: [Option<std::sync::Arc<egui::Galley>>; 128] = std::array::from_fn(|_| None);
         for indexed in content.display_iter {
             let row = indexed.point.line.0 + content.display_offset as i32;
             if row < 0 || row >= rows as i32 {
@@ -5388,31 +5614,50 @@ fn terminal_view(
                 fg = fg.gamma_multiply(0.65);
             }
             if bg != theme.background() {
-                painter.rect_filled(Rect::from_min_size(pos, cell), 0.0, bg);
+                shapes.push(egui::Shape::rect_filled(
+                    Rect::from_min_size(pos, cell),
+                    0.0,
+                    bg,
+                ));
             }
             if !c.flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::HIDDEN) && c.c != ' ' {
-                let mut text = c.c.to_string();
-                if let Some(z) = c.zerowidth() {
-                    text.extend(z);
-                }
-                painter.text(pos, egui::Align2::LEFT_TOP, text, font.clone(), fg);
+                let galley = if c.c.is_ascii() && c.zerowidth().is_none() {
+                    ascii[c.c as usize]
+                        .get_or_insert_with(|| {
+                            painter.layout_no_wrap(
+                                c.c.to_string(),
+                                font.clone(),
+                                Color32::PLACEHOLDER,
+                            )
+                        })
+                        .clone()
+                } else {
+                    let mut text = c.c.to_string();
+                    if let Some(marks) = c.zerowidth() {
+                        text.extend(marks);
+                    }
+                    painter.layout_no_wrap(text, font.clone(), Color32::PLACEHOLDER)
+                };
+                shapes.push(egui::Shape::galley(pos, galley, fg));
             }
             if c.flags.contains(Flags::UNDERLINE) {
-                painter.line_segment(
+                shapes.push(egui::Shape::line_segment(
                     [
                         pos + Vec2::new(0.0, cell.y - 2.0),
                         pos + Vec2::new(cell.x, cell.y - 2.0),
                     ],
                     Stroke::new(1.0_f32, fg),
-                );
+                ));
             }
         }
+        painter.extend(shapes.iter().cloned());
         let cursor_start = ui.ctx().graphics(|graphics| {
             graphics
                 .get(painter.layer_id())
-                .map_or(paint_start, |list| list.all_entries().len())
+                .map_or(0, |list| list.all_entries().len())
         });
         if focused
+            && !holding
             && !searching
             && ((copying && mode.contains(TermMode::VI))
                 || (!copying
@@ -5462,15 +5707,13 @@ fn terminal_view(
         if capture_selection {
             selected = term.selection_to_string();
         }
-        let (shapes, cursor) = ui.ctx().graphics(|graphics| {
-            let entries = graphics.get(painter.layer_id()).unwrap().all_entries();
-            let shapes = entries
-                .skip(paint_start)
+        let cursor = ui.ctx().graphics(|graphics| {
+            graphics
+                .get(painter.layer_id())
+                .into_iter()
+                .flat_map(|list| list.all_entries().skip(cursor_start))
                 .map(|entry| entry.shape.clone())
-                .collect::<Vec<_>>();
-            let mut shapes = shapes;
-            let cursor = shapes.split_off(cursor_start - paint_start);
-            (shapes, cursor)
+                .collect()
         });
         ui.ctx().data_mut(|data| {
             data.insert_temp(
@@ -5506,6 +5749,13 @@ fn terminal_view(
         selection_busy = capture_selection;
         ui.ctx().request_repaint_after(Duration::from_millis(16));
     }
+    drop(live);
+    if drag_release.is_none()
+        && response.clicked_by(egui::PointerButton::Primary)
+        && !response.double_clicked()
+    {
+        terminal.held_screen = None;
+    }
     let reporting =
         !copying && mode.intersects(TermMode::MOUSE_MODE) && !ui.input(|i| i.modifiers.shift);
     let mut result = if selection_busy {
@@ -5520,16 +5770,51 @@ fn terminal_view(
             .input(|i| i.pointer.hover_pos())
             .filter(|pos| grid_rect.contains(*pos))
     {
-        let (delta, modifiers) = ui.input(|i| (i.raw_scroll_delta.y, i.modifiers));
-        let route = scroll_route(
-            mode,
-            searching || copying || modifiers.shift || !terminal.alive.load(Ordering::Acquire),
-        );
-        let lines = ui.ctx().data_mut(|data| {
-            data.get_temp_mut_or_default::<ScrollState>(response.id.with("scroll"))
-                .lines(delta, cell.y, route)
+        let wheel = ui.input(|input| {
+            input
+                .events
+                .iter()
+                .filter_map(|event| {
+                    if let egui::Event::MouseWheel {
+                        unit,
+                        delta,
+                        modifiers,
+                    } = event
+                    {
+                        Some((*unit, *delta, *modifiers))
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
         });
-        if lines != 0 {
+        for (unit, delta, modifiers) in wheel {
+            let delta = if modifiers.shift && delta.y == 0.0 {
+                delta.x
+            } else {
+                delta.y
+            };
+            let points = match unit {
+                egui::MouseWheelUnit::Point => delta,
+                egui::MouseWheelUnit::Line => delta * cell.y,
+                egui::MouseWheelUnit::Page => delta * cell.y * rows as f32,
+            };
+            let route = scroll_route(
+                mode,
+                scrolled
+                    || searching
+                    || copying
+                    || modifiers.shift
+                    || !terminal.alive.load(Ordering::Acquire),
+            );
+            let lines = ui.ctx().data_mut(|data| {
+                data.get_temp_mut_or_default::<ScrollState>(response.id.with("scroll"))
+                    .lines(points, cell.y, route)
+            });
+            if lines == 0 {
+                continue;
+            }
+            terminal.held_screen = None;
             match route {
                 ScrollRoute::History => result = terminal.scroll(lines),
                 ScrollRoute::Mouse => {
@@ -5580,7 +5865,7 @@ fn terminal_view(
     let (pressed, released) =
         ui.input(|i| (i.pointer.primary_pressed(), i.pointer.primary_released()));
     let was_clicked = response.clicked();
-    let drag_started = response.drag_started();
+    let drag_started = response.drag_started() || drag_release.is_some();
     let choice_click = ui.ctx().data_mut(|data| {
         let press = data.get_temp_mut_or_default::<ChoicePress>(response.id.with("choice_press"));
         if pressed {
@@ -5639,7 +5924,11 @@ fn terminal_view(
             if ui
                 .add_enabled(
                     !copying && !searching && terminal.alive.load(Ordering::Acquire),
-                    egui::Button::new(shortcut("Paste clipboard", "V")),
+                    egui::Button::new(if cfg!(target_os = "macos") {
+                        "Paste clipboard · Cmd+V"
+                    } else {
+                        "Paste clipboard · Ctrl+V"
+                    }),
                 )
                 .clicked()
             {
@@ -5694,6 +5983,7 @@ fn terminal_view(
                 .ctx()
                 .copy_text(selection_copy_without_indentation(&text)),
             SelectionMenuAction::Paste => {
+                terminal.held_screen = None;
                 result = selection_paste_text(&text).and_then(|text| terminal.paste(&text));
                 response.request_focus();
             }
@@ -5709,13 +5999,19 @@ fn terminal_view(
         ui.ctx()
             .data_mut(|data| data.remove::<std::sync::Arc<String>>(menu_id));
     }
-    let clicked = response.clicked() || response.drag_started() || response.secondary_clicked();
-    if searching
-        || menu_open
-        || menu_was_open
-        || (!focused && !clicked)
-        || (!response.has_focus() && ui.ctx().wants_keyboard_input())
-    {
+    let clicked = return_live
+        || drag_release.is_some()
+        || response.clicked()
+        || response.drag_started()
+        || response.secondary_clicked();
+    if focused && !searching && terminal.pending_paste.is_some() {
+        let reviewed = paste_review(ui.ctx(), terminal);
+        if terminal.pending_paste.is_none() {
+            response.request_focus();
+        }
+        return (clicked, result.and(reviewed), new_tab);
+    }
+    if searching || menu_open || menu_was_open || (!focused && !clicked) || !response.has_focus() {
         return (clicked, result, new_tab);
     }
     if copying {
@@ -5727,10 +6023,18 @@ fn terminal_view(
         let input = match event {
             egui::Event::Text(s) => Some(s.into_bytes()),
             egui::Event::Paste(s) => {
-                if let Err(e) = terminal.paste(&s) {
+                if let Err(e) = terminal.clipboard_paste(s) {
                     result = Err(e);
                 }
+                if terminal.pending_paste.is_some() {
+                    break;
+                }
                 None
+            }
+            egui::Event::Copy
+                if cfg!(target_os = "linux") && modifiers.ctrl && !modifiers.shift =>
+            {
+                Some(vec![3])
             }
             egui::Event::Copy => {
                 if let Err(error) = terminal.selection_action(SelectionAction::Copy { exit: false })
@@ -5792,6 +6096,7 @@ fn terminal_view(
         };
         if let Some(bytes) = input {
             let sent = if follow_cursor {
+                terminal.held_screen = None;
                 terminal.input_at_cursor(bytes)
             } else {
                 terminal.input(bytes)
@@ -5803,6 +6108,60 @@ fn terminal_view(
     }
     (clicked, result, new_tab)
 }
+fn paste_review(ctx: &egui::Context, terminal: &mut Terminal) -> anyhow::Result<()> {
+    let Some(text) = terminal.pending_paste.as_deref() else {
+        return Ok(());
+    };
+    let dialog =
+        egui::Modal::new(egui::Id::new(("multiline-paste", terminal.id))).show(ctx, |ui| {
+            ui.set_max_width(420.0);
+            ui.heading("Paste multiple lines?");
+            ui.label("This program treats line breaks as Enter and may run each line.");
+            let preview: String = text.chars().take(240).collect();
+            egui::Frame::new()
+                .fill(ui.visuals().extreme_bg_color)
+                .corner_radius(5)
+                .inner_margin(8)
+                .show(ui, |ui| {
+                    let sample = preview.replace("\r\n", "\n").replace('\r', "\n");
+                    let mut rows = sample.lines();
+                    let mut visible = rows.by_ref().take(4).collect::<Vec<_>>().join("\n");
+                    if rows.next().is_some() || preview.len() < text.len() {
+                        visible.push('…');
+                    }
+                    ui.add(egui::Label::new(RichText::new(visible).monospace()).wrap());
+                });
+            if text.ends_with(['\n', '\r']) {
+                ui.small("The clipboard ends with a line break.");
+            }
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Cancel").clicked() {
+                    Some(None)
+                } else if ui.button("Paste as one line").clicked() {
+                    Some(Some(false))
+                } else if ui.button("Send line breaks").clicked() {
+                    Some(Some(true))
+                } else {
+                    None
+                }
+            })
+            .inner
+        });
+    if let Some(action) = dialog.inner {
+        let text = terminal.pending_paste.take().unwrap();
+        match action {
+            Some(true) => terminal.paste(&text)?,
+            Some(false) => {
+                terminal.paste(&text.replace("\r\n", "\n").replace(['\r', '\n'], " "))?
+            }
+            None => (),
+        }
+    } else if dialog.should_close() {
+        terminal.pending_paste = None;
+    }
+    Ok(())
+}
+
 fn terminal_url_at(
     grid: &alacritty_terminal::grid::Grid<alacritty_terminal::term::cell::Cell>,
     point: Point,
@@ -9851,9 +10210,10 @@ mod render_tests {
         } else {
             assert_eq!(
                 terminal
-                    .term
-                    .lock()
+                    .held_screen
+                    .as_ref()
                     .unwrap()
+                    .view
                     .selection_to_string()
                     .as_deref(),
                 Some("selecta")
@@ -9909,7 +10269,7 @@ mod render_tests {
             }
             let pos = menu_button("Search in browser");
             // The menu keeps the original text even if output clears selection.
-            terminal.term.lock().unwrap().selection = None;
+            terminal.held_screen.as_mut().unwrap().view.selection = None;
             frame(
                 &mut terminal,
                 &mut search,

@@ -433,3 +433,91 @@ fn benchmark_all_grids_held() {
         quantile(&times, 100)
     );
 }
+
+/// Fixed parser batches keep the viewport workload identical across builds.
+/// Measures an egui terminal frame, excluding parser injection and GPU presentation.
+#[test]
+#[ignore = "set TESSERA_BENCH_DAILY=1 for the terminal interaction benchmark"]
+fn benchmark_daily_terminal_interactions() {
+    if std::env::var_os("TESSERA_BENCH_DAILY").is_none() {
+        return;
+    }
+    let ctx = egui::Context::default();
+    let dir = tempfile::tempdir().unwrap();
+    let mut panes: Vec<(_, _, alacritty_terminal::vte::ansi::Processor)> = (0..3)
+        .map(|_| {
+            let term = Terminal::spawn_test(
+                Uuid::new_v4(),
+                dir.path(),
+                std::path::Path::new(""),
+                ctx.clone(),
+            )
+            .unwrap();
+            (
+                term,
+                TerminalSearch::default(),
+                alacritty_terminal::vte::ansi::Processor::default(),
+            )
+        })
+        .collect();
+    let batch = format!("{}\r\n", "  build é 1234567890  ".repeat(6)).repeat(16);
+    let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 480.0));
+    for scenario in ["stream", "scroll", "switch"] {
+        for (terminal, _, _) in &panes {
+            terminal
+                .term
+                .lock()
+                .unwrap()
+                .scroll_display(alacritty_terminal::grid::Scroll::Bottom);
+        }
+        let mut ms = Vec::new();
+        for n in 0..130 {
+            for (terminal, _, parser) in &mut panes {
+                let mut grid = terminal.term.lock().unwrap();
+                parser.advance(&mut *grid, batch.as_bytes());
+                terminal.revision.fetch_add(1, Ordering::Release);
+            }
+            let index = if scenario == "switch" {
+                n % panes.len()
+            } else {
+                0
+            };
+            let (terminal, search, _) = &mut panes[index];
+            let mut events = vec![egui::Event::PointerMoved(screen.center())];
+            if scenario == "scroll" {
+                events.push(egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: Vec2::new(0.0, 24.0),
+                    modifiers: Modifiers::NONE,
+                });
+            }
+            let started = Instant::now();
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        ui.push_id(index, |ui| {
+                            terminal_view(ui, terminal, search, true, 15.0, true)
+                                .1
+                                .unwrap()
+                        });
+                    });
+                },
+            );
+            std::hint::black_box(output);
+            if n >= 10 {
+                ms.push(started.elapsed().as_secs_f64() * 1000.0);
+            }
+        }
+        println!(
+            "DAILY {scenario} frames={} median_ms={:.3} p95_ms={:.3}",
+            ms.len(),
+            quantile(&ms, 50),
+            quantile(&ms, 95)
+        );
+    }
+}
