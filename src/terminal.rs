@@ -162,7 +162,15 @@ fn snapshot_grid<T: EventListener>(term: &Term<T>) -> String {
 }
 
 fn request_repaint(ctx: &Context) {
-    let viewport = ctx.viewport_id();
+    request_viewport_repaint(ctx, ctx.viewport_id());
+}
+
+fn request_root_repaint(ctx: &Context) {
+    // The root frame also drives immediate detached terminal windows.
+    request_viewport_repaint(ctx, eframe::egui::ViewportId::ROOT);
+}
+
+fn request_viewport_repaint(ctx: &Context, viewport: eframe::egui::ViewportId) {
     let pass = ctx.cumulative_pass_nr_for(viewport);
     let request = ctx.data_mut(|data| {
         let key = eframe::egui::Id::new(("terminal repaint", viewport));
@@ -298,12 +306,17 @@ impl PendingInput {
             while self.offset < end && self.buffer.len() < WRITE_CHUNK_BYTES {
                 let byte = self.input.bytes[self.offset];
                 self.offset += 1;
-                if byte != 0x1b {
-                    self.buffer.push(if byte == b'\n' && !bracketed {
-                        b'\r'
-                    } else {
-                        byte
-                    });
+                match byte {
+                    b'\r' | b'\n' => {
+                        // A CRLF pair may span two source chunks.
+                        if byte == b'\r' && self.input.bytes.get(self.offset) == Some(&b'\n') {
+                            self.offset += 1;
+                        }
+                        self.buffer.push(if bracketed { b'\n' } else { b'\r' });
+                    }
+                    b'\t' => self.buffer.push(byte),
+                    0..=31 | 127 => (),
+                    _ => self.buffer.push(byte),
                 }
             }
             if bracketed && self.offset == self.input.bytes.len() && !self.suffix {
@@ -428,7 +441,71 @@ fn agent_command(directory: &Path, launch: &str) -> Result<CommandBuilder> {
     Ok(command)
 }
 
+// Alacritty already anchors a scrolled viewport. At the live edge, use the
+// pointer selection's rotation to anchor the first batch arriving during a drag.
+fn pointer_anchor<T: EventListener>(term: &Term<T>) -> Option<Line> {
+    if term.grid().display_offset() != 0
+        || term.mode().intersects(TermMode::ALT_SCREEN | TermMode::VI)
+    {
+        return None;
+    }
+    let mut selection = term.selection.clone()?;
+    selection.include_all();
+    Some(selection.to_range(term)?.start.line)
+}
+
+fn follow_pointer_anchor<T: EventListener>(term: &mut Term<T>, before: Option<Line>) {
+    if let Some(before) = before
+        && let Some(after) = pointer_anchor(term)
+        && before > after
+    {
+        term.scroll_display(Scroll::Delta((before - after).0));
+    }
+}
+
+fn scroll_history<T: EventListener>(term: &mut Term<T>, lines: i32) {
+    term.scroll_display(Scroll::Delta(lines));
+    if lines < 0 && term.grid().display_offset() == 0 && !term.mode().contains(TermMode::VI) {
+        term.selection = None;
+    }
+}
+
+/// A full-screen application can erase and repaint a selected row at any time.
+pub struct HeldScreen {
+    pub view: Term<Listener>,
+    pub revision: u64,
+}
+
+pub fn hold_alternate_screen(term: &Term<Listener>, revision: u64) -> Box<HeldScreen> {
+    use alacritty_terminal::{term::color::COUNT, vte::ansi::Handler};
+    debug_assert!(term.mode().contains(TermMode::ALT_SCREEN));
+    let size = Size {
+        cols: term.columns(),
+        rows: term.screen_lines(),
+    };
+    let mut view = Term::new(
+        terminal_config(),
+        &size,
+        Listener {
+            replies: Arc::default(),
+        },
+    );
+    // Alternate grids have no history. Only this visible page is cloned.
+    *view.grid_mut() = term.grid().clone();
+    for i in 0..COUNT {
+        if let Some(rgb) = term.colors()[i] {
+            view.set_color(i, rgb);
+        }
+    }
+    Box::new(HeldScreen { view, revision })
+}
+
 pub struct Terminal {
+    pub id: Uuid,
+    pub pending_paste: Option<String>,
+    pub held_screen: Option<Box<HeldScreen>>,
+    pub rows_from_live: usize,
+    pub(crate) visible: Arc<AtomicBool>,
     pub term: Arc<Mutex<Term<Listener>>>,
     tx: SyncSender<Command>,
     input_tx: InputSender,
@@ -675,6 +752,8 @@ impl Terminal {
         let read_stopping = stopping.clone();
         let read_lifecycle = lifecycle.clone();
         let read_bytes = output_bytes.clone();
+        let visible = Arc::new(AtomicBool::new(false));
+        let read_visible = visible.clone();
         let reader = std::thread::spawn(move || {
             let mut parser: Processor = Processor::new();
             let mut buf = [0u8; 16 * 1024];
@@ -696,6 +775,7 @@ impl Terminal {
                 if n > 0 || eof || sync_expired {
                     let theme = TerminalTheme::from_context(&read_ctx);
                     let pending = if let Ok(mut t) = parser_term.lock() {
+                        let anchor = pointer_anchor(&t);
                         if n > 0 {
                             parser.advance(&mut *t, &buf[..n]);
                             read_bytes.fetch_add(n as u64, Ordering::Relaxed);
@@ -708,6 +788,7 @@ impl Terminal {
                         {
                             parser.stop_sync(&mut *t);
                         }
+                        follow_pointer_anchor(&mut t, anchor);
                         parser_mode.store(t.mode().bits(), Ordering::Release);
                         parser_revision.fetch_add(1, Ordering::Release);
                         let events = std::mem::take(&mut *replies.lock().unwrap());
@@ -731,7 +812,9 @@ impl Terminal {
                         }
                         let _ = response_wake.try_send(Command::Wake);
                     }
-                    request_repaint(&read_ctx);
+                    if read_visible.load(Ordering::Relaxed) {
+                        request_root_repaint(&read_ctx);
+                    }
                 }
                 if eof {
                     break;
@@ -792,7 +875,12 @@ impl Terminal {
                     if input.follow_cursor
                         && let Ok(mut term) = host_term.lock()
                     {
-                        term.scroll_display(Scroll::Bottom);
+                        if !term.mode().contains(TermMode::VI) {
+                            term.selection = None;
+                        }
+                        if term.grid().display_offset() > 0 {
+                            term.scroll_display(Scroll::Bottom);
+                        }
                         request_repaint(&ctx);
                     }
                     writing = Some(PendingInput::new(input));
@@ -871,7 +959,7 @@ impl Terminal {
                         .lock()
                         .map_err(|_| std::io::Error::other("terminal state unavailable"))
                         .map(|mut term| {
-                            term.scroll_display(Scroll::Delta(lines));
+                            scroll_history(&mut term, lines);
                             request_repaint(&ctx);
                         }),
                     Ok(Command::Resize(mut s)) => {
@@ -944,6 +1032,11 @@ impl Terminal {
             request_repaint(&ctx);
         });
         Ok(Self {
+            id,
+            pending_paste: None,
+            held_screen: None,
+            rows_from_live: 0,
+            visible,
             term,
             tx,
             input_tx,
@@ -993,6 +1086,15 @@ impl Terminal {
         self.shell_pid
     }
     pub fn selection_action(&mut self, action: SelectionAction) -> Result<()> {
+        if let Some(held) = &self.held_screen
+            && matches!(action, SelectionAction::Copy { exit: false })
+        {
+            if let Some(text) = held.view.selection_to_string() {
+                self.ctx.copy_text(text);
+            }
+            return Ok(());
+        }
+        self.held_screen = None;
         if self.alive.load(Ordering::Acquire) {
             self.tx.try_send(Command::Selection(action)).map_err(|_| {
                 anyhow::anyhow!("terminal control queue unavailable; retry selection")
@@ -1056,27 +1158,52 @@ impl Terminal {
         if (self.size.cols != size.cols || self.size.rows != size.rows)
             && self.tx.try_send(Command::Resize(size)).is_ok()
         {
+            self.held_screen = None;
             self.size = size;
         }
     }
     pub fn exit_code(&self) -> Option<u32> {
         self.lifecycle.lock().ok().and_then(|life| life.exit_code)
     }
-    pub fn paste(&self, s: &str) -> Result<()> {
-        let bracketed = self.mode().contains(TermMode::BRACKETED_PASTE);
-        if s.len()
-            > self
-                .input_tx
-                .budget
+    fn check_paste_size(&self, bytes: usize) -> Result<()> {
+        if !self.alive.load(Ordering::Acquire) || self.stopping.load(Ordering::Acquire) {
+            bail!("shell has exited");
+        }
+        let budget = &self.input_tx.budget;
+        if bytes
+            > budget
                 .limit
-                .saturating_sub(self.input_tx.budget.used.load(Ordering::Acquire))
+                .saturating_sub(budget.used.load(Ordering::Acquire))
         {
             bail!(
                 "terminal input buffer full ({} bytes maximum); nothing from this paste was sent",
-                self.input_tx.budget.limit
+                budget.limit
             );
         }
-        self.enqueue_input(s.as_bytes().to_vec(), Some(bracketed), true)
+        Ok(())
+    }
+
+    // Selection insertion and explicitly reviewed pastes enter here.
+    pub fn paste(&self, s: &str) -> Result<()> {
+        self.check_paste_size(s.len())?;
+        self.enqueue_input(
+            s.as_bytes().to_vec(),
+            Some(self.mode().contains(TermMode::BRACKETED_PASTE)),
+            true,
+        )
+    }
+
+    pub fn clipboard_paste(&mut self, text: String) -> Result<()> {
+        self.held_screen = None;
+        self.check_paste_size(text.len())?;
+        let bracketed = self.mode().contains(TermMode::BRACKETED_PASTE);
+        if !bracketed && text.contains(['\n', '\r']) {
+            self.pending_paste = Some(text);
+            self.ctx.request_repaint();
+            Ok(())
+        } else {
+            self.enqueue_input(text.into_bytes(), Some(bracketed), true)
+        }
     }
     pub fn scroll(&self, lines: i32) -> Result<()> {
         if self.alive.load(Ordering::Acquire) {
@@ -1088,7 +1215,7 @@ impl Terminal {
                 .term
                 .try_lock()
                 .map_err(|_| anyhow::anyhow!("terminal state busy; retry scrolling"))?;
-            term.scroll_display(Scroll::Delta(lines));
+            scroll_history(&mut term, lines);
             request_repaint(&self.ctx);
         }
         Ok(())
@@ -1674,6 +1801,26 @@ mod pty_tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         terminal
+    }
+
+    #[test]
+    fn bracketed_clipboard_delivers_one_block_with_no_submit_key() {
+        let root = tempfile::tempdir().unwrap();
+        let mut terminal = capture_terminal(root.path(), "printf '\\033[?2004h';");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !terminal.mode().contains(TermMode::BRACKETED_PASTE) {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let text = "echo café\r\n\t🙂\x03\rnext\n";
+        terminal.clipboard_paste(text.into()).unwrap();
+        assert!(terminal.pending_paste.is_none());
+        let expected = "\x1b[200~echo café\n\t🙂\nnext\n\x1b[201~";
+        let path = root.path().join("received");
+        while std::fs::read(&path).unwrap_or_default() != expected.as_bytes() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     #[test]

@@ -220,6 +220,20 @@ mod tests {
     }
 
     #[test]
+    fn copied_code_preserves_hard_breaks_tabs_indentation_and_unicode() {
+        let mut term = terminal("\x1b[32m  café\x1b[0m\r\n\t🙂wrapped line\r\nend");
+        let start = Point::new(term.topmost_line(), Column(0));
+        let end = term.grid().cursor.point.sub(&term, Boundary::Grid, 1);
+        let mut selection = Selection::new(SelectionType::Simple, start, Side::Left);
+        selection.update(end, Side::Right);
+        term.selection = Some(selection);
+        assert_eq!(
+            term.selection_to_string().as_deref(),
+            Some("  café\n\t🙂wrapped line\nend")
+        );
+    }
+
+    #[test]
     fn shift_navigation_starts_selection_and_escape_clears_it() {
         let mut term = terminal("hello\r");
         apply(&mut term, SelectionAction::Enter);

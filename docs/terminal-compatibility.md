@@ -10,7 +10,17 @@ Portable tests: real shell input/output and resize (`stty size`), cursor-positio
 
 Automated PTY fixtures run an interactive Bash shell with startup files and line editing disabled, an isolated environment, and a fixed prompt that must appear before input is sent. They exercise UTF-8 directory changes even in the C locale without depending on the runner’s login configuration. Application terminals continue to use the configured login shell and inherited environment.
 
-## Native acceptance checklist (not yet performed)
+## Terminal interaction checks, November 2026
+
+| Session | Observed on macOS |
+| --- | --- |
+| Bash with line editing disabled | Reproduced two commands running on paste in the original build. Verified the new preview in the native window, cancellation, system clipboard copy and paste by double-click, scroll during continuous output, return to live and Ctrl+C. Automated checks also exercise both preview choices against a real Bash process. |
+| Claude Code 2.1.331 | Opened the real interactive CLI. Replayed point and line scroll events, selected and copied displayed text, pasted a multiline draft with indentation, emoji and a final newline, switched panes, resized and cleared the draft with Ctrl+C. The CLI requested bracketed paste, SGR mouse and the alternate screen. |
+| Codex 0.169.0-alpha.11.1 | Exercised the installed CLI in the same pane harness with an isolated local provider configuration. Verified the multiline draft, pane switching, resizing, selection, copying and interrupt. Its slash menu received application mouse input and the emulator stayed at the live edge. |
+
+The assistant checks drove Tessera's normal PTY and terminal view with egui events. A separate deterministic fixture repaints the alternate screen in the middle of a drag and checks the exact copied text. The shell fixture holds a reading position across 180 appended lines and six pane switches. A single-frame drag and a release between two paints have their own regressions. Physical trackpad momentum, a physical wheel, Linux desktop clipboard integration and scrolling through a long model-generated reply in each assistant still need hands-on verification. The normal screen retains up to 10,000 history rows. A full-screen application's own transcript remains subject to its navigation and retention rules.
+
+## Additional native acceptance checklist
 
 - macOS Intel + Apple Silicon launch, quit, reopen into a fresh terminal, Unicode text and font fallback.
 - Interactive Vim/Neovim visual acceptance (Normal/Insert/Replace, resize, wide text), tmux navigation, less paging, shell job control/Ctrl+C/Ctrl+Z, SSH.
